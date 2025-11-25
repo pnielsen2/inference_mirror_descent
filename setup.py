@@ -1,7 +1,7 @@
 import os, sys
 from setuptools import Extension, setup, find_packages
 
-prefix = os.environ["CONDA_PREFIX"]
+prefix = os.environ.get("CONDA_PREFIX", sys.prefix)
 if sys.platform == "win32":
     include_dirs = [os.path.join(prefix, "Library", "include")]
     library_dirs = [os.path.join(prefix, "Library", "lib")]

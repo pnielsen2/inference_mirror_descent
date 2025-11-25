@@ -17,6 +17,7 @@ from relax.algorithm.qvpo import QVPO
 from relax.algorithm.sdac import SDAC
 from relax.algorithm.dpmd import DPMD
 from relax.algorithm.idem import IDEM
+from relax.algorithm.pcmd import PCMD
 from relax.buffer import TreeBuffer
 from relax.network.sac import create_sac_net
 from relax.network.dsact import create_dsact_net
@@ -26,6 +27,8 @@ from relax.network.qsm import create_qsm_net
 from relax.network.dipo import create_dipo_net
 from relax.network.diffv2 import create_diffv2_net
 from relax.network.qvpo import create_qvpo_net
+from relax.network.pcmd import create_pcmd_net
+from relax.pcmd.levels import PcLevelsConfig
 from relax.trainer.off_policy import OffPolicyTrainer
 from relax.env import create_env, create_vector_env
 from relax.utils.experience import Experience, ObsActionPair
@@ -56,6 +59,34 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action='store_true', default=False)
     parser.add_argument("--beta_schedule_scale", type=float, default=0.8)
     parser.add_argument("--beta_schedule_type", type=str, default='linear')
+
+    # PCMD sampler hyperparameters
+    parser.add_argument("--pcmd_points_per_seed", type=int, default=20)
+    parser.add_argument("--pcmd_refresh_L", type=int, default=3)
+    parser.add_argument("--pcmd_action_steps_per_level", type=int, default=1)
+    parser.add_argument("--pcmd_cs", type=float, default=0.08)
+    parser.add_argument("--pcmd_cs_accept", type=float, default=0.1)
+    parser.add_argument("--pcmd_accept_sprime", type=str, default="none")
+    parser.add_argument("--pcmd_s_accept_target", type=float, default=0.5)
+    parser.add_argument("--pcmd_s_accept_lr", type=float, default=0.05)
+    parser.add_argument("--pcmd_level_offset", type=int, default=1)
+    parser.add_argument("--pcmd_H_plan", type=int, default=1)
+
+    parser.add_argument("--pcmd_use_ula_refresh", dest="pcmd_use_ula_refresh", action="store_true")
+    parser.add_argument("--pcmd_no_ula_refresh", dest="pcmd_use_ula_refresh", action="store_false")
+    parser.set_defaults(pcmd_use_ula_refresh=True)
+
+    parser.add_argument("--pcmd_use_crn", dest="pcmd_use_crn", action="store_true")
+    parser.add_argument("--pcmd_no_use_crn", dest="pcmd_use_crn", action="store_false")
+    parser.set_defaults(pcmd_use_crn=True)
+
+    parser.add_argument("--pcmd_bprop_refresh", action="store_true", default=False,
+                        help="Enable backpropagation through refresh in the PCMD sampler.")
+
+    parser.add_argument("--pcmd_adapt_s_accept", dest="pcmd_adapt_s_accept", action="store_true")
+    parser.add_argument("--pcmd_no_adapt_s_accept", dest="pcmd_adapt_s_accept", action="store_false")
+    parser.set_defaults(pcmd_adapt_s_accept=False)
+
     args = parser.parse_args()
 
     if args.debug:
@@ -157,6 +188,57 @@ if __name__ == "__main__":
                                           num_particles=args.num_particles,
                                           noise_scale=args.noise_scale)
         algorithm = QVPO(agent, params, lr=args.lr, alpha_lr=args.alpha_lr, delay_alpha_update=args.delay_alpha_update)
+    elif args.alg == "pcmd":
+        def mish(x: jax.Array):
+            return x * jnp.tanh(jax.nn.softplus(x))
+
+        # Use the same hidden sizes and activation style as other diffusion-based methods
+        pc_net, pc_params = create_pcmd_net(
+            init_network_key,
+            obs_dim,
+            act_dim,
+            hidden_sizes,
+            activation=mish,
+        )
+
+        # Map existing diffusion_steps / beta_schedule_scale to PC-MD level config
+        levels_cfg = PcLevelsConfig(
+            K=int(args.diffusion_steps),
+            alpha_bar_min=0.05,
+            alpha_bar_max=1.0,
+            beta_schedule="linear",
+            lambda_scale=float(args.beta_schedule_scale),
+        )
+
+        algorithm = PCMD(
+            pc_net,
+            pc_params,
+            gamma=0.99,
+            lr_policy=args.lr,
+            lr_dyn=args.lr,
+            lr_reward=args.lr,
+            lr_value=args.lr,
+            ema_tau=0.005,
+            H_train=1,
+            H_plan=args.pcmd_H_plan,
+            num_timesteps=args.diffusion_steps,
+            beta_schedule_scale=args.beta_schedule_scale,
+            beta_schedule_type=args.beta_schedule_type,
+            levels_cfg=levels_cfg,
+            points_per_seed=args.pcmd_points_per_seed,
+            refresh_L=args.pcmd_refresh_L,
+            action_steps_per_level=args.pcmd_action_steps_per_level,
+            use_ula_refresh=args.pcmd_use_ula_refresh,
+            cs=args.pcmd_cs,
+            cs_accept=args.pcmd_cs_accept,
+            bprop_refresh=args.pcmd_bprop_refresh,
+            accept_sprime=args.pcmd_accept_sprime,
+            adapt_s_accept=args.pcmd_adapt_s_accept,
+            s_accept_target=args.pcmd_s_accept_target,
+            s_accept_lr=args.pcmd_s_accept_lr,
+            use_crn=args.pcmd_use_crn,
+            level_offset=args.pcmd_level_offset,
+        )
     else:
         raise ValueError(f"Invalid algorithm {args.alg}!")
 
@@ -164,6 +246,11 @@ if __name__ == "__main__":
         PROJECT_ROOT = Path('/n/netscratch/nali_lab_seas/Lab/haitongma/sdac_logs')
     
     exp_dir = PROJECT_ROOT / "logs" / args.env / (args.alg + '_' + time.strftime("%Y-%m-%d_%H-%M-%S") + f'_s{args.seed}_{args.suffix}')
+
+    # PCMD and DPMD do not expose a standalone value interface used by save_q_structure;
+    # avoid saving value structure for them to prevent setup crashes.
+    save_value = args.alg not in ("pcmd", "dpmd")
+
     trainer = OffPolicyTrainer(
         env=env,
         algorithm=algorithm,
@@ -176,6 +263,7 @@ if __name__ == "__main__":
         warmup_with="random",
         log_path=exp_dir,
         update_log_n_step=1 if args.debug else 1000,
+        save_value=save_value,
     )
 
     trainer.setup(Experience.create_example(obs_dim, act_dim, trainer.batch_size))

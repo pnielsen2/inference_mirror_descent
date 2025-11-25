@@ -66,7 +66,7 @@ def make_persist(f: Callable):
 class PersistFunction:
     def __init__(
         self,
-        closed_jaxpr: jax.core.ClosedJaxpr,
+        closed_jaxpr,
         in_tree: jax.tree_util.PyTreeDef,
         in_descr_flat: List[jax.ShapeDtypeStruct],
         out_tree: jax.tree_util.PyTreeDef,
