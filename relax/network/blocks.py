@@ -196,6 +196,25 @@ class DACERPolicyNet(hk.Module):
         input = jnp.concatenate((obs, act, te), axis=-1)
         return mlp(self.hidden_sizes, act_dim, self.activation, self.output_activation)(input)
 
+
+@dataclass
+@fix_repr
+class EnergyPolicyNet(hk.Module):
+    hidden_sizes: Sequence[int]
+    activation: Activation
+    output_activation: Activation = Identity
+    time_dim: int = 16
+    name: str = None
+
+    def __call__(self, obs: jax.Array, act: jax.Array, t: jax.Array) -> jax.Array:
+        te = scaled_sinusoidal_encoding(t, dim=self.time_dim, batch_shape=obs.shape[:-1])
+        te = hk.Linear(self.time_dim * 2)(te)
+        te = self.activation(te)
+        te = hk.Linear(self.time_dim)(te)
+        input = jnp.concatenate((obs, act, te), axis=-1)
+        # Output scalar energy (squeeze last dim)
+        return mlp(self.hidden_sizes, 1, self.activation, self.output_activation, squeeze_output=True)(input)
+
 def mlp(hidden_sizes: Sequence[int], output_size: int, activation: Activation, output_activation: Activation, *, squeeze_output: bool = False) -> Callable[[jax.Array], jax.Array]:
     layers = []
     for hidden_size in hidden_sizes:

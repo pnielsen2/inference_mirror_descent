@@ -78,10 +78,13 @@ class OffPolicyTrainer:
         self.sample_log_interval = Interval(self.sample_log_n_episode)
         self.save_policy_interval = Interval(self.save_policy_every)
         # self.eval_interval = Interval()
-        wandb.init(project="diffusion_online_rl",
-                   name=log_path.name,
-                   dir=log_path,
-                   group=env.spec.id)
+        wandb.init(
+            project="diffusion_online_rl",
+            name=log_path.name,
+            dir=log_path,
+            group=env.spec.id,
+            config=self.hparams,
+        )
 
     def setup(self, dummy_data: Experience):
         self.algorithm.warmup(dummy_data)
@@ -164,8 +167,9 @@ class OffPolicyTrainer:
         ul.add(info)
 
         if ul.update_step % self.update_log_n_step == 0:
-            self.add_hist(dist_info, ul.update_step * 5)
-            ul.log(self.add_scalar)
+            current_step = self.sample_log.sample_step
+            self.add_hist(dist_info, current_step)
+            ul.log(lambda tag, value, _step: self.add_scalar(tag, value, current_step))
 
     def train(self, key: jax.Array):
         key, warmup_key = jax.random.split(key)

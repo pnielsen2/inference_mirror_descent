@@ -2,16 +2,6 @@
 
 This is the official implementation of
 
-**Efficient Online Reinforcement Learning for Diffusion Policies**
-
-accepted by ICML 2025.
-
-<p align="left">
-<a href='https://arxiv.org/pdf/2502.00361' style='padding-left: 0.5rem;'>
-    <img src='https://img.shields.io/badge/arXiv-PDF-red?style=flat&logo=arXiv&logoColor=wihte' alt='arXiv PDF'>
-</a>
-</p>
-
 ## Installation
 
 ```bash
@@ -34,6 +24,38 @@ pip install -e .
 # Run one experiment
 XLA_FLAGS='--xla_gpu_deterministic_ops=true' CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_MEM_FRACTION=.1 python scripts/train_mujoco.py --alg sdac --seed 100
 ```
+
+This project attempts to introduce three things: 
+1. inference time tilt of policies. For this modificaiton alone, the best performing command so far is
+```bash
+python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4 --dpmd_constant_weight -tfg --tfg_lambda 128.0 --num_particles 32 --mala_steps 2
+```
+which achieves an average of 10425 (SE: 371.966) over 5 runs compared to plain DPMD:
+```bash
+python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4 --num_particles 32
+```
+which achieves an average of 9748 (SE: 199.7) over 5 runs.
+
+There appears to be a bug in the code relating to q-normalization, but fixing it by adding the flag --fix_q_norm_bug: 
+
+```bash
+python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4 --num_particles 32 --fix_q_norm_bug
+```
+
+doesn't seem to help, achieving a mean of 8995 (SE: 246) over 5 runs.
+
+We also find that denoising many particles and behavior cloning the best/soft best under the Q function dominates performance:
+
+```bash
+python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4 --dpmd_constant_weight --num_particles 128 --q_critic_agg mean --particle_selection_lambda 64
+```
+
+This command achieves and average of 10429 (SE: 157.16) without any Q-guidance at inference time or Q-based reweighting during training. This is purely the result of behavior cloning the best/soft best over many denoised action particles under the Q function.
+
+2. Use of transition models and reward models to guide tilts, rather than Q
+3. Planning - denoising a sequence of actions and tilting based on the quality of the entire sequence
+
+
 
 ## Visualize results
 ```python
