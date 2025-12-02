@@ -169,7 +169,7 @@ class OffPolicyTrainer:
         if ul.update_step % self.update_log_n_step == 0:
             current_step = self.sample_log.sample_step
             self.add_hist(dist_info, current_step)
-            ul.log(lambda tag, value, _step: self.add_scalar(tag, value, current_step))
+            ul.log(lambda tag, value, _step: self.add_scalar(f"update/{tag}", value, current_step))
 
     def train(self, key: jax.Array):
         key, warmup_key = jax.random.split(key)

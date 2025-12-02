@@ -88,6 +88,13 @@ if __name__ == "__main__":
                         help="Number of MALA correction steps per diffusion step. If > 0, automatically enables energy_param.")
     parser.add_argument("--model_q_mc_samples", type=int, default=8)
     parser.add_argument("--dpmd_critic_type", type=str, default="q")
+    parser.add_argument("--transition_model", action="store_true", default=False)
+    parser.add_argument("--state_population_size", type=int, default=16)
+    parser.add_argument("--transition_refresh_type", type=str, default="recur")
+    parser.add_argument("--transition_refresh_L", type=int, default=3)
+    parser.add_argument("--bprop_refresh", type=int, default=0)
+    parser.add_argument("--transition_use_crn", action="store_true", default=False)
+    parser.add_argument("--dpmd_td_guided_targets", action="store_true", default=False)
 
     # PCMD sampler hyperparameters
     parser.add_argument("--pcmd_points_per_seed", type=int, default=20)
@@ -129,6 +136,19 @@ if __name__ == "__main__":
     if args.debug:
         from jax import config
         config.update("jax_disable_jit", True)
+
+    if args.transition_model:
+        args.dpmd_critic_type = "transition_reward"
+        if not args.dpmd_constant_weight:
+            raise ValueError("--transition_model requires --dpmd_constant_weight to be set (constant-weight diffusion loss).")
+
+    if args.dpmd_critic_type != "transition_reward":
+        # Transition-only flags must be at their defaults when not using transition_reward critic
+        if args.state_population_size != 16 or args.transition_refresh_type != "recur" or args.transition_refresh_L != 3 or args.bprop_refresh != 0 or args.transition_use_crn:
+            raise ValueError("Transition-related flags (--state_population_size, --transition_refresh_type, --transition_refresh_L, --bprop_refresh, --transition_use_crn) are only valid when dpmd_critic_type='transition_reward' or --transition_model is set.")
+
+    if args.transition_refresh_L < args.bprop_refresh:
+        raise ValueError("--transition_refresh_L must be >= --bprop_refresh.")
 
     master_seed = args.seed
     master_rng, _ = seeding(master_seed)
@@ -175,6 +195,8 @@ if __name__ == "__main__":
         algorithm = SDAC(agent, params, lr=args.lr, alpha_lr=args.alpha_lr, delay_alpha_update=args.delay_alpha_update, lr_schedule_end=args.lr_schedule_end)
     
     elif args.alg == 'dpmd':
+        from relax.network.transition import create_transition_net
+
         def mish(x: jax.Array):
             return x * jnp.tanh(jax.nn.softplus(x))
         agent, params = create_diffv2_net(
@@ -192,6 +214,22 @@ if __name__ == "__main__":
             energy_param=args.energy_param,
             mala_steps=args.mala_steps,
         )
+
+        transition_net = None
+        transition_params = None
+        if args.dpmd_critic_type == "transition_reward":
+            trans_key, _ = jax.random.split(init_network_key)
+            transition_net, transition_params = create_transition_net(
+                trans_key,
+                obs_dim,
+                act_dim,
+                hidden_sizes,
+                diffusion_hidden_sizes,
+                num_timesteps=args.diffusion_steps,
+                beta_schedule_scale=args.beta_schedule_scale,
+                beta_schedule_type=args.beta_schedule_type,
+            )
+
         algorithm = DPMD(
             agent,
             params,
@@ -207,6 +245,14 @@ if __name__ == "__main__":
             tfg_recur_steps=args.dpmd_recurrence_steps,
             particle_selection_lambda=args.particle_selection_lambda,
             critic_type=args.dpmd_critic_type,
+            state_population_size=args.state_population_size,
+            transition_refresh_type=args.transition_refresh_type,
+            transition_refresh_L=args.transition_refresh_L,
+            bprop_refresh=args.bprop_refresh,
+            transition_use_crn=args.transition_use_crn,
+            transition_net=transition_net,
+            transition_params=transition_params,
+            td_guided_targets=args.dpmd_td_guided_targets,
         )
 
     elif args.alg == 'dpmd_bc':

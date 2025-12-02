@@ -28,9 +28,9 @@ XLA_FLAGS='--xla_gpu_deterministic_ops=true' CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_C
 This project attempts to introduce three things: 
 1. inference time tilt of policies. For this modificaiton alone, the best performing command so far is
 ```bash
-python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4 --dpmd_constant_weight -tfg --tfg_lambda 128.0 --num_particles 32 --mala_steps 2
+python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4 --dpmd_constant_weight --tfg_lambda 16.0 --num_particles 1 --mala_steps 2 --q_critic_agg mean
 ```
-which achieves an average of 10425 (SE: 371.966) over 5 runs compared to plain DPMD:
+which achieves an average of 10418 (SE: 111.608) over 5 runs compared to plain DPMD:
 ```bash
 python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4 --num_particles 32
 ```

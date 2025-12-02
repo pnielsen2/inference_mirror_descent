@@ -233,7 +233,12 @@ class Diffv2Net:
 
     def get_deterministic_action(self, policy_params: hk.Params, obs: jax.Array) -> jax.Array:
         key = random_key_from_data(obs)
-        policy_params, log_alpha, q1_params, q2_params = policy_params
+        # Allow an optional fifth element (e.g., transition_params) in policy_params
+        # and ignore it for deterministic action computation.
+        if isinstance(policy_params, (tuple, list)) and len(policy_params) == 5:
+            policy_params, log_alpha, q1_params, q2_params, _ = policy_params
+        else:
+            policy_params, log_alpha, q1_params, q2_params = policy_params
         log_alpha = -jnp.inf
         policy_params = (policy_params, log_alpha, q1_params, q2_params)
         return self.get_action(key, policy_params, obs)
