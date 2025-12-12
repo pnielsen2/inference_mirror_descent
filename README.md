@@ -6,8 +6,8 @@ This is the official implementation of
 
 ```bash
 # Create environment
-conda create -n relax python=3.9 numpy tqdm tensorboardX matplotlib scikit-learn black snakeviz ipykernel setproctitle numba
-conda activate relax
+conda create -n inf-md python=3.10 numpy tqdm tensorboardX matplotlib scikit-learn black snakeviz ipykernel setproctitle numba
+conda activate inf-md
 
 # One of: Install jax WITH CUDA 
 pip install --upgrade "jax[cuda12]==0.4.27" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html

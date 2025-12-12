@@ -46,12 +46,15 @@ class DPMD(Algorithm):
         num_samples: int = 200,
         use_ema: bool = True,
         use_reweighting: bool = True,
+        use_reward_critic: bool = False,
+        pure_bc_training: bool = False,
         q_critic_agg: str = "min",
         fix_q_norm_bug: bool = False,
         tfg_lambda: float = 0.0,
         tfg_lambda_schedule: str = "constant",
         tfg_recur_steps: int = 0,
         particle_selection_lambda: float = np.inf,
+        supervised_steps: int = 1,
     ):
         self.agent = agent
         self.gamma = gamma
@@ -87,12 +90,15 @@ class DPMD(Algorithm):
         )
         self.use_ema = use_ema
         self.use_reweighting = use_reweighting
+        self.use_reward_critic = use_reward_critic
+        self.pure_bc_training = pure_bc_training
         self.q_critic_agg = q_critic_agg
         self.fix_q_norm_bug = fix_q_norm_bug
         self.tfg_lambda = tfg_lambda
         self.tfg_lambda_schedule = tfg_lambda_schedule
         self.tfg_recur_steps = tfg_recur_steps
         self.particle_selection_lambda = particle_selection_lambda
+        self.supervised_steps = int(supervised_steps)
 
         timesteps = self.agent.num_timesteps
         if self.tfg_lambda_schedule == "linear":
@@ -194,6 +200,8 @@ class DPMD(Algorithm):
                 q1 = self.agent.q(q1_params, s, a)
                 q2 = self.agent.q(q2_params, s, a)
                 q = aggregate_q(q1, q2)
+                if self.use_reward_critic:
+                    q = q * (jnp.float32(1.0) / jnp.float32(1.0 - self.gamma))
                 return q
 
             def get_min_taret_q(s, a):
@@ -202,46 +210,79 @@ class DPMD(Algorithm):
                 q = jnp.minimum(q1, q2)
                 return q
 
-            td_params = (policy_params, log_alpha, q1_params, q2_params)
-            next_action = sample_action_with_agg(next_eval_key, td_params, next_obs, hard_min_q)
-            q1_target = self.agent.q(target_q1_params, next_obs, next_action)
-            q2_target = self.agent.q(target_q2_params, next_obs, next_action)
-            q_target = jnp.minimum(q1_target, q2_target)  # - jnp.exp(log_alpha) * next_logp
-            q_backup = reward + (1 - done) * self.gamma * q_target
+            reward_loss = jnp.float32(0.0)
 
-            def q_loss_fn(q_params: hk.Params) -> jax.Array:
-                q = self.agent.q(q_params, obs, action)
-                q_loss = jnp.mean((q - q_backup) ** 2)
-                return q_loss, q
+            if not self.use_reward_critic:
+                td_params = (policy_params, log_alpha, q1_params, q2_params)
+                next_action = sample_action_with_agg(next_eval_key, td_params, next_obs, hard_min_q)
 
-            (q1_loss, q1), q1_grads = jax.value_and_grad(q_loss_fn, has_aux=True)(q1_params)
-            (q2_loss, q2), q2_grads = jax.value_and_grad(q_loss_fn, has_aux=True)(q2_params)
-            q1_update, q1_opt_state = self.optim.update(q1_grads, q1_opt_state)
-            q2_update, q2_opt_state = self.optim.update(q2_grads, q2_opt_state)
-            q1_params = optax.apply_updates(q1_params, q1_update)
-            q2_params = optax.apply_updates(q2_params, q2_update)
+                q1_target = self.agent.q(target_q1_params, next_obs, next_action)
+                q2_target = self.agent.q(target_q2_params, next_obs, next_action)
+                q_target = jnp.minimum(q1_target, q2_target)
+                q_backup = reward + (1 - done) * self.gamma * q_target
 
+                def q_loss_fn(q_params: hk.Params) -> jax.Array:
+                    q = self.agent.q(q_params, obs, action)
+                    q_loss = jnp.mean((q - q_backup) ** 2)
+                    return q_loss, q
+
+                (q1_loss, q1), q1_grads = jax.value_and_grad(q_loss_fn, has_aux=True)(q1_params)
+                (q2_loss, q2), q2_grads = jax.value_and_grad(q_loss_fn, has_aux=True)(q2_params)
+                q1_update, q1_opt_state = self.optim.update(q1_grads, q1_opt_state)
+                q2_update, q2_opt_state = self.optim.update(q2_grads, q2_opt_state)
+                q1_params = optax.apply_updates(q1_params, q1_update)
+                q2_params = optax.apply_updates(q2_params, q2_update)
+            else:
+                if self.pure_bc_training:
+                    next_action = action
+                else:
+                    td_params = (policy_params, log_alpha, q1_params, q2_params)
+                    next_action = sample_action_with_agg(next_eval_key, td_params, next_obs, hard_min_q)
+
+                def reward_loss_fn(q_params: hk.Params) -> jax.Array:
+                    r_pred = self.agent.q(q_params, obs, action)
+                    r_loss = jnp.mean((r_pred - reward) ** 2)
+                    return r_loss, r_pred
+
+                (r1_loss, q1), q1_grads = jax.value_and_grad(reward_loss_fn, has_aux=True)(q1_params)
+                (r2_loss, q2), q2_grads = jax.value_and_grad(reward_loss_fn, has_aux=True)(q2_params)
+                q1_update, q1_opt_state = self.optim.update(q1_grads, q1_opt_state)
+                q2_update, q2_opt_state = self.optim.update(q2_grads, q2_opt_state)
+                q1_params = optax.apply_updates(q1_params, q1_update)
+                q2_params = optax.apply_updates(q2_params, q2_update)
+                reward_loss = 0.5 * (r1_loss + r2_loss)
 
             def policy_loss_fn(policy_params) -> jax.Array:
-                q_min = get_min_q(next_obs, next_action)
-                q_mean, q_std = q_min.mean(), q_min.std()
-                if self.fix_q_norm_bug:
-                    norm_q = (q_min - running_mean) / running_std
+                if self.pure_bc_training:
+                    cond_obs = obs
+                    target_action = action
+                    q_min = get_min_q(cond_obs, target_action)
+                    q_mean, q_std = q_min.mean(), q_min.std()
+                    scaled_q = jnp.zeros_like(q_min)
+                    base_q_weights = jnp.ones_like(q_min)
+                    loss_weights = jnp.ones_like(q_min)
                 else:
-                    norm_q = q_min - running_mean / running_std
-                scaled_q = norm_q.clip(-3.0, 3.0) / jnp.exp(log_alpha)
-                base_q_weights = jnp.exp(scaled_q)
-                if self.use_reweighting:
-                    loss_weights = base_q_weights
-                else:
-                    loss_weights = jnp.ones_like(base_q_weights)
+                    cond_obs = next_obs
+                    target_action = next_action
+                    q_min = get_min_q(cond_obs, target_action)
+                    q_mean, q_std = q_min.mean(), q_min.std()
+                    if self.fix_q_norm_bug:
+                        norm_q = (q_min - running_mean) / running_std
+                    else:
+                        norm_q = q_min - running_mean / running_std
+                    scaled_q = norm_q.clip(-3.0, 3.0) / jnp.exp(log_alpha)
+                    base_q_weights = jnp.exp(scaled_q)
+                    if self.use_reweighting:
+                        loss_weights = base_q_weights
+                    else:
+                        loss_weights = jnp.ones_like(base_q_weights)
 
                 def denoiser(t, x):
-                    return self.agent.policy(policy_params, next_obs, x, t)
+                    return self.agent.policy(policy_params, cond_obs, x, t)
 
                 t = jax.random.randint(
                     diffusion_time_key,
-                    (next_obs.shape[0],),
+                    (obs.shape[0],),
                     0,
                     self.agent.num_timesteps,
                 )
@@ -250,12 +291,9 @@ class DPMD(Algorithm):
                     loss_weights,
                     denoiser,
                     t,
-                    jax.lax.stop_gradient(next_action),
+                    jax.lax.stop_gradient(target_action),
                 )
 
-                # Always log the Q-based weights (base_q_weights), even if
-                # constant-weight training is enabled, so that statistics
-                # reflect the reweighting that would be applied.
                 return loss, (base_q_weights, scaled_q, q_mean, q_std)
 
             (total_loss, (q_weights, scaled_q, q_mean, q_std)), policy_grads = jax.value_and_grad(policy_loss_fn, has_aux=True)(policy_params)
@@ -296,8 +334,6 @@ class DPMD(Algorithm):
                     target_params
                 )
 
-            q1_params, q1_opt_state = param_update(self.optim, q1_params, q1_grads, q1_opt_state)
-            q2_params, q2_opt_state = param_update(self.optim, q2_params, q2_grads, q2_opt_state)
             policy_params, policy_opt_state = delay_param_update(self.policy_optim, policy_params, policy_grads, policy_opt_state)
             log_alpha, log_alpha_opt_state = delay_alpha_param_update(self.alpha_optim, log_alpha, log_alpha_opt_state)
 
@@ -317,11 +353,11 @@ class DPMD(Algorithm):
                 running_std=new_running_std
             )
             info = {
-                "q1_loss": q1_loss,
-                "q1_mean": jnp.mean(q1),
-                "q1_max": jnp.max(q1),
-                "q1_min": jnp.min(q1),
-                "q2_loss": q2_loss,
+                "q1_loss": q1_loss if not self.use_reward_critic else 0.0,
+                "q1_mean": jnp.mean(q1) if not self.use_reward_critic else 0.0,
+                "q1_max": jnp.max(q1) if not self.use_reward_critic else 0.0,
+                "q1_min": jnp.min(q1) if not self.use_reward_critic else 0.0,
+                "q2_loss": q2_loss if not self.use_reward_critic else 0.0,
                 "policy_loss": total_loss,
                 "alpha": jnp.exp(log_alpha),
                 "q_weights_std": jnp.std(q_weights),
@@ -334,6 +370,129 @@ class DPMD(Algorithm):
                 "running_q_std": new_running_std,
                 "entropy_approx": 0.5 * self.agent.act_dim * jnp.log( 2 * jnp.pi * jnp.exp(1) * (0.1 * jnp.exp(log_alpha)) ** 2),
             }
+            if self.use_reward_critic:
+                info["reward_loss"] = reward_loss
+            return state, info
+
+        @jax.jit
+        def stateless_supervised_update(
+            key: jax.Array,
+            state: Diffv2TrainState,
+            data: Experience,
+        ) -> Tuple[Diffv2TrainState, Metric]:
+            obs, action, reward, next_obs, done = data.obs, data.action, data.reward, data.next_obs, data.done
+            q1_params, q2_params, target_q1_params, target_q2_params, policy_params, target_policy_params, log_alpha = state.params
+            q1_opt_state, q2_opt_state, policy_opt_state, log_alpha_opt_state = state.opt_state
+            step = state.step
+            running_mean = state.running_mean
+            running_std = state.running_std
+
+            next_eval_key, diffusion_time_key, diffusion_noise_key = jax.random.split(key, 3)
+
+            reward = reward * self.reward_scale
+
+            def get_min_q(s, a):
+                q1 = self.agent.q(q1_params, s, a)
+                q2 = self.agent.q(q2_params, s, a)
+                q = aggregate_q(q1, q2)
+                if self.use_reward_critic:
+                    q = q * (jnp.float32(1.0) / jnp.float32(1.0 - self.gamma))
+                return q
+
+            if self.pure_bc_training:
+                cond_obs = obs
+                target_action = action
+                q_min = get_min_q(cond_obs, target_action)
+                q_mean, q_std = q_min.mean(), q_min.std()
+                scaled_q = jnp.zeros_like(q_min)
+                base_q_weights = jnp.ones_like(q_min)
+                loss_weights = jnp.ones_like(q_min)
+            else:
+                td_params = (policy_params, log_alpha, q1_params, q2_params)
+                next_action = sample_action_with_agg(next_eval_key, td_params, next_obs, hard_min_q)
+                cond_obs = next_obs
+                target_action = next_action
+                q_min = get_min_q(cond_obs, target_action)
+                q_mean, q_std = q_min.mean(), q_min.std()
+                if self.fix_q_norm_bug:
+                    norm_q = (q_min - running_mean) / running_std
+                else:
+                    norm_q = q_min - running_mean / running_std
+                scaled_q = norm_q.clip(-3.0, 3.0) / jnp.exp(log_alpha)
+                base_q_weights = jnp.exp(scaled_q)
+                if self.use_reweighting:
+                    loss_weights = base_q_weights
+                else:
+                    loss_weights = jnp.ones_like(base_q_weights)
+
+            def policy_loss_fn(policy_p) -> jax.Array:
+                def denoiser(t, x):
+                    return self.agent.policy(policy_p, cond_obs, x, t)
+
+                t = jax.random.randint(
+                    diffusion_time_key,
+                    (obs.shape[0],),
+                    0,
+                    self.agent.num_timesteps,
+                )
+                loss = self.agent.diffusion.weighted_p_loss(
+                    diffusion_noise_key,
+                    loss_weights,
+                    denoiser,
+                    t,
+                    jax.lax.stop_gradient(target_action),
+                )
+
+                return loss, (base_q_weights, scaled_q, q_mean, q_std)
+
+            (total_loss, (q_weights, scaled_q, q_mean, q_std)), policy_grads = jax.value_and_grad(policy_loss_fn, has_aux=True)(policy_params)
+
+            def param_update(optim, params, grads, opt_state):
+                update, new_opt_state = optim.update(grads, opt_state)
+                new_params = optax.apply_updates(params, update)
+                return new_params, new_opt_state
+
+            def delay_param_update(optim, params, grads, opt_state):
+                return jax.lax.cond(
+                    step % self.delay_update == 0,
+                    lambda params, opt_state: param_update(optim, params, grads, opt_state),
+                    lambda params, opt_state: (params, opt_state),
+                    params, opt_state
+                )
+
+            policy_params, policy_opt_state = delay_param_update(self.policy_optim, policy_params, policy_grads, policy_opt_state)
+
+            state = Diffv2TrainState(
+                params=Diffv2Params(q1_params, q2_params, target_q1_params, target_q2_params, policy_params, target_policy_params, log_alpha),
+                opt_state=Diffv2OptStates(q1=q1_opt_state, q2=q2_opt_state, policy=policy_opt_state, log_alpha=log_alpha_opt_state),
+                step=step,
+                entropy=jnp.float32(0.0),
+                running_mean=running_mean,
+                running_std=running_std,
+            )
+
+            info = {
+                "q1_loss": jnp.float32(0.0),
+                "q1_mean": jnp.float32(0.0),
+                "q1_max": jnp.float32(0.0),
+                "q1_min": jnp.float32(0.0),
+                "q2_loss": jnp.float32(0.0),
+                "policy_loss": total_loss,
+                "alpha": jnp.exp(log_alpha),
+                "q_weights_std": jnp.std(q_weights),
+                "q_weights_mean": jnp.mean(q_weights),
+                "q_weights_min": jnp.min(q_weights),
+                "q_weights_max": jnp.max(q_weights),
+                "scale_q_mean": jnp.mean(scaled_q),
+                "scale_q_std": jnp.std(scaled_q),
+                "running_q_mean": running_mean,
+                "running_q_std": running_std,
+                "entropy_approx": 0.5 * self.agent.act_dim * jnp.log( 2 * jnp.pi * jnp.exp(1) * (0.1 * jnp.exp(log_alpha)) ** 2),
+            }
+
+            if self.use_reward_critic:
+                info["reward_loss"] = jnp.float32(0.0)
+
             return state, info
 
         def stateless_get_action_tfg_recur(
@@ -367,6 +526,8 @@ class DPMD(Algorithm):
                 q1 = self.agent.q(q1_params, obs_batch, x0_hat)
                 q2 = self.agent.q(q2_params, obs_batch, x0_hat)
                 q = aggregate_q_fn(q1, q2)
+                if self.use_reward_critic:
+                    q = q * (jnp.float32(1.0) / jnp.float32(1.0 - self.gamma))
                 return jnp.mean(q)
 
             def grad_guidance(x_in, t_idx):
@@ -441,6 +602,8 @@ class DPMD(Algorithm):
                 q1 = self.agent.q(q1_params, obs_batch, act_final)
                 q2 = self.agent.q(q2_params, obs_batch, act_final)
                 q = aggregate_q_fn(q1, q2)
+                if self.use_reward_critic:
+                    q = q * (jnp.float32(1.0) / jnp.float32(1.0 - self.gamma))
                 return act_final, q
 
             def single_sampler(single_key: jax.Array):
@@ -570,6 +733,8 @@ class DPMD(Algorithm):
                 q1 = self.agent.q(q1_params, obs_batch, act_final)
                 q2 = self.agent.q(q2_params, obs_batch, act_final)
                 q = aggregate_q_fn(q1, q2)
+                if self.use_reward_critic:
+                    q = q * (jnp.float32(1.0) / jnp.float32(1.0 - self.gamma))
                 return act_final, q
 
             def single_sampler(single_key: jax.Array):
@@ -608,6 +773,8 @@ class DPMD(Algorithm):
                 q1 = self.agent.q(q1_params, obs_batch, act)
                 q2 = self.agent.q(q2_params, obs_batch, act)
                 q = aggregate_q_fn(q1, q2)
+                if self.use_reward_critic:
+                    q = q * (jnp.float32(1.0) / jnp.float32(1.0 - self.gamma))
                 return act, q
 
             def single_sampler(single_key: jax.Array):
@@ -623,6 +790,7 @@ class DPMD(Algorithm):
             return sample_action_with_agg(key, params, obs, aggregate_q)
 
         self._implement_common_behavior(stateless_update, stateless_get_action_env, self.agent.get_deterministic_action)
+        self._update_supervised = jax.jit(stateless_supervised_update)
 
     def get_policy_params(self):
         return (self.state.params.policy, self.state.params.log_alpha, self.state.params.q1, self.state.params.q2 )
@@ -638,3 +806,7 @@ class DPMD(Algorithm):
     def get_action(self, key: jax.Array, obs: np.ndarray) -> np.ndarray:
         action = self._get_action(key, self.get_policy_params_to_save(), obs)
         return np.asarray(action)
+
+    def update_supervised(self, key: jax.Array, data: Experience) -> Metric:
+        self.state, info = self._update_supervised(key, self.state, data)
+        return {k: float(v) for k, v in info.items() if not k.startswith('hist')}, {k: v for k, v in info.items() if k.startswith('hist')}

@@ -1,12 +1,12 @@
 from dataclasses import dataclass
-from typing import Callable, NamedTuple, Sequence, Tuple
+from typing import Callable, NamedTuple, Optional, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
 import haiku as hk
 import math
 
-from relax.network.blocks import Activation, Identity, mlp, scaled_sinusoidal_encoding
+from relax.network.blocks import Activation, Identity, mlp, scaled_sinusoidal_encoding, DACERPolicyNet, EnergyPolicyNet
 from relax.utils.diffusion import GaussianDiffusion
 
 
@@ -34,6 +34,8 @@ class ModelBasedNet:
     noise_scale: float
     beta_schedule_scale: float
     beta_schedule_type: str = "linear"
+    energy_mode: bool = False
+    energy_fn: Optional[Callable[[hk.Params, jax.Array, jax.Array, jax.Array], jax.Array]] = None
 
     @property
     def diffusion(self) -> GaussianDiffusion:
@@ -104,10 +106,42 @@ def create_model_based_net(
     noise_scale: float,
     beta_schedule_scale: float,
     beta_schedule_type: str = "linear",
+    energy_param: bool = False,
 ) -> Tuple[ModelBasedNet, ModelBasedParams]:
-    from relax.network.blocks import DACERPolicyNet
 
-    policy = hk.without_apply_rng(hk.transform(lambda obs, act, t: DACERPolicyNet(diffusion_hidden_sizes, activation)(obs, act, t)))
+    if energy_param:
+        # Energy parameterization for the policy: network outputs scalar energy E(s, a_t, t)
+        # and the diffusion denoiser is the gradient of this energy w.r.t. action, as in
+        # Diffv2Net.energy_mode.
+        policy = hk.without_apply_rng(
+            hk.transform(
+                lambda obs, act, t: EnergyPolicyNet(diffusion_hidden_sizes, activation)(
+                    obs,
+                    act,
+                    t,
+                )
+            )
+        )
+
+        def policy_apply(params: hk.Params, obs: jax.Array, act: jax.Array, t: jax.Array) -> jax.Array:
+            return jax.grad(lambda a: policy.apply(params, obs, a, t).sum())(act)
+
+        energy_apply: Optional[
+            Callable[[hk.Params, jax.Array, jax.Array, jax.Array], jax.Array]
+        ] = policy.apply
+    else:
+        # Standard DACER-style diffusion denoiser.
+        policy = hk.without_apply_rng(
+            hk.transform(
+                lambda obs, act, t: DACERPolicyNet(diffusion_hidden_sizes, activation)(
+                    obs,
+                    act,
+                    t,
+                )
+            )
+        )
+        policy_apply = policy.apply
+        energy_apply = None
     dynamics = hk.without_apply_rng(hk.transform(_dyn_forward(hidden_sizes, activation, time_dim=16)))
     reward = hk.without_apply_rng(hk.transform(_reward_forward(hidden_sizes, activation)))
     value = hk.without_apply_rng(hk.transform(_value_forward(hidden_sizes, activation)))
@@ -140,7 +174,7 @@ def create_model_based_net(
     params = init(key, jnp.zeros((1, obs_dim)), jnp.zeros((1, act_dim)))
 
     net = ModelBasedNet(
-        policy=policy.apply,
+        policy=policy_apply,
         dynamics=dynamics.apply,
         reward=reward.apply,
         value=value.apply,
@@ -152,6 +186,8 @@ def create_model_based_net(
         noise_scale=noise_scale,
         beta_schedule_scale=beta_schedule_scale,
         beta_schedule_type=beta_schedule_type,
+        energy_mode=energy_param,
+        energy_fn=energy_apply,
     )
 
     return net, params

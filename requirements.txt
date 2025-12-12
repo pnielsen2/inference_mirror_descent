@@ -2,6 +2,7 @@
 # numpy
 # jax  # See document for installation
 optax
+flax
 dm-haiku
 numpyro
 numba
@@ -18,3 +19,6 @@ scikit-learn
 # Utility
 tqdm
 setproctitle
+pyyaml
+requests
+wandb

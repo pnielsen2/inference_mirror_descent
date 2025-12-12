@@ -44,6 +44,10 @@ class DPMDMB(Algorithm):
         delay_update: int = 2,
         reward_scale: float = 0.2,
         num_mc_samples: int = 8,
+        lr_policy=None,
+        lr_dyn=None,
+        lr_reward=None,
+        lr_value=None,
     ):
         self.agent = agent
         self.gamma = gamma
@@ -53,17 +57,26 @@ class DPMDMB(Algorithm):
         self.reward_scale = reward_scale
         self.num_mc_samples = num_mc_samples
 
+        if lr_policy is None:
+            lr_policy_init = lr
+        else:
+            lr_policy_init = float(lr_policy)
+
         lr_schedule = optax.schedules.linear_schedule(
-            init_value=lr,
+            init_value=lr_policy_init,
             end_value=lr_schedule_end,
             transition_steps=int(5e4),
             transition_begin=int(2.5e4),
         )
 
+        dyn_lr = lr if lr_dyn is None else float(lr_dyn)
+        rew_lr = lr if lr_reward is None else float(lr_reward)
+        value_lr = lr if lr_value is None else float(lr_value)
+
         self.policy_optim = optax.adam(learning_rate=lr_schedule)
-        self.dyn_optim = optax.adam(lr)
-        self.rew_optim = optax.adam(lr)
-        self.value_optim = optax.adam(lr)
+        self.dyn_optim = optax.adam(dyn_lr)
+        self.rew_optim = optax.adam(rew_lr)
+        self.value_optim = optax.adam(value_lr)
         self.alpha_optim = optax.adam(alpha_lr)
 
         self.state = ModelBasedTrainState(

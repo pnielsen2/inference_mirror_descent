@@ -92,3 +92,26 @@ class Algorithm:
         self._update(key, self.state, data)
         self._get_action(key, policy_params, obs)
         self._get_deterministic_action(policy_params, obs)
+
+    def compute_validation_metrics(self, key: jax.Array, data: Experience) -> Metric:
+        """Compute validation metrics on a batch of data without updating state.
+
+        By default, this reuses the stateless update function stored in
+        ``self._update`` to obtain the same metric dictionary as a training
+        step, but discards the updated state. Algorithms that require a
+        different notion of validation can override this method.
+        """
+
+        _, info = self._update(key, self.state, data)
+        return {k: float(v) for k, v in info.items() if not k.startswith('hist')}
+
+    def get_effective_hparams(self) -> dict:
+        """Return a dict of effective hyperparameters for logging.
+
+        Subclasses can override this to expose any internal hyperparameters,
+        including parameters that are overridden relative to the raw CLI args
+        (e.g., clamped values, derived quantities, or algorithm-specific
+        interpretations). The default implementation returns an empty dict.
+        """
+
+        return {}

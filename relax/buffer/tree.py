@@ -69,6 +69,21 @@ class TreeBuffer(Buffer[T]):
             samples = jax.device_put(samples)
         return samples, indices
 
+    def gather_indices(self, indices: "np.ndarray", *, to_jax: bool = False) -> T:
+        """Gather samples at the given buffer indices.
+
+        This is a thin wrapper around the internal storage layout, used by
+        higher-level code (e.g., trainers) to implement more structured
+        sampling schemes such as train/validation splits without changing the
+        existing random sampling API.
+        """
+
+        leaves = tuple(np.take(buf, indices, axis=0) for buf in self.buffers)
+        samples = tree.tree_unflatten(self.treedef, leaves)
+        if to_jax:
+            samples = jax.device_put(samples)
+        return samples
+
     def replace(self, indices: np.ndarray, samples: T, *, from_jax: bool = False) -> None:
         if from_jax:
             samples = jax.device_get(samples)
