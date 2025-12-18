@@ -69,7 +69,7 @@ def create_dacer_doubleq_net(
 ) -> Tuple[DACERDoubleQNet, DACERDoubleQParams]:
     # q = hk.without_apply_rng(hk.transform(lambda obs, act: DistributionalQNet2(hidden_sizes, activation)(obs, act)))
     q = hk.without_apply_rng(hk.transform(lambda obs, act: QNet(hidden_sizes, activation)(obs, act)))
-    policy = hk.without_apply_rng(hk.transform(lambda obs, act, t: DACERPolicyNet(diffusion_hidden_sizes, activation)(obs, act, t)))
+    policy = hk.without_apply_rng(hk.transform(lambda obs, act, t, h: DACERPolicyNet(diffusion_hidden_sizes, activation)(obs, act, t, h)))
 
     @jax.jit
     def init(key, obs, act):
@@ -78,7 +78,7 @@ def create_dacer_doubleq_net(
         q2_params = q.init(q2_key, obs, act)
         target_q1_params = q1_params
         target_q2_params = q2_params
-        policy_params = policy.init(policy_key, obs, act, 0)
+        policy_params = policy.init(policy_key, obs, act, 0, jnp.zeros((1,), dtype=jnp.float32))
         log_alpha = jnp.array(math.log(3), dtype=jnp.float32) # math.log(3) or math.log(5) choose one
         return DACERDoubleQParams(q1_params, q2_params, target_q1_params, target_q2_params, policy_params, log_alpha)
 
@@ -86,5 +86,9 @@ def create_dacer_doubleq_net(
     sample_act = jnp.zeros((1, act_dim))
     params = init(key, sample_obs, sample_act)
 
-    net = DACERDoubleQNet(q=q.apply, policy=policy.apply, num_timesteps=num_timesteps, act_dim=act_dim, target_entropy=-act_dim*0.9)
+    # Wrap policy to pass h=0 for single-step mode
+    def policy_apply(params, obs, act, t):
+        h_zeros = jnp.zeros(obs.shape[:-1], dtype=jnp.float32)
+        return policy.apply(params, obs, act, t, h_zeros)
+    net = DACERDoubleQNet(q=q.apply, policy=policy_apply, num_timesteps=num_timesteps, act_dim=act_dim, target_entropy=-act_dim*0.9)
     return net, params

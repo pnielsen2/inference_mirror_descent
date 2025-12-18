@@ -53,6 +53,7 @@ class OffPolicyTrainer:
         val_env: Optional[Env] = None,
         val_buffer: Optional[ExperienceBuffer] = None,
         validation_ratio: float = 0.0,
+        track_next_action: bool = False,  # Enable SARSA-style next_action tracking
     ):
         self.env = env
         self.algorithm = algorithm
@@ -88,6 +89,10 @@ class OffPolicyTrainer:
         self.val_env = val_env
         self.val_buffer = val_buffer
         self.validation_ratio = float(validation_ratio)
+        self.track_next_action = track_next_action
+        # State for tracking next_action in SARSA-style buffer
+        self._prev_buffer_indices: Optional[np.ndarray] = None
+        self._prev_dones: Optional[np.ndarray] = None
         # TODO: make EpisodeLog and Experience configurable
         # TODO: re-add done_info_keys support
         # TODO: re-add evaluation support
@@ -223,6 +228,9 @@ class OffPolicyTrainer:
         train_obs, _ = self.env.reset()
         step = 0
         key_fn = jax.jit(lambda step: jax.random.fold_in(key, step))
+        # State for SARSA-style next_action tracking during warmup
+        warmup_prev_indices: Optional[np.ndarray] = None
+        warmup_prev_dones: Optional[np.ndarray] = None
         while len(self.buffer) < self.start_step:
             step += 1
             if self.warmup_with == "random":
@@ -231,9 +239,36 @@ class OffPolicyTrainer:
                 action = self.algorithm.get_action(key_fn(step), train_obs)
             else:
                 raise ValueError(f"Invalid warmup_with {self.warmup_with}!")
+            
+            # SARSA-style tracking: update previous experience's next_action
+            if self.track_next_action and warmup_prev_indices is not None:
+                if warmup_prev_dones is not None:
+                    prev_dones = np.atleast_1d(warmup_prev_dones)
+                    prev_indices = np.atleast_1d(warmup_prev_indices)
+                    action_arr = np.atleast_2d(action) if np.asarray(action).ndim == 1 else action
+                    non_terminal_mask = ~prev_dones
+                    if np.any(non_terminal_mask):
+                        indices_to_update = prev_indices[non_terminal_mask]
+                        actions_to_set = action_arr[non_terminal_mask] if self.is_vec else action
+                        update_exp = Experience(
+                            obs=None, action=None, reward=None, done=None, next_obs=None,
+                            next_action=actions_to_set,
+                        )
+                        self.buffer.replace(indices_to_update, update_exp)
+            
             next_obs, reward, terminated, truncated, info = self.env.step(action)
 
             experience = Experience.create(train_obs, action, reward, terminated, truncated, next_obs, info)
+            
+            # Track buffer indices before adding (for next iteration's next_action update)
+            if self.track_next_action:
+                if self.is_vec:
+                    batch_size = np.atleast_1d(reward).shape[0]
+                    warmup_prev_indices = np.arange(self.buffer.ptr, self.buffer.ptr + batch_size) % self.buffer.max_len
+                else:
+                    warmup_prev_indices = np.array([self.buffer.ptr])
+                warmup_prev_dones = np.atleast_1d(terminated) | np.atleast_1d(truncated)
+            
             if self.is_vec:
                 self.buffer.add_batch(experience)
             else:
@@ -243,6 +278,11 @@ class OffPolicyTrainer:
                 train_obs, _ = self.env.reset()
             else:
                 train_obs = next_obs
+        
+        # Initialize tracking state for main sample loop to continue from warmup
+        if self.track_next_action:
+            self._prev_buffer_indices = warmup_prev_indices
+            self._prev_dones = warmup_prev_dones
 
         # Optional warmup for the dedicated validation buffer.
         if self.val_env is not None and self.val_buffer is not None and self.validation_ratio > 0.0:
@@ -283,9 +323,45 @@ class OffPolicyTrainer:
         sl = self.sample_log
 
         action = self.algorithm.get_action(sample_key, obs)
+        
+        # SARSA-style tracking: update previous experience's next_action with current action
+        if self.track_next_action and self._prev_buffer_indices is not None:
+            # Only update for non-terminal previous transitions
+            if self._prev_dones is not None:
+                # For vectorized envs, _prev_dones is a boolean array
+                # For single env, _prev_dones is a scalar boolean
+                prev_dones = np.atleast_1d(self._prev_dones)
+                prev_indices = np.atleast_1d(self._prev_buffer_indices)
+                action_arr = np.atleast_2d(action) if action.ndim == 1 else action
+                
+                # Update next_action only for non-terminal transitions
+                non_terminal_mask = ~prev_dones
+                if np.any(non_terminal_mask):
+                    indices_to_update = prev_indices[non_terminal_mask]
+                    actions_to_set = action_arr[non_terminal_mask] if self.is_vec else action_arr[0]
+                    # Use buffer's replace method to update only next_action field
+                    # Create a partial Experience with only next_action set
+                    update_exp = Experience(
+                        obs=None, action=None, reward=None, done=None, next_obs=None,
+                        next_action=actions_to_set if self.is_vec else action,
+                    )
+                    self.buffer.replace(indices_to_update, update_exp)
+        
         next_obs, reward, terminated, truncated, info = self.env.step(action)
 
         experience = Experience.create(obs, action, reward, terminated, truncated, next_obs, info)
+        
+        # Track buffer indices before adding (for next iteration's next_action update)
+        if self.track_next_action:
+            if self.is_vec:
+                batch_size = np.atleast_1d(reward).shape[0]
+                # Indices where this batch will be stored
+                current_indices = np.arange(self.buffer.ptr, self.buffer.ptr + batch_size) % self.buffer.max_len
+            else:
+                current_indices = np.array([self.buffer.ptr])
+            self._prev_buffer_indices = current_indices
+            self._prev_dones = np.atleast_1d(terminated) | np.atleast_1d(truncated)
+        
         if self.is_vec:
             self.buffer.add_batch(experience)
         else:
@@ -335,6 +411,9 @@ class OffPolicyTrainer:
             self.progress.update(sl.sample_step - self.progress.n)
 
             obs, _ = self.env.reset()
+            # Reset open-loop execution state at episode boundaries
+            if hasattr(self.algorithm, 'reset_open_loop'):
+                self.algorithm.reset_open_loop()
         else:
             obs = next_obs
 
@@ -355,8 +434,13 @@ class OffPolicyTrainer:
         key = update_key
 
         # Sample training batch uniformly from the main replay buffer.
+        # For H-step policy training, sample sequences instead of individual transitions.
+        H_train = getattr(self.algorithm, "H_train", 1)
         train_idx, val_idx = self._get_train_val_index_sets()
-        if train_idx is None:
+        if H_train > 1 and isinstance(self.buffer, TreeBuffer):
+            # Sample H-step sequences for policy training
+            train_data = self.buffer.sample_sequences(self.batch_size, H_train)
+        elif train_idx is None:
             train_data = self.buffer.sample(self.batch_size)
         else:
             train_data = self._sample_from_index_set(train_idx, self.batch_size)

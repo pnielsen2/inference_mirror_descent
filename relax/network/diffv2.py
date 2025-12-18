@@ -262,6 +262,7 @@ def create_diffv2_net(
     beta_schedule_type: str = "linear",
     energy_param: bool = False,
     mala_steps: int = 1,
+    single_q_network: bool = False,
     ) -> Tuple[Diffv2Net, Diffv2Params]:
     # q = hk.without_apply_rng(hk.transform(lambda obs, act: DistributionalQNet2(hidden_sizes, activation)(obs, act)))
     q = hk.without_apply_rng(hk.transform(lambda obs, act: QNet(hidden_sizes, activation)(obs, act)))
@@ -269,12 +270,26 @@ def create_diffv2_net(
     if energy_param:
         # Energy parameterization: Network outputs scalar E(x).
         # Policy (score/noise) is grad(E(x)).
-        policy_net = hk.without_apply_rng(hk.transform(lambda obs, act, t: EnergyPolicyNet(diffusion_hidden_sizes, activation)(obs, act, t)))
+        #
+        # EnergyPolicyNet now expects a horizon index h as an additional
+        # conditioning input. For the single-step Diffv2 setting, we use a
+        # fixed h=0 embedding for all calls, so the external DPDM API remains
+        # policy(params, obs, act, t) with no explicit horizon argument.
+        policy_net = hk.without_apply_rng(
+            hk.transform(
+                lambda obs, act, t, h: EnergyPolicyNet(diffusion_hidden_sizes, activation)(
+                    obs,
+                    act,
+                    t,
+                    h,
+                )
+            )
+        )
 
-        # We define the external policy interface (which returns noise/score) as grad(E) w.r.t action
+        # We define the external policy interface (which returns noise/score)
+        # as grad(E) w.r.t the action argument.
         def policy_score_fn(obs, act, t):
-            # Note: EnergyPolicyNet outputs scalar.
-            # We want grad w.r.t 'act' (arg 1)
+            # Note: EnergyPolicyNet outputs scalar; take grad w.r.t 'act'.
             return jax.grad(lambda a: policy_net.apply(None, obs, a, t).sum())(act)
 
         # We still need to init parameters using the base network
@@ -282,22 +297,33 @@ def create_diffv2_net(
 
         # For Diffv2Net.policy, we pass the function that computes the gradient
         # Diffv2Net expects: policy(params, obs, act, t)
-        policy_apply = lambda params, obs, act, t: jax.grad(lambda a: policy_net.apply(params, obs, a, t).sum())(act)
-        energy_apply = policy_net.apply
+        def policy_apply(params, obs, act, t):
+            h_zeros = jnp.zeros(obs.shape[:-1], dtype=jnp.float32)
+            return jax.grad(lambda a: policy_net.apply(params, obs, a, t, h_zeros).sum())(act)
+        def energy_apply(params, obs, act, t):
+            h_zeros = jnp.zeros(obs.shape[:-1], dtype=jnp.float32)
+            return policy_net.apply(params, obs, act, t, h_zeros)
         
     else:
-        policy = hk.without_apply_rng(hk.transform(lambda obs, act, t: DACERPolicyNet(diffusion_hidden_sizes, activation)(obs, act, t)))
-        policy_apply = policy.apply
+        policy = hk.without_apply_rng(hk.transform(lambda obs, act, t, h: DACERPolicyNet(diffusion_hidden_sizes, activation)(obs, act, t, h)))
+        # Wrap to always pass h=0 for single-step mode, maintaining 4-arg interface for DPMD
+        def policy_apply(params, obs, act, t):
+            h_zeros = jnp.zeros(obs.shape[:-1], dtype=jnp.float32)
+            return policy.apply(params, obs, act, t, h_zeros)
         energy_apply = None
 
     @jax.jit
     def init(key, obs, act):
         q1_key, q2_key, policy_key = jax.random.split(key, 3)
         q1_params = q.init(q1_key, obs, act)
-        q2_params = q.init(q2_key, obs, act)
+        if single_q_network:
+            # Use the same params for both Q networks
+            q2_params = q1_params
+        else:
+            q2_params = q.init(q2_key, obs, act)
         target_q1_params = q1_params
         target_q2_params = q2_params
-        policy_params = policy.init(policy_key, obs, act, 0)
+        policy_params = policy.init(policy_key, obs, act, 0, jnp.zeros((1,), dtype=jnp.float32))
         target_policy_params = policy_params
         log_alpha = jnp.array(math.log(5), dtype=jnp.float32) # math.log(3) or math.log(5) choose one
         return Diffv2Params(q1_params, q2_params, target_q1_params, target_q2_params, policy_params, target_policy_params, log_alpha)

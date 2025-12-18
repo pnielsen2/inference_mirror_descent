@@ -1,0 +1,53 @@
+program: scripts/train_mujoco.py
+
+method: random
+metric:
+  name: sample/episode_return
+  goal: maximize
+
+project: diffusion_online_rl
+name: dpmd_mb_pc_halfcheetah_lr_random
+
+parameters:
+  seed:
+    values: [100, 101, 102, 103, 104]
+
+  lr_policy:
+    values: [3e-5, 1e-4, 3e-4, 1e-3, 3e-3]
+  lr_dyn:
+    values: [3e-5, 1e-4, 3e-4, 1e-3, 3e-3]
+  lr_reward:
+    values: [3e-5, 1e-4, 3e-4, 1e-3, 3e-3]
+  lr_value:
+    values: [3e-5, 1e-4, 3e-4, 1e-3, 3e-3]
+
+command:
+  - ${env:PYTHON}
+  - scripts/train_mujoco.py
+  - --alg
+  - dpmd_mb_pc
+  - --env
+  - HalfCheetah-v4
+  - --tfg_lambda
+  - "16"
+  - --mala_steps
+  - "2"
+  - --pc_use_value
+  - --bprop_refresh_steps
+  - "3"
+  - --sprime_num_particles
+  - "32"
+  - --update_per_iteration
+  - "8"
+  - --total_step
+  - "500000"
+  - --lr_policy
+  - "{{lr_policy}}"
+  - --lr_dyn
+  - "{{lr_dyn}}"
+  - --lr_reward
+  - "{{lr_reward}}"
+  - --lr_value
+  - "{{lr_value}}"
+  - --seed
+  - "{{seed}}"

@@ -48,6 +48,8 @@ class DPMD(Algorithm):
         use_reweighting: bool = True,
         use_reward_critic: bool = False,
         pure_bc_training: bool = False,
+        off_policy_td: bool = False,
+        no_entropy_tuning: bool = False,
         q_critic_agg: str = "min",
         fix_q_norm_bug: bool = False,
         tfg_lambda: float = 0.0,
@@ -55,6 +57,9 @@ class DPMD(Algorithm):
         tfg_recur_steps: int = 0,
         particle_selection_lambda: float = np.inf,
         supervised_steps: int = 1,
+        single_q_network: bool = False,
+        lr_schedule_steps: int = int(5e4),
+        lr_schedule_begin: int = int(2.5e4),
     ):
         self.agent = agent
         self.gamma = gamma
@@ -67,8 +72,8 @@ class DPMD(Algorithm):
         lr_schedule = optax.schedules.linear_schedule(
             init_value=lr,
             end_value=lr_schedule_end,
-            transition_steps=int(5e4),
-            transition_begin=int(2.5e4),
+            transition_steps=int(lr_schedule_steps),
+            transition_begin=int(lr_schedule_begin),
         )
         self.policy_optim = optax.adam(learning_rate=lr_schedule)
         self.alpha_optim = optax.adam(alpha_lr)
@@ -92,6 +97,8 @@ class DPMD(Algorithm):
         self.use_reweighting = use_reweighting
         self.use_reward_critic = use_reward_critic
         self.pure_bc_training = pure_bc_training
+        self.off_policy_td = off_policy_td
+        self.no_entropy_tuning = no_entropy_tuning
         self.q_critic_agg = q_critic_agg
         self.fix_q_norm_bug = fix_q_norm_bug
         self.tfg_lambda = tfg_lambda
@@ -99,6 +106,7 @@ class DPMD(Algorithm):
         self.tfg_recur_steps = tfg_recur_steps
         self.particle_selection_lambda = particle_selection_lambda
         self.supervised_steps = int(supervised_steps)
+        self.single_q_network = single_q_network
 
         timesteps = self.agent.num_timesteps
         if self.tfg_lambda_schedule == "linear":
@@ -161,7 +169,8 @@ class DPMD(Algorithm):
                 acts, qs = jax.vmap(single_sampler)(keys)
                 act = select_action_from_particles(acts, qs, key_select)
 
-            act = act + jax.random.normal(noise_key, act.shape) * jnp.exp(log_alpha) * self.agent.noise_scale
+            if not self.no_entropy_tuning:
+                act = act + jax.random.normal(noise_key, act.shape) * jnp.exp(log_alpha) * self.agent.noise_scale
 
             if single:
                 return act[0]
@@ -186,6 +195,7 @@ class DPMD(Algorithm):
             key: jax.Array, state: Diffv2TrainState, data: Experience
         ) -> Tuple[Diffv2OptStates, Metric]:
             obs, action, reward, next_obs, done = data.obs, data.action, data.reward, data.next_obs, data.done
+            next_action_buffer = data.next_action  # SARSA-style: action taken at next_obs (may be None)
             q1_params, q2_params, target_q1_params, target_q2_params, policy_params, target_policy_params, log_alpha = state.params
             q1_opt_state, q2_opt_state, policy_opt_state, log_alpha_opt_state = state.opt_state
             step = state.step
@@ -213,8 +223,14 @@ class DPMD(Algorithm):
             reward_loss = jnp.float32(0.0)
 
             if not self.use_reward_critic:
-                td_params = (policy_params, log_alpha, q1_params, q2_params)
-                next_action = sample_action_with_agg(next_eval_key, td_params, next_obs, hard_min_q)
+                if self.off_policy_td:
+                    # SARSA-style off-policy: use the action actually taken at next_obs
+                    # (stored as next_action in buffer via track_next_action)
+                    next_action = next_action_buffer
+                else:
+                    # On-policy: sample fresh actions from current policy
+                    td_params = (policy_params, log_alpha, q1_params, q2_params)
+                    next_action = sample_action_with_agg(next_eval_key, td_params, next_obs, hard_min_q)
 
                 q1_target = self.agent.q(target_q1_params, next_obs, next_action)
                 q2_target = self.agent.q(target_q2_params, next_obs, next_action)
@@ -227,11 +243,18 @@ class DPMD(Algorithm):
                     return q_loss, q
 
                 (q1_loss, q1), q1_grads = jax.value_and_grad(q_loss_fn, has_aux=True)(q1_params)
-                (q2_loss, q2), q2_grads = jax.value_and_grad(q_loss_fn, has_aux=True)(q2_params)
                 q1_update, q1_opt_state = self.optim.update(q1_grads, q1_opt_state)
-                q2_update, q2_opt_state = self.optim.update(q2_grads, q2_opt_state)
                 q1_params = optax.apply_updates(q1_params, q1_update)
-                q2_params = optax.apply_updates(q2_params, q2_update)
+                
+                if self.single_q_network:
+                    # Use the same params for both Q networks
+                    q2_params = q1_params
+                    q2_loss = q1_loss
+                    q2 = q1
+                else:
+                    (q2_loss, q2), q2_grads = jax.value_and_grad(q_loss_fn, has_aux=True)(q2_params)
+                    q2_update, q2_opt_state = self.optim.update(q2_grads, q2_opt_state)
+                    q2_params = optax.apply_updates(q2_params, q2_update)
             else:
                 if self.pure_bc_training:
                     next_action = action
@@ -245,11 +268,18 @@ class DPMD(Algorithm):
                     return r_loss, r_pred
 
                 (r1_loss, q1), q1_grads = jax.value_and_grad(reward_loss_fn, has_aux=True)(q1_params)
-                (r2_loss, q2), q2_grads = jax.value_and_grad(reward_loss_fn, has_aux=True)(q2_params)
                 q1_update, q1_opt_state = self.optim.update(q1_grads, q1_opt_state)
-                q2_update, q2_opt_state = self.optim.update(q2_grads, q2_opt_state)
                 q1_params = optax.apply_updates(q1_params, q1_update)
-                q2_params = optax.apply_updates(q2_params, q2_update)
+                
+                if self.single_q_network:
+                    # Use the same params for both Q networks
+                    q2_params = q1_params
+                    r2_loss = r1_loss
+                    q2 = q1
+                else:
+                    (r2_loss, q2), q2_grads = jax.value_and_grad(reward_loss_fn, has_aux=True)(q2_params)
+                    q2_update, q2_opt_state = self.optim.update(q2_grads, q2_opt_state)
+                    q2_params = optax.apply_updates(q2_params, q2_update)
                 reward_loss = 0.5 * (r1_loss + r2_loss)
 
             def policy_loss_fn(policy_params) -> jax.Array:
@@ -335,10 +365,14 @@ class DPMD(Algorithm):
                 )
 
             policy_params, policy_opt_state = delay_param_update(self.policy_optim, policy_params, policy_grads, policy_opt_state)
-            log_alpha, log_alpha_opt_state = delay_alpha_param_update(self.alpha_optim, log_alpha, log_alpha_opt_state)
+            if not self.no_entropy_tuning:
+                log_alpha, log_alpha_opt_state = delay_alpha_param_update(self.alpha_optim, log_alpha, log_alpha_opt_state)
 
             target_q1_params = delay_target_update(q1_params, target_q1_params, self.tau)
-            target_q2_params = delay_target_update(q2_params, target_q2_params, self.tau)
+            if self.single_q_network:
+                target_q2_params = target_q1_params
+            else:
+                target_q2_params = delay_target_update(q2_params, target_q2_params, self.tau)
             target_policy_params = delay_target_update(policy_params, target_policy_params, self.tau)
 
             new_running_mean = running_mean + 0.001 * (q_mean - running_mean)

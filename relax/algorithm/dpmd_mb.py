@@ -48,6 +48,8 @@ class DPMDMB(Algorithm):
         lr_dyn=None,
         lr_reward=None,
         lr_value=None,
+        lr_schedule_steps: int = int(5e4),
+        lr_schedule_begin: int = int(2.5e4),
     ):
         self.agent = agent
         self.gamma = gamma
@@ -65,8 +67,8 @@ class DPMDMB(Algorithm):
         lr_schedule = optax.schedules.linear_schedule(
             init_value=lr_policy_init,
             end_value=lr_schedule_end,
-            transition_steps=int(5e4),
-            transition_begin=int(2.5e4),
+            transition_steps=int(lr_schedule_steps),
+            transition_begin=int(lr_schedule_begin),
         )
 
         dyn_lr = lr if lr_dyn is None else float(lr_dyn)

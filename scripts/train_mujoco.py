@@ -87,10 +87,18 @@ if __name__ == "__main__":
                         help="Number of recurrence-style TFG inner steps per diffusion level for dpmd (0 disables recurrence).")
     parser.add_argument("--dpmd_constant_weight", action="store_true", default=False,
                         help="If set for dpmd, disable Q-based reweighting in the diffusion score-matching loss and use constant weights.")
+    parser.add_argument("--single_q_network", action="store_true", default=False,
+                        help="If set, train a single Q network instead of twin Q networks. The same Q is used for both Q1 and Q2.")
     parser.add_argument("--dpmd_use_reward_critic", action="store_true", default=False,
                         help="If set for dpmd, replace the Q critic with a 1-step reward network trained from the replay buffer and use it (scaled by 1/(1-gamma)) for tilting/guidance.")
     parser.add_argument("--dpmd_pure_bc_training", action="store_true", default=False,
                         help="If set for dpmd, train the diffusion policy purely by behavior cloning from replay actions (no critic-based tilting at training time), while still using the critic for inference-time guidance.")
+    parser.add_argument("--dpmd_off_policy_td", action="store_true", default=False,
+                        help="If set for dpmd, use off-policy (buffer) actions for the critic TD target instead of on-policy (sampled from current policy) actions.")
+    parser.add_argument("--dpmd_no_entropy_tuning", action="store_true", default=False,
+                        help="If set for dpmd, disable action noise and alpha/entropy tuning (makes DPMD more similar to dpmd_mb_pc).")
+    parser.add_argument("--dpmd_long_lr_schedule", action="store_true", default=False,
+                        help="If set, anneal the diffusion policy LR over the full training horizon instead of the default 50k-step schedule (applies to dpmd and dpmd_mb).")                    
     parser.add_argument("--dpmd_bc_noisy_q_guided", action="store_true", default=False,
                         help="For dpmd_bc: train Q on noisy forward-diffused actions and use guided sampling that evaluates Q on an intermediate noisy diffusion state.")
     parser.add_argument("--dpmd_bc_tfg_recurrence", action="store_true", default=False,
@@ -200,6 +208,51 @@ if __name__ == "__main__":
         ),
     )
 
+    parser.add_argument(
+        "--pc_action_recur_steps",
+        type=int,
+        default=0,
+        help=(
+            "Number of TFG recurrence-style inner steps per diffusion level for dpmd_mb_pc "
+            "action sampling. When > 0, use recurrence-based guidance instead of MALA."
+        ),
+    )
+
+    parser.add_argument(
+        "--pc_H_plan",
+        type=int,
+        default=1,
+        help=(
+            "Planning and training horizon for dpmd_mb_pc. When > 1 (requires --pc_deterministic_dyn), "
+            "denoise H actions in parallel during planning and train the policy on H-step sequences "
+            "from the replay buffer with horizon index embeddings. The guidance objective is the "
+            "H-step unrolled sum of discounted rewards plus terminal value. H=1 recovers standard "
+            "single-action behavior."
+        ),
+    )
+    parser.add_argument(
+        "--pc_joint_seq",
+        action="store_true",
+        default=False,
+        help=(
+            "When enabled with --pc_H_plan > 1, use a joint sequence denoiser that models "
+            "correlations across the H-step action sequence. The policy network takes the "
+            "full action sequence as input and outputs noise for all H actions jointly. "
+            "Default (off) uses a factorized prior where each action is denoised separately "
+            "conditioned on its horizon index."
+        ),
+    )
+    parser.add_argument(
+        "--open_loop",
+        action="store_true",
+        default=False,
+        help=(
+            "When enabled with --pc_H_plan > 1, execute the full H-action plan sequentially "
+            "without replanning until the sequence is exhausted. Default (off) replans at "
+            "every step (closed-loop MPC)."
+        ),
+    )
+
     parser.add_argument("--pc_use_crn", dest="pc_use_crn", action="store_true")
     parser.add_argument("--pc_no_use_crn", dest="pc_use_crn", action="store_false")
     parser.set_defaults(pc_use_crn=True)
@@ -243,6 +296,16 @@ if __name__ == "__main__":
     if args.use_hypergrad and not args.use_validation:
         raise ValueError("--use_hypergrad requires --use_validation to be enabled, since hypergradients are computed from validation loss.")
 
+    # Configure policy LR schedule for diffusion-policy algorithms (dpmd, dpmd_mb).
+    if args.dpmd_long_lr_schedule:
+        # Anneal over the full training horizon
+        dpmd_lr_schedule_steps = int(args.total_step)
+        dpmd_lr_schedule_begin = 0
+    else:
+        # Preserve original behavior (short 50k-step schedule)
+        dpmd_lr_schedule_steps = int(5e4)
+        dpmd_lr_schedule_begin = int(2.5e4)
+
     if args.debug:
         from jax import config
         config.update("jax_disable_jit", True)
@@ -265,7 +328,9 @@ if __name__ == "__main__":
     hidden_sizes = [args.hidden_dim] * args.hidden_num
     diffusion_hidden_sizes = [args.diffusion_hidden_dim] * args.hidden_num
 
-    buffer = TreeBuffer.from_experience(obs_dim, act_dim, size=args.buffer_size, seed=buffer_seed)
+    # Use SARSA-style buffer (with next_action) when dpmd_off_policy_td is enabled
+    include_next_action = getattr(args, 'dpmd_off_policy_td', False)
+    buffer = TreeBuffer.from_experience(obs_dim, act_dim, size=args.buffer_size, seed=buffer_seed, include_next_action=include_next_action)
 
     # Optional dedicated validation environment and buffer. When enabled via
     # use_validation and validation_ratio>0, we create an extra vector env for
@@ -338,6 +403,7 @@ if __name__ == "__main__":
             beta_schedule_type=args.beta_schedule_type,
             energy_param=args.energy_param,
             mala_steps=args.mala_steps,
+            single_q_network=args.single_q_network,
         )
         algorithm = DPMD(
             agent,
@@ -349,6 +415,8 @@ if __name__ == "__main__":
             use_reweighting=not args.dpmd_constant_weight,
             use_reward_critic=args.dpmd_use_reward_critic,
             pure_bc_training=args.dpmd_pure_bc_training,
+            off_policy_td=args.dpmd_off_policy_td,
+            no_entropy_tuning=args.dpmd_no_entropy_tuning,
             q_critic_agg=args.q_critic_agg,
             fix_q_norm_bug=args.fix_q_norm_bug,
             tfg_lambda=args.tfg_lambda,
@@ -356,6 +424,9 @@ if __name__ == "__main__":
             tfg_recur_steps=args.dpmd_recurrence_steps,
             particle_selection_lambda=args.particle_selection_lambda,
             supervised_steps=args.supervised_steps,
+            single_q_network=args.single_q_network,
+            lr_schedule_steps=dpmd_lr_schedule_steps,
+            lr_schedule_begin=dpmd_lr_schedule_begin,
         )
 
     elif args.alg == 'dpmd_bc':
@@ -421,6 +492,8 @@ if __name__ == "__main__":
             lr_dyn=args.lr_dyn,
             lr_reward=args.lr_reward,
             lr_value=args.lr_value,
+            lr_schedule_steps=dpmd_lr_schedule_steps,
+            lr_schedule_begin=dpmd_lr_schedule_begin,
         )
 
     elif args.alg == 'dpmd_mb_pc':
@@ -440,6 +513,8 @@ if __name__ == "__main__":
             beta_schedule_scale=args.beta_schedule_scale,
             beta_schedule_type=args.beta_schedule_type,
             energy_param=args.energy_param,
+            H_train=args.pc_H_plan,
+            joint_seq=args.pc_joint_seq,
         )
         algorithm = DPMDMBPC(
             agent,
@@ -453,6 +528,10 @@ if __name__ == "__main__":
             sprime_cs=args.sprime_cs,
             bprop_refresh_steps=args.bprop_refresh_steps,
             action_steps_per_level=args.mala_steps,
+            action_recur_steps=args.pc_action_recur_steps,
+            H_plan=args.pc_H_plan,
+            joint_seq=args.pc_joint_seq,
+            open_loop=args.open_loop,
             use_crn=args.pc_use_crn,
             tfg_lambda=args.tfg_lambda,
             supervised_steps=args.supervised_steps,
@@ -632,9 +711,10 @@ if __name__ == "__main__":
         val_env=val_env,
         val_buffer=val_buffer,
         validation_ratio=args.validation_ratio,
+        track_next_action=include_next_action,  # Enable SARSA-style buffer for off-policy TD
     )
 
-    trainer.setup(Experience.create_example(obs_dim, act_dim, trainer.batch_size))
+    trainer.setup(Experience.create_example(obs_dim, act_dim, trainer.batch_size, include_next_action=include_next_action))
     log_git_details(log_file=os.path.join(exp_dir, 'dacer.diff'))
     
     # Save the arguments to a YAML file
