@@ -64,18 +64,21 @@ class DPMDMB(Algorithm):
         else:
             lr_policy_init = float(lr_policy)
 
-        lr_schedule = optax.schedules.linear_schedule(
-            init_value=lr_policy_init,
-            end_value=lr_schedule_end,
-            transition_steps=int(lr_schedule_steps),
-            transition_begin=int(lr_schedule_begin),
-        )
+        if lr_schedule_steps > 0:
+            lr_schedule = optax.schedules.linear_schedule(
+                init_value=lr_policy_init,
+                end_value=lr_schedule_end,
+                transition_steps=int(lr_schedule_steps),
+                transition_begin=int(lr_schedule_begin),
+            )
+            self.policy_optim = optax.adam(learning_rate=lr_schedule)
+        else:
+            # Constant LR (no annealing)
+            self.policy_optim = optax.adam(learning_rate=lr_policy_init)
 
         dyn_lr = lr if lr_dyn is None else float(lr_dyn)
         rew_lr = lr if lr_reward is None else float(lr_reward)
         value_lr = lr if lr_value is None else float(lr_value)
-
-        self.policy_optim = optax.adam(learning_rate=lr_schedule)
         self.dyn_optim = optax.adam(dyn_lr)
         self.rew_optim = optax.adam(rew_lr)
         self.value_optim = optax.adam(value_lr)
@@ -361,7 +364,10 @@ class DPMDMB(Algorithm):
                     return self.agent.policy(policy_params, obs, x, t)
 
                 return self.agent.diffusion.p_sample(
-                    k, model_fn, (*obs.shape[:-1], self.agent.act_dim)
+                    k,
+                    model_fn,
+                    (*obs.shape[:-1], self.agent.act_dim),
+                    deterministic=getattr(self, "ddim_predictor", False),
                 )
 
             keys = jax.random.split(key_act, self.agent.num_particles)

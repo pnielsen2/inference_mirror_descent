@@ -71,6 +71,7 @@ class DPMDMBPC(Algorithm):
         deterministic_dyn: bool = False,
         entropic_sprime_agg: bool = False,
         ucb_sprime_coeff: float = 0.0,
+        x0_hat_clip_radius: float = 1.0,
         use_hypergrad: bool = False,
         hypergrad_lr: float = 1e-3,
         hypergrad_period: int = 100,
@@ -93,8 +94,8 @@ class DPMDMBPC(Algorithm):
         self.action_steps_per_level = int(action_steps_per_level)
         self.action_recur_steps = int(action_recur_steps)
         self.H_plan = int(H_plan)
-        self.H_train = int(H_plan)  # Unified: H_train = H_plan
         self.joint_seq = bool(joint_seq) and H_plan > 1  # Only use joint_seq when H > 1
+        self.H_train = int(H_plan) if self.joint_seq else 1
         self.open_loop = bool(open_loop) and H_plan > 1  # Only use open_loop when H > 1
         
         # Open-loop execution state: cached action sequence and current index
@@ -113,6 +114,7 @@ class DPMDMBPC(Algorithm):
         # across the s' population, where k = ucb_sprime_coeff. When k != 0,
         # this takes precedence over the entropic_sprime_agg setting.
         self.ucb_sprime_coeff = float(ucb_sprime_coeff)
+        self.x0_hat_clip_radius = float(x0_hat_clip_radius)
         self.use_hypergrad = bool(use_hypergrad)
         self.hypergrad_lr = float(hypergrad_lr)
         self.hypergrad_period = int(hypergrad_period)
@@ -304,58 +306,25 @@ class DPMDMBPC(Algorithm):
             # Define loss functions for per-step policy and joint sequence policy
             def policy_loss_fn(policy_p: hk.Params) -> jax.Array:
                 """Per-step policy loss (factorized or single-step)."""
-                if actions_seq is not None and not self.joint_seq:
-                    # Factorized mode: denoise each action separately with horizon index
-                    B = obs.shape[0]
-                    H = self.H_train
+                h_zeros = jnp.zeros((obs.shape[0],), dtype=jnp.float32)
 
-                    def loss_for_horizon_step(h: int, key_h: jax.Array) -> jax.Array:
-                        """Compute diffusion loss for horizon step h."""
-                        t_key, noise_key = jax.random.split(key_h)
-                        t = jax.random.randint(
-                            t_key,
-                            (B,),
-                            0,
-                            self.agent.num_timesteps,
-                        )
-                        action_h = actions_seq[:, h, :]
-                        h_idx = jnp.full((B,), h, dtype=jnp.float32)
+                def denoiser(t, x):
+                    return self.agent.policy(policy_p, obs, x, t, h_zeros)
 
-                        def denoiser_h(t_in, x):
-                            return self.agent.policy(policy_p, obs, x, t_in, h_idx)
-
-                        loss_h = self.agent.diffusion.p_loss(
-                            noise_key,
-                            denoiser_h,
-                            t,
-                            jax.lax.stop_gradient(action_h),
-                        )
-                        return loss_h
-
-                    keys_h = jax.random.split(policy_key, H)
-                    losses = jax.vmap(loss_for_horizon_step)(jnp.arange(H), keys_h)
-                    return jnp.mean(losses)
-                else:
-                    # Single-step policy training or warmup with Experience data
-                    h_zeros = jnp.zeros((obs.shape[0],), dtype=jnp.float32)
-
-                    def denoiser(t, x):
-                        return self.agent.policy(policy_p, obs, x, t, h_zeros)
-
-                    t_key, noise_key = jax.random.split(policy_key)
-                    t = jax.random.randint(
-                        t_key,
-                        (obs.shape[0],),
-                        0,
-                        self.agent.num_timesteps,
-                    )
-                    loss = self.agent.diffusion.p_loss(
-                        noise_key,
-                        denoiser,
-                        t,
-                        jax.lax.stop_gradient(action),
-                    )
-                    return loss
+                t_key, noise_key = jax.random.split(policy_key)
+                t = jax.random.randint(
+                    t_key,
+                    (obs.shape[0],),
+                    0,
+                    self.agent.num_timesteps,
+                )
+                loss = self.agent.diffusion.p_loss(
+                    noise_key,
+                    denoiser,
+                    t,
+                    jax.lax.stop_gradient(action),
+                )
+                return loss
 
             def seq_policy_loss_fn(seq_policy_p: hk.Params) -> jax.Array:
                 """Joint sequence policy loss."""
@@ -981,7 +950,7 @@ class DPMDMBPC(Algorithm):
                         x_local * B_act.sqrt_recip_alphas_cumprod[t]
                         - noise_pred_local * B_act.sqrt_recipm1_alphas_cumprod[t]
                     )
-                    a_clean_local = jnp.clip(a_clean_local, -1.0, 1.0)
+                    a_clean_local = jnp.clip(a_clean_local, -self.x0_hat_clip_radius, self.x0_hat_clip_radius)
                     a_clean_local = jnp.where(
                         jnp.isfinite(a_clean_local),
                         a_clean_local,
@@ -1359,17 +1328,13 @@ class DPMDMBPC(Algorithm):
                 """
                 obs_0 = jax.lax.stop_gradient(obs_0)
                 if obs_0.ndim == 1:
-                    return obs_0
-                # Last axis is obs_dim; collapse everything else.
-                flat = obs_0.reshape(-1, obs_0.shape[-1])
-                return flat[0]
 
-            def get_tweedie_actions(x_t: jax.Array, t_idx: jax.Array, obs_0: jax.Array):
-                """Get Tweedie action estimates for all H actions.
-                
-                Args:
-                    x_t: Noisy actions [H, act_dim]
-                    t_idx: Diffusion timestep (scalar)
+        if self.joint_seq and self.agent.seq_policy is not None:
+            a_clean, noise_preds = get_tweedie_actions(x_t, t_idx, obs_vec)
+            s_traj = rollout_states(a_clean, obs_vec, key_dyn)
+        else:
+            def step(carry, x_h):
+                s_cur, key_cur = carry
                     obs_0: Initial observation (possibly with extra dims)
                 """
                 obs_vec = _normalize_obs0(obs_0)  # [obs_dim]
@@ -1387,7 +1352,7 @@ class DPMDMBPC(Algorithm):
                         x_t * B_act.sqrt_recip_alphas_cumprod[t_idx]
                         - noise_pred * B_act.sqrt_recipm1_alphas_cumprod[t_idx]
                     )
-                    a_clean = jnp.clip(a_clean, -1.0, 1.0)
+                    a_clean = jnp.clip(a_clean, -self.x0_hat_clip_radius, self.x0_hat_clip_radius)
                     a_clean = jnp.where(jnp.isfinite(a_clean), a_clean, jnp.zeros_like(a_clean))
                     return a_clean, noise_pred
                 else:
@@ -1403,7 +1368,7 @@ class DPMDMBPC(Algorithm):
                             x_h * B_act.sqrt_recip_alphas_cumprod[t_idx]
                             - noise_pred[0] * B_act.sqrt_recipm1_alphas_cumprod[t_idx]
                         )
-                        a_clean = jnp.clip(a_clean, -1.0, 1.0)
+                        a_clean = jnp.clip(a_clean, -self.x0_hat_clip_radius, self.x0_hat_clip_radius)
                         a_clean = jnp.where(jnp.isfinite(a_clean), a_clean, jnp.zeros_like(a_clean))
                         return a_clean, noise_pred[0]
 
@@ -1460,8 +1425,67 @@ class DPMDMBPC(Algorithm):
                     obs_0: Initial observation [obs_dim] - passed explicitly
                     key_dyn: Random key for stochastic dynamics (None for deterministic)
                 """
-                a_clean, noise_preds = get_tweedie_actions(x_t, t_idx, obs_0)
-                s_traj = rollout_states(a_clean, obs_0, key_dyn)
+                obs_vec = _normalize_obs0(obs_0)
+
+                if self.joint_seq and self.agent.seq_policy is not None:
+                    a_clean, noise_preds = get_tweedie_actions(x_t, t_idx, obs_vec)
+                    s_traj = rollout_states(a_clean, obs_vec, key_dyn)
+                else:
+                    def step(carry, x_h):
+                        s_cur, key_cur = carry
+
+                        h_zeros = jnp.zeros((1,), dtype=jnp.float32)
+                        noise_pred = self.agent.policy(
+                            policy_params,
+                            s_cur[None, :],
+                            x_h[None, :],
+                            t_idx,
+                            h_zeros,
+                        )[0]
+                        a_clean_h = (
+                            x_h * B_act.sqrt_recip_alphas_cumprod[t_idx]
+                            - noise_pred * B_act.sqrt_recipm1_alphas_cumprod[t_idx]
+                        )
+                        a_clean_h = jnp.clip(a_clean_h, -self.x0_hat_clip_radius, self.x0_hat_clip_radius)
+                        a_clean_h = jnp.where(
+                            jnp.isfinite(a_clean_h),
+                            a_clean_h,
+                            jnp.zeros_like(a_clean_h),
+                        )
+
+                        if self.deterministic_dyn:
+                            s_next = _predict_next_obs_deterministic(
+                                dyn_params,
+                                s_cur[None, :],
+                                a_clean_h[None, :],
+                            )[0]
+                            key_next = key_cur
+                        else:
+                            key_next, key_step = jax.random.split(key_cur)
+                            s_next = _ddim_sample_next_obs(
+                                key_step,
+                                dyn_params,
+                                s_cur[None, :],
+                                a_clean_h[None, :],
+                            )[0]
+
+                        return (s_next, key_next), (s_cur, a_clean_h, noise_pred)
+
+                    if key_dyn is None:
+                        key_dyn = jax.random.PRNGKey(0)
+
+                    (s_final, _), (s_hist, a_clean_seq, noise_seq) = jax.lax.scan(
+                        step,
+                        (obs_vec, key_dyn),
+                        x_t,
+                    )
+
+                    s_traj = jnp.concatenate(
+                        [s_hist, s_final[None, :]],
+                        axis=0,
+                    )
+                    a_clean = a_clean_seq
+                    noise_preds = noise_seq
 
                 def single_reward(s_h, a_h, sp_h):
                     return self.agent.reward(
@@ -1486,7 +1510,7 @@ class DPMDMBPC(Algorithm):
                     obs_0: Initial observation (possibly with extra dims)
                     key_dyn: Random key for stochastic dynamics (None for deterministic)
                 """
-                obs_vec = _normalize_obs0(obs_0)  # [obs_dim]
+                obs_vec = _normalize_obs0(obs_0)
                 
                 obj, aux = compute_horizon_objective(x_t, t_idx, obs_vec, key_dyn)
 
@@ -1494,19 +1518,48 @@ class DPMDMBPC(Algorithm):
                     if self.joint_seq and self.agent.seq_energy_fn is not None:
                         t_batch = jnp.atleast_1d(t_idx)
                         E_model = self.agent.seq_energy_fn(
-                            seq_policy_params, obs_vec[None, :], x_t[None, :, :], t_batch,
+                            seq_policy_params,
+                            obs_vec[None, :],
+                            x_t[None, :, :],
+                            t_batch,
                         )[0]
                     elif self.agent.energy_fn is not None:
-                        h_indices_e = jnp.arange(H, dtype=jnp.float32)
+                        _a_clean, s_traj, _ = aux
 
-                        def single_energy(x_h, h_idx):
-                            h_batch = jnp.array([h_idx])
-                            E_m = self.agent.energy_fn(
-                                policy_params, obs_vec[None, :], x_h[None, :], t_idx, h_batch,
+                        if self.joint_seq:
+                            h_indices_e = jnp.arange(H, dtype=jnp.float32)
+
+                            def single_energy(x_h, h_idx):
+                                h_batch = jnp.array([h_idx])
+                                E_m = self.agent.energy_fn(
+                                    policy_params,
+                                    obs_vec[None, :],
+                                    x_h[None, :],
+                                    t_idx,
+                                    h_batch,
+                                )
+                                return E_m[0]
+
+                            E_model = jnp.sum(jax.vmap(single_energy)(x_t, h_indices_e))
+                        else:
+                            h_zeros_e = jnp.zeros((1,), dtype=jnp.float32)
+
+                            def single_energy_step(s_h, x_h):
+                                E_m = self.agent.energy_fn(
+                                    policy_params,
+                                    s_h[None, :],
+                                    x_h[None, :],
+                                    t_idx,
+                                    h_zeros_e,
+                                )
+                                return E_m[0]
+
+                            E_model = jnp.sum(
+                                jax.vmap(single_energy_step)(
+                                    s_traj[:H],
+                                    x_t,
+                                )
                             )
-                            return E_m[0]
-
-                        E_model = jnp.sum(jax.vmap(single_energy)(x_t, h_indices_e))
                     else:
                         E_model = jnp.array(0.0, dtype=jnp.float32)
                 else:

@@ -27,15 +27,32 @@ class ValueNet(hk.Module):
 
 @dataclass
 @fix_repr
-class QNet(hk.Module):
+class DistributionalValueNet(hk.Module):
+    """Value network that outputs (mean, log_var) for per-state variance estimation."""
     hidden_sizes: Sequence[int]
     activation: Activation
     output_activation: Activation = Identity
     name: str = None
 
+    def __call__(self, obs: jax.Array) -> Tuple[jax.Array, jax.Array]:
+        output = mlp(self.hidden_sizes, 2, self.activation, self.output_activation)(obs)
+        value_mean = output[..., 0]
+        value_log_var = output[..., 1]  # Will be used as log(variance)
+        return value_mean, value_log_var
+
+
+@dataclass
+@fix_repr
+class QNet(hk.Module):
+    hidden_sizes: Sequence[int]
+    activation: Activation
+    output_activation: Activation = Identity
+    zero_init_final: bool = False
+    name: str = None
+
     def __call__(self, obs: jax.Array, act: jax.Array) -> jax.Array:
         input = jnp.concatenate((obs, act), axis=-1)
-        return mlp(self.hidden_sizes, 1, self.activation, self.output_activation, squeeze_output=True)(input)
+        return mlp(self.hidden_sizes, 1, self.activation, self.output_activation, squeeze_output=True, zero_init_final=self.zero_init_final)(input)
 
 
 @dataclass
@@ -186,6 +203,7 @@ class DACERPolicyNet(hk.Module):
     output_activation: Activation = Identity
     time_dim: int = 16
     horizon_dim: int = 8
+    zero_init_final: bool = False
     name: str = None
 
     def __call__(
@@ -214,7 +232,7 @@ class DACERPolicyNet(hk.Module):
         he = self.activation(he)
         he = hk.Linear(self.horizon_dim)(he)
         input = jnp.concatenate((obs, act, te, he), axis=-1)
-        return mlp(self.hidden_sizes, act_dim, self.activation, self.output_activation)(input)
+        return mlp(self.hidden_sizes, act_dim, self.activation, self.output_activation, zero_init_final=self.zero_init_final)(input)
 
 
 @dataclass
@@ -225,6 +243,7 @@ class EnergyPolicyNet(hk.Module):
     output_activation: Activation = Identity
     time_dim: int = 16
     horizon_dim: int = 8
+    zero_init_final: bool = False
     name: str = None
 
     def __call__(
@@ -253,7 +272,7 @@ class EnergyPolicyNet(hk.Module):
         he = hk.Linear(self.horizon_dim)(he)
         input = jnp.concatenate((obs, act, te, he), axis=-1)
         # Output scalar energy (squeeze last dim)
-        return mlp(self.hidden_sizes, 1, self.activation, self.output_activation, squeeze_output=True)(input)
+        return mlp(self.hidden_sizes, 1, self.activation, self.output_activation, squeeze_output=True, zero_init_final=self.zero_init_final)(input)
 
 @dataclass
 @fix_repr
@@ -370,11 +389,14 @@ class EnergySequencePolicyNet(hk.Module):
         return mlp(self.hidden_sizes, 1, self.activation, self.output_activation, squeeze_output=True)(input)
 
 
-def mlp(hidden_sizes: Sequence[int], output_size: int, activation: Activation, output_activation: Activation, *, squeeze_output: bool = False) -> Callable[[jax.Array], jax.Array]:
+def mlp(hidden_sizes: Sequence[int], output_size: int, activation: Activation, output_activation: Activation, *, squeeze_output: bool = False, zero_init_final: bool = False) -> Callable[[jax.Array], jax.Array]:
     layers = []
     for hidden_size in hidden_sizes:
         layers += [hk.Linear(hidden_size), activation]
-    layers += [hk.Linear(output_size), output_activation]
+    if zero_init_final:
+        layers += [hk.Linear(output_size, w_init=hk.initializers.Constant(0), b_init=hk.initializers.Constant(0)), output_activation]
+    else:
+        layers += [hk.Linear(output_size), output_activation]
     if squeeze_output:
         layers.append(partial(jnp.squeeze, axis=-1))
     return hk.Sequential(layers)

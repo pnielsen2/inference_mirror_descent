@@ -42,7 +42,24 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--alg", type=str, default="sdac")
     parser.add_argument("--env", type=str, default="HalfCheetah-v4")
+    parser.add_argument("--backend", type=str, default="gymnasium", choices=["gymnasium", "mjx"], help="Physics backend: 'gymnasium' (standard MuJoCo C) or 'mjx' (JAX-based MuJoCo via Brax, differentiable).")
     parser.add_argument("--suffix", type=str, default="")
+    parser.add_argument(
+        "--dummy_action_dim",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, expand the environment action dimension to dummy_action_dim by adding dummy action coordinates "
+            "that do not affect dynamics. The reward is modified by subtracting dummy_action_alpha * ||a_dummy||^2. "
+            "Set to 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--dummy_action_alpha",
+        type=float,
+        default=0.0,
+        help="Penalty coefficient alpha for the dummy action L2 penalty.",
+    )
     parser.add_argument("--num_vec_envs", type=int, default=5)
     parser.add_argument("--hidden_num", type=int, default=3)
     parser.add_argument("--hidden_dim", type=int, default=256)
@@ -54,62 +71,81 @@ if __name__ == "__main__":
     parser.add_argument("--supervised_steps", type=int, default=1)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--lr_policy", type=float, default=None)
+    parser.add_argument("--lr_q", type=float, default=None)
     parser.add_argument("--lr_dyn", type=float, default=None)
     parser.add_argument("--lr_reward", type=float, default=None)
     parser.add_argument("--lr_value", type=float, default=None)
     parser.add_argument("--lr_schedule_end", type=float, default=3e-5)
     parser.add_argument("--alpha_lr", type=float, default=7e-3)
-    parser.add_argument("--delay_alpha_update", type=float, default=250)
+    parser.add_argument("--delay_alpha_update", type=int, default=250)
+    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor for the Q critic. Default 0.99.")
+    parser.add_argument("--tau", type=float, default=0.005, help="Polyak averaging coefficient for target network updates. Default 0.005.")
+    parser.add_argument("--delay_update", type=int, default=2, help="Update policy and target networks every delay_update steps. Default 2.")
     parser.add_argument("--seed", type=int, default=100)
     parser.add_argument("--num_particles", type=int, default=32)
     parser.add_argument("--noise_scale", type=float, default=0.1)
     parser.add_argument("--cluster", default=False, action="store_true")
     parser.add_argument("--debug", action='store_true', default=False)
+    parser.add_argument("--timing_log_every", type=int, default=0)
 
     parser.add_argument("--buffer_size", type=int, default=int(1e6))
-    parser.add_argument("--batch_size", type=int, default=256,
-                        help="Mini-batch size for training updates.")
-    parser.add_argument("--val_batch_size", type=int, default=None,
-                        help="Mini-batch size for validation updates. If None, defaults to batch_size.")
+    parser.add_argument("--batch_size", type=int, default=256, help="Mini-batch size for training updates.")
+    parser.add_argument("--val_batch_size", type=int, default=None, help="Mini-batch size for validation updates. If None, defaults to batch_size.")
     parser.add_argument("--beta_schedule_scale", type=float, default=0.8)
-    parser.add_argument("--beta_schedule_type", type=str, default='linear')
-    parser.add_argument("--tfg_lambda", type=float, default=0.0,
-                        help="Guidance strength lambda for dpmd training-free Q-guidance. If 0, no Q-guidance is applied.")
-    parser.add_argument("--tfg_lambda_schedule", type=str, default="constant",
-                        help="Schedule type for dpmd guidance lambda as a function of noise level t (e.g., 'constant', 'linear').")
-    parser.add_argument("--fix_q_norm_bug", action="store_true", default=False,
-                        help="If set, use the corrected normalization (q_min - running_mean) / (running_std + eps) instead of the original buggy form.")
-    parser.add_argument("--q_critic_agg", type=str, default="min",
-                        help="Aggregation for twin Qs when used as a signal (tilting, reweighting): 'min', 'mean', or 'max'. TD targets always use 'min'.")
-    parser.add_argument("--particle_selection_lambda", type=float, default=float("inf"),
-                        help="Temperature for selecting an action among multiple particles using exp(particle_selection_lambda * Q(a)). Default inf reproduces argmax over Q.")
-    parser.add_argument("--dpmd_recurrence_steps", type=int, default=0,
-                        help="Number of recurrence-style TFG inner steps per diffusion level for dpmd (0 disables recurrence).")
-    parser.add_argument("--dpmd_constant_weight", action="store_true", default=False,
-                        help="If set for dpmd, disable Q-based reweighting in the diffusion score-matching loss and use constant weights.")
-    parser.add_argument("--single_q_network", action="store_true", default=False,
-                        help="If set, train a single Q network instead of twin Q networks. The same Q is used for both Q1 and Q2.")
-    parser.add_argument("--dpmd_use_reward_critic", action="store_true", default=False,
-                        help="If set for dpmd, replace the Q critic with a 1-step reward network trained from the replay buffer and use it (scaled by 1/(1-gamma)) for tilting/guidance.")
-    parser.add_argument("--dpmd_pure_bc_training", action="store_true", default=False,
-                        help="If set for dpmd, train the diffusion policy purely by behavior cloning from replay actions (no critic-based tilting at training time), while still using the critic for inference-time guidance.")
-    parser.add_argument("--dpmd_off_policy_td", action="store_true", default=False,
-                        help="If set for dpmd, use off-policy (buffer) actions for the critic TD target instead of on-policy (sampled from current policy) actions.")
-    parser.add_argument("--dpmd_no_entropy_tuning", action="store_true", default=False,
-                        help="If set for dpmd, disable action noise and alpha/entropy tuning (makes DPMD more similar to dpmd_mb_pc).")
-    parser.add_argument("--dpmd_long_lr_schedule", action="store_true", default=False,
-                        help="If set, anneal the diffusion policy LR over the full training horizon instead of the default 50k-step schedule (applies to dpmd and dpmd_mb).")                    
-    parser.add_argument("--dpmd_bc_noisy_q_guided", action="store_true", default=False,
-                        help="For dpmd_bc: train Q on noisy forward-diffused actions and use guided sampling that evaluates Q on an intermediate noisy diffusion state.")
-    parser.add_argument("--dpmd_bc_tfg_recurrence", action="store_true", default=False,
-                        help="For dpmd_bc: apply a recurrence-style training-free guidance step at inference time using Q as f(x_0)=exp(Q(x_0)).")
-    parser.add_argument("--dpmd_bc_recurrence_steps", type=int, default=3,
-                        help="For dpmd_bc: number of recurrence steps per noise level when using tfg_recurrence.")
-    parser.add_argument("--energy_param", action="store_true", default=False,
-                        help="Parameterize the diffusion model as the gradient of an energy function.")
-    parser.add_argument("--mala_steps", type=int, default=0,
-                        help="Number of MALA correction steps per diffusion step. If > 0, automatically enables energy_param.")
+    parser.add_argument("--beta_schedule_type", type=str, default='linear', help="Noise schedule type. 'linear': linear beta schedule. 'cosine': cosine schedule (Nichol & Dhariwal). 'constant_kl': constant mutual-information-loss per step, spacing noise levels uniformly in log(1+SNR).")
+    parser.add_argument("--snr_max", type=float, default=124.0, help="Maximum SNR (at cleanest noise level). Controls alpha_bar_0 = snr_max/(1+snr_max). Default 124.0 matches the cosine schedule with s=0.008 offset at T=20. All schedule types use this to set the same clean endpoint, so you can switch between cosine/constant_kl/linear while keeping the noise range comparable.")
+    parser.add_argument("--reward_scale", type=float, default=0.2, help="Scale factor applied to rewards before Q/value learning. Default 0.2 matches original DPMD. Set to 1.0 for clarity when using inference-time guidance (adjust tfg_lambda/particle_selection_lambda accordingly).")
+    parser.add_argument("--tfg_lambda", type=float, default=0.0, help="Guidance strength lambda for dpmd training-free Q-guidance. If 0, no Q-guidance is applied.")
+    parser.add_argument("--tfg_lambda_end", type=float, default=None, help="Final value of tfg_lambda at end of training. If set, tfg_lambda interpolates log-linearly from tfg_lambda to tfg_lambda_end over training. Default None uses constant tfg_lambda.")
+    parser.add_argument("--log_md_kl_every", type=int, default=int(1e9), help="Log KL(π_tilt || π_0) every N steps. Default 1e9 (effectively disabled). Requires sampling from base policy, so adds overhead when enabled.")
+    parser.add_argument("--critic_normalization", type=str, default="none", choices=["none", "ema", "distributional"], help="Normalization mode for Q guidance. 'none': use raw Q. 'ema': train V(s) to predict E[Q], normalize (Q-V) by sqrt(EMA[A^2]). 'distributional': train distributional V(s) outputting (mean, var), normalize by per-state std.")
+    parser.add_argument("--td_actions", type=int, default=1, help="Number of denoised next-actions to sample for TD target computation (mean Q over td_actions). Default 1.")
+    parser.add_argument("--tfg_patience", type=float, default=float("inf"), help="If finite, reduce tfg_lambda when the logged sample/episode_return has failed to improve for tfg_patience consecutive logged points at the current tfg_lambda. Default inf disables the scheduler.")
+    parser.add_argument("--tfg_reduction_factor", type=float, default=1.0, help="Multiplicative factor applied to tfg_lambda when plateau patience is exceeded. Default 1.0 is a no-op.")
+    parser.add_argument("--x0_hat_clip_radius", type=float, default=float("inf"), help="Clipping radius r for Tweedie clean-action estimates x0_hat used inside guidance/Q evaluation. x0_hat is clipped to [-r, r] before being passed into Q / model-based objectives. Default 1.0 matches normalized action bounds.")
+    parser.add_argument("--tfg_lambda_schedule", type=str, default="constant", help="Schedule for guidance lambda vs noise level. 'constant': lambda_t=lambda. 'linear': linearly from lambda at t=0 to 0 at t=T. 'snr': lambda_t=lambda*alpha_bar_t (SNR-proportional), gives bounded c_t=lambda*(1-alpha_bar_t) and ~constant Hessian-term loss.")
+    parser.add_argument("--fix_q_norm_bug", action="store_true", default=False, help="If set, use the corrected normalization (q_min - running_mean) / (running_std + eps) instead of the original buggy form.")
+    parser.add_argument("--q_critic_agg", type=str, default="min", help="Aggregation for twin Qs when used as a signal (tilting, reweighting): 'min', 'mean', 'max', 'random', 'entropic', or 'precision'. 'entropic' uses log(mean(exp(Q))), a soft-max. 'precision' uses inverse-variance-weighted mean (for distributional critics). TD targets always use 'min'.")
+    parser.add_argument("--entropic_risk_beta", type=float, default=1.0, help="Temperature for entropic risk aggregation (only used with --q_critic_agg entropic). Aggregation is (1/beta)*log(mean(exp(beta*Q))). beta>0: risk-seeking/optimistic (beta->inf gives max). beta->0: risk-neutral (mean). beta<0: risk-averse/pessimistic (beta->-inf gives min). Default 1.0.")
+    parser.add_argument("--particle_selection_lambda", type=float, default=float("inf"), help="Temperature for selecting an action among multiple particles using exp(particle_selection_lambda * Q(a)). Default inf reproduces argmax over Q.")
+    parser.add_argument("--dpmd_recurrence_steps", type=int, default=0, help="Number of recurrence-style TFG inner steps per diffusion level for dpmd (0 disables recurrence).")
+    parser.add_argument("--dpmd_constant_weight", action="store_true", default=False, help="If set for dpmd, disable Q-based reweighting in the diffusion score-matching loss and use constant weights.")
+    parser.add_argument("--single_q_network", action="store_true", default=False, help="If set, train a single Q network instead of twin Q networks. The same Q is used for both Q1 and Q2.")
+    parser.add_argument("--dpmd_use_reward_critic", action="store_true", default=False, help="If set for dpmd, replace the Q critic with a 1-step reward network trained from the replay buffer and use it (scaled by 1/(1-gamma)) for tilting/guidance.")
+    parser.add_argument("--dpmd_pure_bc_training", action="store_true", default=False, help="If set for dpmd, train the diffusion policy purely by behavior cloning from replay actions (no critic-based tilting at training time), while still using the critic for inference-time guidance.")
+    parser.add_argument("--dpmd_off_policy_td", action="store_true", default=False, help="If set for dpmd, use off-policy (buffer) actions for the critic TD target instead of on-policy (sampled from current policy) actions.")
+    parser.add_argument("--dpmd_no_entropy_tuning", action="store_true", default=False, help="If set for dpmd, disable action noise and alpha/entropy tuning (makes DPMD more similar to dpmd_mb_pc).")
+    parser.add_argument("--lr_annealing", action="store_true", default=False, help="If set, anneal the learning rate from initial LR to lr_schedule_end over the full training horizon. If not set, LR remains constant (applies to dpmd and dpmd_mb).")                    
+    parser.add_argument("--dpmd_bc_noisy_q_guided", action="store_true", default=False, help="For dpmd_bc: train Q on noisy forward-diffused actions and use guided sampling that evaluates Q on an intermediate noisy diffusion state.")
+    parser.add_argument("--dpmd_bc_tfg_recurrence", action="store_true", default=False, help="For dpmd_bc: apply a recurrence-style training-free guidance step at inference time using Q as f(x_0)=exp(Q(x_0)).")
+    parser.add_argument("--dpmd_bc_recurrence_steps", type=int, default=3, help="For dpmd_bc: number of recurrence steps per noise level when using tfg_recurrence.")
+    parser.add_argument("--energy_param", action="store_true", default=False, help="Parameterize the diffusion model as the gradient of an energy function.")
+    parser.add_argument("--mala_steps", type=int, default=0, help="Number of MALA correction steps per diffusion step. If > 0, automatically enables energy_param.")
+    parser.add_argument("--gaussian_prior_baseline", action="store_true", default=False, help="Add Gaussian prior baseline so untrained model samples from N(0,I). For energy mode: E(x)=0.5||x||^2+E_net(x). For eps mode: eps(x,t)=sigma_t*x+eps_net(x,t).")
+    parser.add_argument("--zero_init_q", action="store_true", default=False, help="Zero-initialize the last layer of the Q network so Q(s,a)=0 at init. Prevents early Hessian amplification in guided_ula_kl loss.")
+    parser.add_argument("--mala_per_level_eta", action="store_true", default=False, help="If set, learn a separate MALA eta-scale for each diffusion noise level. Default behavior (flag off) uses a single shared eta-scale across all noise levels.")
+    parser.add_argument("--mala_adapt_rate", type=float, default=0.05, help="Robbins-Monro adaptation rate for MALA log_eta_scale updates.")
+    parser.add_argument("--mala_init_eta_scale", type=float, default=1.0, help="Initial MALA eta_scale multiplier (eta_k = eta_scale * beta_t, then clipped).")
+    parser.add_argument("--mala_guided_predictor", action="store_true", default=False, help="If set, apply Q-guidance (TFG-style eps guidance) in the DDPM predictor step after each MALA correction step.")
+    parser.add_argument("--mala_predictor_first", action="store_true", default=False, help="If set, use predictor->corrector ordering for MALA sampling: apply DDPM predictor step t->t-1 first, then run MALA corrector targeting energy_total at level t-1.")
+    parser.add_argument("--ddim_predictor", action="store_true", default=False, help="If set, use deterministic DDIM-style predictor (no noise) instead of stochastic DDPM. Recommended for MALA sampling since the stochastic noise is redundant with MALA corrections.")
+    parser.add_argument("--q_td_huber_width", type=float, default=float("inf"), help="Huber width (delta) for critic TD error in DPMD. Default inf recovers the current MSE TD loss. Effective width is scaled by reward_scale internally.")
+    parser.add_argument("--decorrelated_q_batches", action="store_true", default=False, help="If set, Q1 and Q2 see shuffled versions of the same batch, decorrelating their training data to maintain disagreement at large batch sizes.")
+    parser.add_argument("--q_bootstrap_agg", type=str, default="min", choices=["min", "independent", "mean", "mixture", "pick_min"], help="Aggregation mode for Q TD targets. 'min' (default): both Qs bootstrap from min(Q1_target, Q2_target). 'independent': Q1 bootstraps from Q1_target, Q2 from Q2_target. 'mean': both Qs bootstrap from mean(Q1_target, Q2_target). 'mixture': both Qs bootstrap from mixture distribution of Q1 and Q2. 'pick_min': pick (mean,var) from whichever target critic has lower mean (DSAC-T style).")
+    parser.add_argument("--langevin_q_noise", action="store_true", default=False, help="If set, add SGLD noise to Q gradients: grad += sqrt(2*lr_q/batch_size)*noise. This approximates posterior sampling over Q-functions (LSAC-style).")
+    parser.add_argument("--distributional_critic", action="store_true", default=False, help="If set, use a distributional Q critic that outputs (mean, variance) and is trained with cross-entropy loss instead of MSE.")
+    parser.add_argument("--critic_grad_modifier", type=str, default="none", choices=["none", "variance_scaled", "natgrad"], help="Distributional critic gradient modifier. 'none' (default): standard CE gradients. 'variance_scaled': multiply CE by stop_gradient(var) (legacy/halfway). 'natgrad': full natural gradient in (mean,var) coordinates. Only effective with --distributional_critic.")
+    parser.add_argument("--natural_gradient_critic", action="store_true", default=False, help="Deprecated alias for --critic_grad_modifier natgrad. If set and --critic_grad_modifier is left at default, enables natgrad. Only effective with --distributional_critic.")
+    # DSAC-T refinements (Distributional SAC with Three Refinements, arxiv.org/abs/2310.05858)
+    parser.add_argument("--dsac_expected_value_sub", action="store_true", default=False, help="DSAC-T Refinement 1: Expected value substitution. Use target_var=0 for the mean-related gradient, reducing variance. Only effective with --distributional_critic.")
+    parser.add_argument("--dsac_adaptive_clip_xi", type=float, default=0.0, help="DSAC-T Refinement 2: Adaptive clipping factor xi. If > 0, clip TD error by xi*sigma in variance gradient (typically xi=3 for three-sigma rule). Set to 0 to disable. Only effective with --distributional_critic.")
+    parser.add_argument("--dsac_omega_scaling", action="store_true", default=False, help="DSAC-T Refinement 3: Omega scaling. Scale loss by omega/(omega_ema+eps) where omega=mean(pred_var). Normalizes gradients across reward scales. Only effective with --distributional_critic.")
+    parser.add_argument("--dsac_omega_tau", type=float, default=0.005, help="Polyak averaging rate for DSAC-T omega and b EMA updates. Only used when --dsac_omega_scaling or --dsac_adaptive_clip_xi > 0.")
+    parser.add_argument("--latent_action_space", action="store_true", default=False, help="If set, treat policy/Q/diffusion actions as unconstrained latent variables z. Only when interacting with the environment (and for logging) we squash via a = 2*NormalCDF(z)-1. Replay buffer stores latents, so all models train on latent actions.")
+    parser.add_argument("--latent_action_eps", type=float, default=1e-6, help="Epsilon for clamping probabilities when converting between env actions and latent actions.")
     parser.add_argument("--model_q_mc_samples", type=int, default=8)
+    parser.add_argument("--energy_multiplier", type=float, default=1.0, help="Multiplier for base energy/score during sampling. Values < 1 temper (flatten) the base distribution, increasing entropy. Guidance signal is NOT scaled. Default 1.0 (no tempering).")
+    parser.add_argument("--policy_loss_type", type=str, default="eps_mse", choices=["eps_mse", "ula_kl", "guided_ula_kl", "e2e_guided_ula_kl"], help="Policy diffusion loss type. 'eps_mse': standard MSE on epsilon. 'ula_kl': ULA-step KL (eta_t/(1-abar) weighted epsilon MSE). 'guided_ula_kl': Hessian-weighted score MSE via M_t = I + c_t*H_Q where c_t = lambda*(1-abar)/abar. 'e2e_guided_ula_kl': end-to-end guided drift MSE (Q gradient flows through Tweedie estimate). All guided losses treat Q params and MALA step size as fixed.")
 
     # Validation / hold-out configuration
     parser.add_argument("--use_validation", action="store_true", default=False,
@@ -297,14 +333,14 @@ if __name__ == "__main__":
         raise ValueError("--use_hypergrad requires --use_validation to be enabled, since hypergradients are computed from validation loss.")
 
     # Configure policy LR schedule for diffusion-policy algorithms (dpmd, dpmd_mb).
-    if args.dpmd_long_lr_schedule:
+    if args.lr_annealing:
         # Anneal over the full training horizon
         dpmd_lr_schedule_steps = int(args.total_step)
         dpmd_lr_schedule_begin = 0
     else:
-        # Preserve original behavior (short 50k-step schedule)
-        dpmd_lr_schedule_steps = int(5e4)
-        dpmd_lr_schedule_begin = int(2.5e4)
+        # No annealing: constant LR (set schedule_steps to 0 to disable)
+        dpmd_lr_schedule_steps = 0
+        dpmd_lr_schedule_begin = 0
 
     if args.debug:
         from jax import config
@@ -320,9 +356,25 @@ if __name__ == "__main__":
     del init_network_seed, train_seed
 
     if args.num_vec_envs > 0:
-        env, obs_dim, act_dim = create_vector_env(args.env, args.num_vec_envs, env_seed, env_action_seed, mode="futex")
+        env, obs_dim, act_dim = create_vector_env(
+            args.env,
+            args.num_vec_envs,
+            env_seed,
+            env_action_seed,
+            mode="futex",
+            backend=args.backend,
+            dummy_action_dim=args.dummy_action_dim,
+            dummy_action_alpha=args.dummy_action_alpha,
+        )
     else:
-        env, obs_dim, act_dim = create_env(args.env, env_seed, env_action_seed)
+        env, obs_dim, act_dim = create_env(
+            args.env,
+            env_seed,
+            env_action_seed,
+            dummy_action_dim=args.dummy_action_dim,
+            dummy_action_alpha=args.dummy_action_alpha,
+            backend=args.backend,
+        )
     eval_env = None
 
     hidden_sizes = [args.hidden_dim] * args.hidden_num
@@ -357,6 +409,7 @@ if __name__ == "__main__":
             env_seed + 1,
             env_action_seed + 1,
             mode="futex",
+            backend=args.backend,
         )
 
         val_buffer_size = max(1, int(args.buffer_size * r))
@@ -383,12 +436,15 @@ if __name__ == "__main__":
             beta_schedule_type=args.beta_schedule_type,
             energy_param=args.energy_param,
             mala_steps=args.mala_steps,
+            gaussian_prior_baseline=args.gaussian_prior_baseline,
+            snr_max=args.snr_max,
         )
         algorithm = SDAC(agent, params, lr=args.lr, alpha_lr=args.alpha_lr, delay_alpha_update=args.delay_alpha_update, lr_schedule_end=args.lr_schedule_end)
     
     elif args.alg == 'dpmd':
         def mish(x: jax.Array):
             return x * jnp.tanh(jax.nn.softplus(x))
+
         agent, params = create_diffv2_net(
             init_network_key,
             obs_dim,
@@ -404,14 +460,27 @@ if __name__ == "__main__":
             energy_param=args.energy_param,
             mala_steps=args.mala_steps,
             single_q_network=args.single_q_network,
+            x_recon_clip_radius=args.x0_hat_clip_radius if args.latent_action_space else 1.0,
+            gaussian_prior_baseline=args.gaussian_prior_baseline,
+            distributional_critic=args.distributional_critic,
+            snr_max=args.snr_max,
+            zero_init_q=args.zero_init_q,
         )
+
         algorithm = DPMD(
             agent,
             params,
+            gamma=args.gamma,
             lr=args.lr,
+            lr_policy=args.lr_policy,
+            lr_q=args.lr_q,
             alpha_lr=args.alpha_lr,
             delay_alpha_update=args.delay_alpha_update,
+            tau=args.tau,
+            delay_update=args.delay_update,
             lr_schedule_end=args.lr_schedule_end,
+            reward_scale=args.reward_scale,
+            td_actions=args.td_actions,
             use_reweighting=not args.dpmd_constant_weight,
             use_reward_critic=args.dpmd_use_reward_critic,
             pure_bc_training=args.dpmd_pure_bc_training,
@@ -423,10 +492,32 @@ if __name__ == "__main__":
             tfg_lambda_schedule=args.tfg_lambda_schedule,
             tfg_recur_steps=args.dpmd_recurrence_steps,
             particle_selection_lambda=args.particle_selection_lambda,
+            x0_hat_clip_radius=args.x0_hat_clip_radius,
             supervised_steps=args.supervised_steps,
             single_q_network=args.single_q_network,
             lr_schedule_steps=dpmd_lr_schedule_steps,
             lr_schedule_begin=dpmd_lr_schedule_begin,
+            mala_per_level_eta=args.mala_per_level_eta,
+            mala_adapt_rate=args.mala_adapt_rate,
+            mala_init_eta_scale=args.mala_init_eta_scale,
+            mala_guided_predictor=args.mala_guided_predictor,
+            mala_predictor_first=args.mala_predictor_first,
+            ddim_predictor=args.ddim_predictor,
+            latent_action_space=args.latent_action_space,
+            q_td_huber_width=args.q_td_huber_width,
+            decorrelated_q_batches=args.decorrelated_q_batches,
+            q_bootstrap_agg=args.q_bootstrap_agg,
+            entropic_risk_beta=args.entropic_risk_beta,
+            langevin_q_noise=args.langevin_q_noise,
+            critic_grad_modifier=args.critic_grad_modifier,
+            natural_gradient_critic=args.natural_gradient_critic,
+            dsac_expected_value_sub=args.dsac_expected_value_sub,
+            dsac_adaptive_clip_xi=args.dsac_adaptive_clip_xi,
+            dsac_omega_scaling=args.dsac_omega_scaling,
+            dsac_omega_tau=args.dsac_omega_tau,
+            energy_multiplier=args.energy_multiplier,
+            critic_normalization=args.critic_normalization,
+            policy_loss_type=args.policy_loss_type,
         )
 
     elif args.alg == 'dpmd_bc':
@@ -448,6 +539,8 @@ if __name__ == "__main__":
             beta_schedule_type=args.beta_schedule_type,
             energy_param=args.energy_param,
             mala_steps=args.mala_steps,
+            gaussian_prior_baseline=args.gaussian_prior_baseline,
+            snr_max=args.snr_max,
         )
         algorithm = DPMDBC(
             agent,
@@ -456,6 +549,7 @@ if __name__ == "__main__":
             alpha_lr=args.alpha_lr,
             delay_alpha_update=args.delay_alpha_update,
             lr_schedule_end=args.lr_schedule_end,
+            reward_scale=args.reward_scale,
             train_q_on_noisy_actions=args.dpmd_bc_noisy_q_guided,
             guided_sampling=args.dpmd_bc_noisy_q_guided,
             tfg_recurrence=args.dpmd_bc_tfg_recurrence,
@@ -479,6 +573,7 @@ if __name__ == "__main__":
             beta_schedule_scale=args.beta_schedule_scale,
             beta_schedule_type=args.beta_schedule_type,
             energy_param=args.energy_param,
+            snr_max=args.snr_max,
         )
         algorithm = DPMDMB(
             agent,
@@ -487,6 +582,7 @@ if __name__ == "__main__":
             alpha_lr=args.alpha_lr,
             delay_alpha_update=args.delay_alpha_update,
             lr_schedule_end=args.lr_schedule_end,
+            reward_scale=args.reward_scale,
             num_mc_samples=args.model_q_mc_samples,
             lr_policy=args.lr_policy,
             lr_dyn=args.lr_dyn,
@@ -520,7 +616,7 @@ if __name__ == "__main__":
             agent,
             params,
             lr=args.lr,
-            reward_scale=0.2,
+            reward_scale=args.reward_scale,
             use_value=args.pc_use_value,
             sprime_num_particles=args.sprime_num_particles,
             sprime_refresh_steps=args.sprime_refresh_steps,
@@ -534,6 +630,7 @@ if __name__ == "__main__":
             open_loop=args.open_loop,
             use_crn=args.pc_use_crn,
             tfg_lambda=args.tfg_lambda,
+            x0_hat_clip_radius=args.x0_hat_clip_radius,
             supervised_steps=args.supervised_steps,
             lr_policy=args.lr_policy,
             lr_dyn=args.lr_dyn,
@@ -568,6 +665,8 @@ if __name__ == "__main__":
             beta_schedule_type=args.beta_schedule_type,
             energy_param=args.energy_param,
             mala_steps=args.mala_steps,
+            gaussian_prior_baseline=args.gaussian_prior_baseline,
+            snr_max=args.snr_max,
         )
         algorithm = IDEM(agent, params, lr=args.lr, alpha_lr=args.alpha_lr, delay_alpha_update=args.delay_alpha_update, lr_schedule_end=args.lr_schedule_end)
     elif args.alg == "qsm":
@@ -637,7 +736,7 @@ if __name__ == "__main__":
         algorithm = PCMD(
             pc_net,
             pc_params,
-            gamma=0.99,
+            gamma=args.gamma,
             lr_policy=args.lr_policy if args.lr_policy is not None else args.lr,
             lr_dyn=args.lr_dyn if args.lr_dyn is not None else args.lr,
             lr_reward=args.lr_reward if args.lr_reward is not None else args.lr,
@@ -687,12 +786,15 @@ if __name__ == "__main__":
     if hasattr(algorithm, "get_effective_hparams"):
         args_dict.update(algorithm.get_effective_hparams())
 
+    # Scale batch size for decorrelated Q batches: each Q should see batch_size transitions
+    effective_batch_size = args.batch_size * 2 if getattr(args, 'decorrelated_q_batches', False) else args.batch_size
+
     trainer = OffPolicyTrainer(
         env=env,
         algorithm=algorithm,
         buffer=buffer,
         log_path=exp_dir,
-        batch_size=args.batch_size,
+        batch_size=effective_batch_size,
         val_batch_size=args.val_batch_size,
         start_step=args.start_step,
         total_step=args.total_step,
@@ -702,6 +804,8 @@ if __name__ == "__main__":
         save_policy_every=int(args.total_step / 20),
         save_value=save_value,
         update_log_n_step=1 if args.debug else 1000,
+        debug=args.debug,
+        timing_log_every=args.timing_log_every,
         warmup_with="random",
         hparams=args_dict,
         use_validation=args.use_validation,
@@ -712,6 +816,13 @@ if __name__ == "__main__":
         val_buffer=val_buffer,
         validation_ratio=args.validation_ratio,
         track_next_action=include_next_action,  # Enable SARSA-style buffer for off-policy TD
+        latent_action_space=args.latent_action_space,
+        latent_action_eps=args.latent_action_eps,
+        tfg_patience=args.tfg_patience,
+        tfg_reduction_factor=args.tfg_reduction_factor,
+        tfg_lambda_start=args.tfg_lambda,
+        tfg_lambda_end=args.tfg_lambda_end,
+        log_md_kl_every=args.log_md_kl_every,
     )
 
     trainer.setup(Experience.create_example(obs_dim, act_dim, trainer.batch_size, include_next_action=include_next_action))

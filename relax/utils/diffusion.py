@@ -1,4 +1,4 @@
-from typing import Protocol, Tuple
+from typing import Protocol, Tuple, Optional
 from dataclasses import dataclass
 
 import numpy as np
@@ -77,24 +77,63 @@ class BetaScheduleCoefficients:
     def linear_beta_schedule(timesteps: int, beta_start=1e-4, beta_end=0.999):
         return np.linspace(beta_start, beta_end, timesteps, dtype=np.float64)
 
+    @staticmethod
+    def constant_kl_beta_schedule(timesteps: int, snr_max=1000.0):
+        """Constant-KL schedule: noise levels equally spaced in log(1 + SNR).
+
+        Derived from requiring constant mutual-information loss per step:
+            I(x_0; x_{k-1}) - I(x_0; x_k) = const  for all k
+        where I(x_0; x_t) = (d/2) log(1 + SNR(t)).
+
+        This gives:
+            alpha_bar_k = 1 - R^{-(T-k)/T},  R = 1 + SNR_max
+        with k=0 cleanest (alpha_bar ~ 1) and k=T-1 noisiest (alpha_bar > 0).
+        Pure noise (alpha_bar = 0) is an implicit endpoint outside the schedule;
+        the reverse process starts from N(0,I) and the model at t=T-1 provides
+        the first denoising step.
+        """
+        R = 1.0 + snr_max
+        T = timesteps
+        k = np.arange(T, dtype=np.float64)
+        exponent = (T - k) / T
+        alphas_cumprod = 1.0 - R ** (-exponent)
+        # Derive betas: beta_k = 1 - alpha_bar_k / alpha_bar_{k-1}
+        alphas_cumprod_with_1 = np.concatenate([[1.0], alphas_cumprod])
+        betas = 1.0 - alphas_cumprod_with_1[1:] / alphas_cumprod_with_1[:-1]
+        betas = np.clip(betas, 1e-8, 0.999)
+        return betas
+
 @dataclass(frozen=True)
 class GaussianDiffusion:
     num_timesteps: int
     beta_schedule_scale: float = 0.3
     beta_schedule_type: str = 'linear'
+    x_recon_clip_radius: Optional[float] = 1.0
+    snr_max: float = 124.0
 
     def beta_schedule(self):
         with jax.ensure_compile_time_eval():
-            if self.beta_schedule_type == 'linear':
-                betas = self.beta_schedule_scale * BetaScheduleCoefficients.linear_beta_schedule(self.num_timesteps)
+            target_abar_0 = self.snr_max / (1.0 + self.snr_max)
+
+            if self.beta_schedule_type == 'constant_kl':
+                betas = BetaScheduleCoefficients.constant_kl_beta_schedule(
+                    self.num_timesteps, snr_max=self.snr_max)
             elif self.beta_schedule_type == 'cosine':
-                betas = self.beta_schedule_scale * BetaScheduleCoefficients.cosine_beta_schedule(self.num_timesteps)
+                raw_betas = BetaScheduleCoefficients.cosine_beta_schedule(self.num_timesteps)
+                scale = (1.0 - target_abar_0) / raw_betas[0]
+                betas = np.clip(scale * raw_betas, 0, 0.999)
+            elif self.beta_schedule_type == 'linear':
+                raw_betas = BetaScheduleCoefficients.linear_beta_schedule(self.num_timesteps)
+                scale = (1.0 - target_abar_0) / raw_betas[0]
+                betas = np.clip(scale * raw_betas, 0, 0.999)
             return BetaScheduleCoefficients.from_beta(betas)
 
     def p_mean_variance(self, t: int, x: jax.Array, noise_pred: jax.Array):
         B = self.beta_schedule()
         x_recon = x * B.sqrt_recip_alphas_cumprod[t] - noise_pred * B.sqrt_recipm1_alphas_cumprod[t]
-        x_recon = jnp.clip(x_recon, -1, 1)
+        if self.x_recon_clip_radius is not None:
+            r = jnp.float32(self.x_recon_clip_radius)
+            x_recon = jnp.clip(x_recon, -r, r)
         model_mean = x_recon * B.posterior_mean_coef1[t] + x * B.posterior_mean_coef2[t]
         model_log_variance = B.posterior_log_variance_clipped[t]
         return model_mean, model_log_variance
@@ -104,20 +143,36 @@ class GaussianDiffusion:
         x_recon = x * B.sqrt_recip_alphas_cumprod[t][:, jnp.newaxis] - noise * B.sqrt_recipm1_alphas_cumprod[t][:, jnp.newaxis]
         return x_recon
 
-    def p_sample(self, key: jax.Array, model: DiffusionModel, shape: Tuple[int, ...]) -> jax.Array:
+    def p_sample(
+        self,
+        key: jax.Array,
+        model: DiffusionModel,
+        shape: Tuple[int, ...],
+        deterministic: bool = False,
+    ) -> jax.Array:
         x_key, noise_key = jax.random.split(key)
         x = 0.5 * jax.random.normal(x_key, shape)
-        noise = jax.random.normal(noise_key, (self.num_timesteps, *shape))
+        noise = None if deterministic else jax.random.normal(noise_key, (self.num_timesteps, *shape))
 
         def body_fn(x, input):
-            t, noise = input
-            noise_pred = model(t, x)
-            model_mean, model_log_variance = self.p_mean_variance(t, x, noise_pred)
-            x = model_mean + (t > 0) * jnp.exp(0.5 * model_log_variance) * noise
-            return x, None
+            if deterministic:
+                t = input
+                noise_pred = model(t, x)
+                model_mean, _model_log_variance = self.p_mean_variance(t, x, noise_pred)
+                x = model_mean
+                return x, None
+            else:
+                t, eps = input
+                noise_pred = model(t, x)
+                model_mean, model_log_variance = self.p_mean_variance(t, x, noise_pred)
+                x = model_mean + (t > 0) * jnp.exp(0.5 * model_log_variance) * eps
+                return x, None
 
         t = jnp.arange(self.num_timesteps)[::-1]
-        x, _ = jax.lax.scan(body_fn, x, (t, noise))
+        if deterministic:
+            x, _ = jax.lax.scan(body_fn, x, t)
+        else:
+            x, _ = jax.lax.scan(body_fn, x, (t, noise))
         return x
 
     def q_sample(self, t: int, x_start: jax.Array, noise: jax.Array):
@@ -144,6 +199,42 @@ class GaussianDiffusion:
         loss = weights * optax.squared_error(noise_pred, noise)
         return loss.mean()
     
+    def ula_weighted_p_loss(self, key: jax.Array, sample_weights: jax.Array, model: DiffusionModel, t: jax.Array,
+                           x_start: jax.Array, eta_scales: jax.Array):
+        """ULA-KL policy loss: weights epsilon MSE by eta_t / (1 - alpha_bar_t).
+
+        This loss corresponds to the KL divergence between the distribution of
+        ULA steps taken using the model's score vs the true score:
+            KL = (eta_t / 4) * ||s_theta - s*||^2
+        In epsilon space this becomes:
+            (eta_t / (4 * (1 - alpha_bar_t))) * ||eps_theta - eps||^2
+
+        The step size eta_t = stop_gradient(eta_scale_t) * beta_t is treated as
+        fixed (no backprop through step-size adaptation).
+
+        Args:
+            key: PRNG key for noise sampling.
+            sample_weights: Per-sample Q-based weights [batch] or [batch, 1].
+            model: Denoiser model predicting epsilon.
+            t: Diffusion timestep indices [batch].
+            x_start: Clean actions [batch, act_dim].
+            eta_scales: Per-level eta scales [num_timesteps] (stop-gradiented externally).
+        """
+        if len(sample_weights.shape) == 1:
+            sample_weights = sample_weights.reshape(-1, 1)
+        assert t.ndim == 1 and t.shape[0] == x_start.shape[0]
+        B = self.beta_schedule()
+        noise = jax.random.normal(key, x_start.shape)
+        x_noisy = jax.vmap(self.q_sample)(t, x_start, noise)
+        noise_pred = model(t, x_noisy)
+        # ULA step size: eta_t = eta_scale_t * beta_t
+        eta_t = jax.lax.stop_gradient(eta_scales[t] * B.betas[t])
+        # Score-space weight: eta_t / (1 - alpha_bar_t)
+        one_minus_alpha_bar = jnp.maximum(jnp.float32(1.0) - B.alphas_cumprod[t], jnp.float32(1e-8))
+        ula_weight = (eta_t / one_minus_alpha_bar).reshape(-1, 1)
+        loss = sample_weights * ula_weight * optax.squared_error(noise_pred, noise)
+        return loss.mean()
+
     def reverse_samping_weighted_p_loss(self, noise: jax.Array, weights: jax.Array, model: DiffusionModel, t: jax.Array,
                         x_t: jax.Array):
         if len(weights.shape) == 1:

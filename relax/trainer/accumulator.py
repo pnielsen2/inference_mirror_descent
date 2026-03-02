@@ -31,17 +31,49 @@ class Accumulator:
             log_fn(key, value)
 
 class SampleLog:
-    __slots__ = ("sample_step", "sample_episode", "episode_return", "episode_length", "accumulator")
+    __slots__ = (
+        "sample_step",
+        "sample_episode",
+        "episode_return",
+        "episode_return_env",
+        "episode_dummy_penalty",
+        "episode_length",
+        "episode_action_env_mean_abs_sum",
+        "episode_action_env_std_sum",
+        "_has_reward_env",
+        "_has_dummy_penalty",
+        "_has_action_env_stats",
+        "accumulator",
+    )
 
     def __init__(self):
         self.sample_step = 0
         self.sample_episode = 0
         self.episode_return = 0.0
+        self.episode_return_env = 0.0
+        self.episode_dummy_penalty = 0.0
         self.episode_length = 0
+        self.episode_action_env_mean_abs_sum = 0.0
+        self.episode_action_env_std_sum = 0.0
+        self._has_reward_env = False
+        self._has_dummy_penalty = False
+        self._has_action_env_stats = False
         self.accumulator = Accumulator("sample")
 
     def add(self, reward: float, terminated: bool, truncated: bool, info: dict):
         self.episode_return += reward
+        if "reward_env" in info:
+            self.episode_return_env += float(info["reward_env"])
+            self._has_reward_env = True
+        if "dummy_action_penalty" in info:
+            self.episode_dummy_penalty += float(info["dummy_action_penalty"])
+            self._has_dummy_penalty = True
+        if "action_env_mean_abs" in info:
+            self.episode_action_env_mean_abs_sum += float(info["action_env_mean_abs"])
+            self._has_action_env_stats = True
+        if "action_env_std" in info:
+            self.episode_action_env_std_sum += float(info["action_env_std"])
+            self._has_action_env_stats = True
         self.episode_length += 1
         self.sample_step += 1
 
@@ -49,9 +81,29 @@ class SampleLog:
         if done:
             self.sample_episode += 1
             self.accumulator.add("episode_return", float(self.episode_return))
+            if self._has_reward_env:
+                self.accumulator.add("episode_return_env", float(self.episode_return_env))
+            if self._has_dummy_penalty:
+                self.accumulator.add("episode_dummy_action_penalty", float(self.episode_dummy_penalty))
+            if self._has_action_env_stats and self.episode_length > 0:
+                self.accumulator.add(
+                    "episode_action_env_mean_abs",
+                    float(self.episode_action_env_mean_abs_sum) / float(self.episode_length),
+                )
+                self.accumulator.add(
+                    "episode_action_env_std",
+                    float(self.episode_action_env_std_sum) / float(self.episode_length),
+                )
             self.accumulator.add("episode_length", self.episode_length)
             self.episode_return = 0.0
+            self.episode_return_env = 0.0
+            self.episode_dummy_penalty = 0.0
             self.episode_length = 0
+            self.episode_action_env_mean_abs_sum = 0.0
+            self.episode_action_env_std_sum = 0.0
+            self._has_reward_env = False
+            self._has_dummy_penalty = False
+            self._has_action_env_stats = False
 
         return done
 
@@ -61,18 +113,51 @@ class SampleLog:
 
 
 class VectorSampleLog:
-    __slots__ = ("num_envs", "sample_step", "sample_episode", "episode_return", "episode_length", "accumulator")
+    __slots__ = (
+        "num_envs",
+        "sample_step",
+        "sample_episode",
+        "episode_return",
+        "episode_return_env",
+        "episode_dummy_penalty",
+        "episode_length",
+        "episode_action_env_mean_abs_sum",
+        "episode_action_env_std_sum",
+        "_has_reward_env",
+        "_has_dummy_penalty",
+        "_has_action_env_stats",
+        "accumulator",
+    )
 
     def __init__(self, num_envs: int):
         self.num_envs = num_envs
         self.sample_step = 0
         self.sample_episode = 0
         self.episode_return = np.zeros((num_envs,), dtype=np.float64)
+        self.episode_return_env = np.zeros((num_envs,), dtype=np.float64)
+        self.episode_dummy_penalty = np.zeros((num_envs,), dtype=np.float64)
         self.episode_length = np.zeros((num_envs,), dtype=np.int64)
+        self.episode_action_env_mean_abs_sum = np.zeros((num_envs,), dtype=np.float64)
+        self.episode_action_env_std_sum = np.zeros((num_envs,), dtype=np.float64)
+        self._has_reward_env = False
+        self._has_dummy_penalty = False
+        self._has_action_env_stats = False
         self.accumulator = Accumulator("sample")
 
     def add(self, reward: np.ndarray, terminated: np.ndarray, truncated: np.ndarray, info: dict):
         self.episode_return += reward
+        if "reward_env" in info:
+            self.episode_return_env += np.asarray(info["reward_env"], dtype=np.float64)
+            self._has_reward_env = True
+        if "dummy_action_penalty" in info:
+            self.episode_dummy_penalty += np.asarray(info["dummy_action_penalty"], dtype=np.float64)
+            self._has_dummy_penalty = True
+        if "action_env_mean_abs" in info:
+            self.episode_action_env_mean_abs_sum += np.asarray(info["action_env_mean_abs"], dtype=np.float64)
+            self._has_action_env_stats = True
+        if "action_env_std" in info:
+            self.episode_action_env_std_sum += np.asarray(info["action_env_std"], dtype=np.float64)
+            self._has_action_env_stats = True
         self.episode_length += 1
         self.sample_step += self.num_envs
 
@@ -81,9 +166,28 @@ class VectorSampleLog:
 
         self.sample_episode += done_count
         self.accumulator.add_vec("episode_return", self.episode_return[done].tolist())
+        if self._has_reward_env:
+            self.accumulator.add_vec("episode_return_env", self.episode_return_env[done].tolist())
+        if self._has_dummy_penalty:
+            self.accumulator.add_vec("episode_dummy_action_penalty", self.episode_dummy_penalty[done].tolist())
+        if self._has_action_env_stats:
+            denom = np.maximum(self.episode_length, 1)
+            mean_abs = (self.episode_action_env_mean_abs_sum / denom)[done]
+            std = (self.episode_action_env_std_sum / denom)[done]
+            self.accumulator.add_vec("episode_action_env_mean_abs", mean_abs.tolist())
+            self.accumulator.add_vec("episode_action_env_std", std.tolist())
         self.accumulator.add_vec("episode_length", self.episode_length[done].tolist())
         self.episode_return[done] = 0.0
+        self.episode_return_env[done] = 0.0
+        self.episode_dummy_penalty[done] = 0.0
         self.episode_length[done] = 0
+        self.episode_action_env_mean_abs_sum[done] = 0.0
+        self.episode_action_env_std_sum[done] = 0.0
+
+        if done_count > 0:
+            self._has_reward_env = False
+            self._has_dummy_penalty = False
+            self._has_action_env_stats = False
 
         return done_count > 0
 
@@ -152,7 +256,7 @@ class UpdateLog:
 
     def __init__(self):
         self.update_step = 0
-        self.accumulator = Accumulator("update")
+        self.accumulator = Accumulator("")
 
     def add(self, metrics: dict):
         self.update_step += 1

@@ -6,6 +6,7 @@ import haiku as hk
 import math
 
 from relax.network.blocks import Activation, DistributionalQNet2, DACERPolicyNet, QNet, EnergyPolicyNet
+from relax.utils.dist_aggregation import get_mean_only
 from relax.network.common import WithSquashedGaussianPolicy
 from relax.utils.diffusion import GaussianDiffusion
 from relax.utils.jax_utils import random_key_from_data
@@ -31,18 +32,23 @@ class Diffv2Net:
     noise_scale: float
     beta_schedule_scale: float
     beta_schedule_type: str = 'linear'
+    x_recon_clip_radius: Optional[float] = 1.0
+    snr_max: float = 124.0
     energy_mode: bool = False
     energy_fn: Optional[Callable[[hk.Params, jax.Array, jax.Array, jax.Array], jax.Array]] = None
     mala_steps: int = 1
+    distributional_critic: bool = False
 
     @property
     def diffusion(self) -> GaussianDiffusion:
         return GaussianDiffusion(self.num_timesteps, 
                                  self.beta_schedule_scale,
-                                 self.beta_schedule_type)
+                                 self.beta_schedule_type,
+                                 x_recon_clip_radius=self.x_recon_clip_radius,
+                                 snr_max=self.snr_max)
 
     def get_action(self, key: jax.Array, policy_params: hk.Params, obs: jax.Array) -> jax.Array:
-        policy_params, log_alpha, q1_params, q2_params = policy_params
+        policy_params, log_alpha, q1_params, q2_params = policy_params[:4]
 
         def model_fn(t, x):
             return self.policy(policy_params, obs, x, t)
@@ -55,10 +61,17 @@ class Diffv2Net:
                 act = self.mala_sample(key, model_fn, energy_model_fn, (*obs.shape[:-1], self.act_dim))
             else:
                 act = self.diffusion.p_sample(key, model_fn, (*obs.shape[:-1], self.act_dim))
-            q1 = self.q(q1_params, obs, act)
-            q2 = self.q(q2_params, obs, act)
+
+            if self.x_recon_clip_radius is None:
+                act_out = act
+            else:
+                r = jnp.float32(self.x_recon_clip_radius)
+                act_out = jnp.clip(act, -r, r)
+
+            q1 = self.q(q1_params, obs, act_out)
+            q2 = self.q(q2_params, obs, act_out)
             q = jnp.minimum(q1, q2)
-            return act.clip(-1, 1), q
+            return act_out, q
 
         key, noise_key = jax.random.split(key)
         if self.num_particles == 1:
@@ -69,6 +82,9 @@ class Diffv2Net:
             q_best_ind = jnp.argmax(qs, axis=0, keepdims=True)
             act = jnp.take_along_axis(acts, q_best_ind[..., None], axis=0).squeeze(axis=0)
         act = act + jax.random.normal(noise_key, act.shape) * jnp.exp(log_alpha) * self.noise_scale
+        if self.x_recon_clip_radius is not None:
+            r = jnp.float32(self.x_recon_clip_radius)
+            act = jnp.clip(act, -r, r)
         return act
 
     def mala_sample(
@@ -173,7 +189,7 @@ class Diffv2Net:
         return x_final
 
     def get_action_guided(self, key: jax.Array, policy_params: hk.Params, obs: jax.Array) -> jax.Array:
-        policy_params, log_alpha, q1_params, q2_params = policy_params
+        policy_params, log_alpha, q1_params, q2_params = policy_params[:4]
 
         def model_fn(t, x):
             return self.policy(policy_params, obs, x, t)
@@ -203,9 +219,16 @@ class Diffv2Net:
                 (i_seq, t_seq, noise),
             )
 
-            act_final = x_final.clip(-1, 1)
-            q1 = self.q(q1_params, obs, x_guide)
-            q2 = self.q(q2_params, obs, x_guide)
+            if self.x_recon_clip_radius is None:
+                act_final = x_final
+                x_guide_out = x_guide
+            else:
+                r = jnp.float32(self.x_recon_clip_radius)
+                act_final = jnp.clip(x_final, -r, r)
+                x_guide_out = jnp.clip(x_guide, -r, r)
+
+            q1 = self.q(q1_params, obs, x_guide_out)
+            q2 = self.q(q2_params, obs, x_guide_out)
             q = jnp.minimum(q1, q2)
             return act_final, q
 
@@ -218,6 +241,9 @@ class Diffv2Net:
             q_best_ind = jnp.argmax(qs, axis=0, keepdims=True)
             act = jnp.take_along_axis(acts, q_best_ind[..., None], axis=0).squeeze(axis=0)
         act = act + jax.random.normal(noise_key, act.shape) * jnp.exp(log_alpha) * self.noise_scale
+        if self.x_recon_clip_radius is not None:
+            r = jnp.float32(self.x_recon_clip_radius)
+            act = jnp.clip(act, -r, r)
         return act
 
     def get_batch_actions(self, key: jax.Array, policy_params: hk.Params, obs: jax.Array, q_func: Callable) -> jax.Array:
@@ -233,7 +259,7 @@ class Diffv2Net:
 
     def get_deterministic_action(self, policy_params: hk.Params, obs: jax.Array) -> jax.Array:
         key = random_key_from_data(obs)
-        policy_params, log_alpha, q1_params, q2_params = policy_params
+        policy_params, log_alpha, q1_params, q2_params = policy_params[:4]
         log_alpha = -jnp.inf
         policy_params = (policy_params, log_alpha, q1_params, q2_params)
         return self.get_action(key, policy_params, obs)
@@ -263,10 +289,40 @@ def create_diffv2_net(
     energy_param: bool = False,
     mala_steps: int = 1,
     single_q_network: bool = False,
+    x_recon_clip_radius: Optional[float] = 1.0,
+    gaussian_prior_baseline: bool = False,
+    distributional_critic: bool = False,
+    snr_max: float = 124.0,
+    zero_init_q: bool = False,
     ) -> Tuple[Diffv2Net, Diffv2Params]:
-    # q = hk.without_apply_rng(hk.transform(lambda obs, act: DistributionalQNet2(hidden_sizes, activation)(obs, act)))
-    q = hk.without_apply_rng(hk.transform(lambda obs, act: QNet(hidden_sizes, activation)(obs, act)))
+    if distributional_critic:
+        # Distributional Q network outputs (mean, std)
+        q_net = hk.without_apply_rng(hk.transform(lambda obs, act: DistributionalQNet2(hidden_sizes, activation)(obs, act)))
+        
+        def q_apply(params, obs, act):
+            mean, std = q_net.apply(params, obs, act)
+            var = std ** 2
+            return mean, var
+    else:
+        # Standard Q network outputs scalar - wrap to return (mean, var=0) for unified interface
+        q_net = hk.without_apply_rng(hk.transform(lambda obs, act: QNet(hidden_sizes, activation, zero_init_final=zero_init_q)(obs, act)))
+        
+        def q_apply(params, obs, act):
+            q_val = q_net.apply(params, obs, act)
+            return q_val, jnp.zeros_like(q_val)
     
+    q = q_net
+    
+    # Precompute beta schedule coefficients for gaussian_prior_baseline in ε mode
+    if gaussian_prior_baseline and not energy_param:
+        # Need σ_t = sqrt(1 - ᾱ_t) for ε baseline
+        with jax.ensure_compile_time_eval():
+            _diff = GaussianDiffusion(num_timesteps, beta_schedule_scale, beta_schedule_type, snr_max=snr_max)
+            B_coeffs = _diff.beta_schedule()
+            sigma_t_array = B_coeffs.sqrt_one_minus_alphas_cumprod  # σ_t for each t
+    else:
+        sigma_t_array = None
+
     if energy_param:
         # Energy parameterization: Network outputs scalar E(x).
         # Policy (score/noise) is grad(E(x)).
@@ -277,7 +333,7 @@ def create_diffv2_net(
         # policy(params, obs, act, t) with no explicit horizon argument.
         policy_net = hk.without_apply_rng(
             hk.transform(
-                lambda obs, act, t, h: EnergyPolicyNet(diffusion_hidden_sizes, activation)(
+                lambda obs, act, t, h: EnergyPolicyNet(diffusion_hidden_sizes, activation, zero_init_final=gaussian_prior_baseline)(
                     obs,
                     act,
                     t,
@@ -297,19 +353,48 @@ def create_diffv2_net(
 
         # For Diffv2Net.policy, we pass the function that computes the gradient
         # Diffv2Net expects: policy(params, obs, act, t)
-        def policy_apply(params, obs, act, t):
-            h_zeros = jnp.zeros(obs.shape[:-1], dtype=jnp.float32)
-            return jax.grad(lambda a: policy_net.apply(params, obs, a, t, h_zeros).sum())(act)
-        def energy_apply(params, obs, act, t):
-            h_zeros = jnp.zeros(obs.shape[:-1], dtype=jnp.float32)
-            return policy_net.apply(params, obs, act, t, h_zeros)
+        # When gaussian_prior_baseline is enabled, the energy includes 0.5*||act||²,
+        # so the score (gradient) includes -act (the Gaussian prior score).
+        if gaussian_prior_baseline:
+            def policy_apply(params, obs, act, t):
+                h_zeros = jnp.zeros(obs.shape[:-1], dtype=jnp.float32)
+                # grad(0.5*||act||²) = act, plus grad of network output
+                return act + jax.grad(lambda a: policy_net.apply(params, obs, a, t, h_zeros).sum())(act)
+            def energy_apply(params, obs, act, t):
+                h_zeros = jnp.zeros(obs.shape[:-1], dtype=jnp.float32)
+                # E(x) = 0.5*||x||² + E_net(x)
+                prior_energy = jnp.float32(0.5) * jnp.sum(act ** 2, axis=-1)
+                return prior_energy + policy_net.apply(params, obs, act, t, h_zeros)
+        else:
+            def policy_apply(params, obs, act, t):
+                h_zeros = jnp.zeros(obs.shape[:-1], dtype=jnp.float32)
+                return jax.grad(lambda a: policy_net.apply(params, obs, a, t, h_zeros).sum())(act)
+            def energy_apply(params, obs, act, t):
+                h_zeros = jnp.zeros(obs.shape[:-1], dtype=jnp.float32)
+                return policy_net.apply(params, obs, act, t, h_zeros)
         
     else:
-        policy = hk.without_apply_rng(hk.transform(lambda obs, act, t, h: DACERPolicyNet(diffusion_hidden_sizes, activation)(obs, act, t, h)))
+        policy = hk.without_apply_rng(hk.transform(lambda obs, act, t, h: DACERPolicyNet(diffusion_hidden_sizes, activation, zero_init_final=gaussian_prior_baseline)(obs, act, t, h)))
         # Wrap to always pass h=0 for single-step mode, maintaining 4-arg interface for DPMD
-        def policy_apply(params, obs, act, t):
-            h_zeros = jnp.zeros(obs.shape[:-1], dtype=jnp.float32)
-            return policy.apply(params, obs, act, t, h_zeros)
+        # When gaussian_prior_baseline is enabled, add σ_t * x baseline to noise prediction
+        # This makes the score at init equal to -x (Gaussian prior score)
+        if gaussian_prior_baseline:
+            def policy_apply(params, obs, act, t):
+                h_zeros = jnp.zeros(obs.shape[:-1], dtype=jnp.float32)
+                eps_net = policy.apply(params, obs, act, t, h_zeros)
+                # ε_baseline = σ_t * x, where σ_t = sqrt(1 - ᾱ_t)
+                # Handle both scalar t and batched t
+                sigma_t = sigma_t_array[t]
+                # Broadcast sigma_t to match act shape
+                if sigma_t.ndim == 0:
+                    eps_baseline = sigma_t * act
+                else:
+                    eps_baseline = sigma_t[..., None] * act
+                return eps_baseline + eps_net
+        else:
+            def policy_apply(params, obs, act, t):
+                h_zeros = jnp.zeros(obs.shape[:-1], dtype=jnp.float32)
+                return policy.apply(params, obs, act, t, h_zeros)
         energy_apply = None
 
     @jax.jit
@@ -333,7 +418,7 @@ def create_diffv2_net(
     params = init(key, sample_obs, sample_act)
 
     net = Diffv2Net(
-        q=q.apply,
+        q=q_apply,
         policy=policy_apply,
         num_timesteps=num_timesteps,
         act_dim=act_dim,
@@ -342,8 +427,11 @@ def create_diffv2_net(
         noise_scale=noise_scale,
         beta_schedule_scale=beta_schedule_scale,
         beta_schedule_type=beta_schedule_type,
+        x_recon_clip_radius=x_recon_clip_radius,
+        snr_max=snr_max,
         energy_mode=energy_param,
         energy_fn=energy_apply,
         mala_steps=mala_steps,
+        distributional_critic=distributional_critic,
     )
     return net, params

@@ -57,7 +57,10 @@ CONFIGS = {
         "alg": "dpmd_mb_pc",
         "pc_deterministic_dyn": True,
         "pc_H_plan": 2,
-        "pc_joint_seq": True,
+        "pc_joint_seq": False,
+        "beta_schedule_type": "cosine",
+        "buffer_size": 200000,
+        "tfg_lambda": 2.0,
     },
 }
 
@@ -120,7 +123,11 @@ def identify_config(run_config: dict) -> str:
         bprop_refresh = run_config.get("bprop_refresh_steps", 0)
         
         # Check for planner H=2
-        if pc_det and pc_H == 2 and pc_joint:
+        beta_type = run_config.get("beta_schedule_type", "linear")
+        buffer_size = run_config.get("buffer_size", 100000)
+        tfg_lambda = run_config.get("tfg_lambda", 0)
+        if (pc_det and pc_H == 2 and not pc_joint and beta_type == "cosine" 
+            and buffer_size == 200000 and abs(tfg_lambda - 2.0) < 0.1):
             return "MB-PC planner (H=2)"
         
         # Check for diffusion dynamics
@@ -181,15 +188,15 @@ def main():
     # Group runs by configuration
     runs_by_config = defaultdict(list)
     
-    # Only include runs from 2025-12-18 (today's runs)
-    date_filter = "2025-12-18"
+    # Include runs from 2025-12-18 and 2025-12-23
+    date_filters = ["2025-12-18", "2025-12-23"]
     
     for run_dir in logs_dir.iterdir():
         if not run_dir.is_dir():
             continue
         
         # Filter by date
-        if date_filter not in run_dir.name:
+        if not any(df in run_dir.name for df in date_filters):
             continue
         
         config = load_config(run_dir)
@@ -304,7 +311,7 @@ def main():
     ax.grid(which='minor', alpha=0.1)
     
     # Save plot
-    output_path = Path("/n/home09/pnielsen/inference_mirror_descent/training_curves.png")
+    output_path = Path("/n/home09/pnielsen/inference_mirror_descent/figures/training_curves.png")
     plt.tight_layout()
     plt.savefig(output_path, dpi=200, bbox_inches='tight')
     print(f"\nPlot saved to: {output_path}")
