@@ -46,6 +46,7 @@ class ModelBasedNet:
     noise_scale: float
     beta_schedule_scale: float
     beta_schedule_type: str = "linear"
+    snr_max: float = 124.0
     energy_mode: bool = False
     # energy_fn(params, obs, act, t, h) -> scalar energy (optional, per-step)
     energy_fn: Optional[Callable[..., jax.Array]] = None
@@ -58,11 +59,11 @@ class ModelBasedNet:
 
     @property
     def diffusion(self) -> GaussianDiffusion:
-        return GaussianDiffusion(self.num_timesteps, self.beta_schedule_scale, self.beta_schedule_type)
+        return GaussianDiffusion(self.num_timesteps, self.beta_schedule_scale, self.beta_schedule_type, snr_max=self.snr_max)
 
     @property
     def dyn_diffusion(self) -> GaussianDiffusion:
-        return GaussianDiffusion(self.num_timesteps, self.beta_schedule_scale, self.beta_schedule_type)
+        return GaussianDiffusion(self.num_timesteps, self.beta_schedule_scale, self.beta_schedule_type, snr_max=self.snr_max)
 
     def get_action(self, key: jax.Array, policy_params: ModelBasedParams, obs: jax.Array, q_func: Callable[[jax.Array, jax.Array], jax.Array]) -> jax.Array:
         policy_params, log_alpha = (policy_params.policy, policy_params.log_alpha)
@@ -148,6 +149,7 @@ def create_model_based_net(
     energy_param: bool = False,
     H_train: int = 1,
     joint_seq: bool = False,
+    snr_max: float = 124.0,
 ) -> Tuple[ModelBasedNet, ModelBasedParams]:
 
     # Determine if we should use joint sequence mode
@@ -323,6 +325,7 @@ def create_model_based_net(
         noise_scale=noise_scale,
         beta_schedule_scale=beta_schedule_scale,
         beta_schedule_type=beta_schedule_type,
+        snr_max=snr_max,
         energy_mode=energy_param,
         energy_fn=energy_apply,
         joint_seq=use_joint_seq,

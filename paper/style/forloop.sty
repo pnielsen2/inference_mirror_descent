@@ -1,0 +1,14 @@
+%% forloop.sty
+%% Copyright 2006 by Ren\'{e} Herrmann
+%% This file may be distributed and/or modified under the
+%% conditions of the LaTeX Project Public License.
+%%
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{forloop}[2006/09/18 v3.0 For Loops in LaTeX]
+
+\RequirePackage{ifthen}
+
+\newcommand{\forloop}[5][1]{%
+  \setcounter{#2}{#3}%
+  \ifthenelse{#4}{#5\addtocounter{#2}{#1}\forloop[#1]{#2}{\value{#2}}{#4}{#5}}{}%
+}

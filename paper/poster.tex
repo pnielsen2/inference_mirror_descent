@@ -1,0 +1,296 @@
+% Poster for Inference-Time Guidance for Diffusion Policies
+% Build with: make poster (from project root)
+% See paper/WORKFLOW.md for AI agent instructions
+
+\documentclass[final,hyperref={pdfpagelabels=false}]{beamer}
+\usepackage[orientation=landscape,size=custom,width=121.92,height=91.44,scale=1.4]{beamerposter}
+\usetheme{default}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{bm}
+\usepackage{tikz}
+\usetikzlibrary{arrows,positioning,shapes,calc}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+% Path to figures
+\graphicspath{{../figures/}}
+
+% Colors
+\definecolor{harvardcrimson}{RGB}{165,28,48}
+\definecolor{softblue}{RGB}{65,105,225}
+\definecolor{softgreen}{RGB}{34,139,34}
+\definecolor{softorange}{RGB}{255,140,0}
+\definecolor{lightgray}{RGB}{245,245,245}
+\definecolor{darkgray}{RGB}{60,60,60}
+
+% Beamer settings
+\setbeamercolor{headline}{bg=harvardcrimson,fg=white}
+\setbeamercolor{block title}{bg=harvardcrimson,fg=white}
+\setbeamercolor{block body}{bg=lightgray,fg=darkgray}
+\setbeamercolor{block alerted title}{bg=softorange,fg=white}
+\setbeamercolor{block alerted body}{bg=lightorange!10,fg=darkgray}
+\setbeamerfont{block title}{size=\Large,series=\bfseries}
+\setbeamerfont{headline title}{size=\Huge,series=\bfseries}
+\setbeamertemplate{navigation symbols}{}
+
+\newlength{\sepwidth}
+\newlength{\colwidth}
+\setlength{\sepwidth}{0.02\paperwidth}
+\setlength{\colwidth}{0.30\paperwidth}
+
+\begin{document}
+\begin{frame}[t]
+
+% ==============================================================================
+% HEADER
+% ==============================================================================
+\begin{beamercolorbox}[wd=\paperwidth,ht=10cm]{headline}
+\vspace{1cm}
+\centering
+{\fontsize{72}{80}\selectfont\bfseries Online Model-Based Guidance for Diffusion Policies}\\[0.8cm]
+{\fontsize{42}{50}\selectfont Inference-Time Planning in Online Reinforcement Learning}\\[1cm]
+{\fontsize{36}{44}\selectfont Philip Nielsen \hspace{3cm} Harvard University \hspace{3cm} CS 2823r}\\[0.5cm]
+\end{beamercolorbox}
+
+\vspace{1cm}
+
+% ==============================================================================
+% CONTENT
+% ==============================================================================
+\begin{columns}[t]
+
+% ------------------------------------------------------------------------------
+% COLUMN 1: Background & Motivation
+% ------------------------------------------------------------------------------
+\begin{column}{\colwidth}
+
+\begin{block}{\Large Motivation: Diffusion Policies for RL}
+\textbf{Diffusion policies} model action distributions as iterative denoising:
+\[
+a_T \sim \mathcal{N}(0, I) \;\to\; a_{T-1} \;\to\; \cdots \;\to\; a_0 \quad \text{(conditioned on state } s\text{)}
+\]
+
+\vspace{0.5em}
+\textbf{Why diffusion for RL?}
+\begin{itemize}
+    \item \textbf{Highly expressive:} Can model multimodal action distributions
+    \item \textbf{Stable training:} Simple denoising score matching loss
+\end{itemize}
+
+\vspace{0.5em}
+\textbf{Challenge:} In online RL, we don't have samples from the optimal policy.
+
+\vspace{0.5em}
+\textbf{Standard solution:} Guide sampling toward high Q-value actions
+\[
+\tilde{\pi}(a|s) \propto \pi_\theta(a|s) \cdot \exp(\lambda Q(s, a))
+\]
+
+\vspace{0.5em}
+\textbf{Problem with Q-guidance:}
+\begin{itemize}
+    \item Q depends on current policy $\pi_\theta$ --- must be re-learned as policy improves
+    \item Q learned via bootstrapping $\Rightarrow$ compounding errors
+    \item Q guidance signal lags behind the policy
+\end{itemize}
+\end{block}
+
+\vspace{1cm}
+
+\begin{block}{\Large Training-Free Guidance (TFG)}
+Use an objective $Q(s, a)$ trained only on \textbf{clean} data:
+\begin{itemize}
+    \item $Q$ is a function of the \textbf{Tweedie estimate} $\hat{a}_0(a_t)$
+    \item Guidance gradient: $\nabla_{a_t} Q(s, \hat{a}_0(a_t))$
+\end{itemize}
+
+\vspace{0.5em}
+\textbf{Tweedie's formula:}
+\[
+\hat{a}_0 = \frac{a_t - \sqrt{1-\bar{\alpha}_t} \cdot \epsilon_\theta(a_t, t)}{\sqrt{\bar{\alpha}_t}}
+\]
+
+\vspace{0.5em}
+\textbf{Issue:} Simple TFG no longer guarantees sampling from the optimal tilted distribution!
+
+\vspace{0.5em}
+\textbf{Solution:} Use MCMC correction at each noise level.
+\end{block}
+
+\vspace{1cm}
+
+\begin{block}{\Large Key Idea: MCMC Correction}
+Define a sequence of \textbf{energy functions} at each noise level:
+\begin{itemize}
+    \item At $t=0$: proportional to the \textbf{target distribution}
+    \item At $t=T$: proportional to the \textbf{standard normal}
+    \item Smooth interpolation at intermediate levels
+\end{itemize}
+
+\vspace{0.5em}
+\textbf{MALA} (Metropolis-Adjusted Langevin Algorithm) at each level:
+\begin{enumerate}
+    \item \textbf{Propose:} $a_t' = a_t - \eta \nabla_{a_t} E_t(a_t) + \sqrt{2\eta}\, z$
+    \item \textbf{Accept/Reject:} Metropolis-Hastings correction
+\end{enumerate}
+
+$\implies$ Sample distribution \textbf{smoothly converges} to the target!
+\end{block}
+
+\end{column}
+
+% ------------------------------------------------------------------------------
+% COLUMN 2: Method
+% ------------------------------------------------------------------------------
+\begin{column}{\colwidth}
+
+\begin{block}{\Large Compositional Objective: Replace Q with $r + \gamma V$}
+\textbf{Key decomposition:}
+\[
+Q(s, a) = \mathbb{E}_{s' \sim p(\cdot|s,a)}\left[ r(s, a, s') + \gamma V(s') \right]
+\]
+
+\vspace{0.5em}
+\textbf{Learn each component separately:}
+
+\vspace{0.5em}
+\begin{center}
+\begin{tikzpicture}[scale=1.2, every node/.style={scale=1.2},
+    block/.style={rectangle, draw, rounded corners, minimum height=3em, minimum width=3em, text centered, align=center, line width=1.5pt}]
+
+\node[block, fill=softblue!25] (policy) at (0,0) {Policy $\pi_\theta$\\(Diffusion)};
+\node[block, fill=softorange!25] (dynamics) at (6,0) {Dynamics $p_\phi$\\(Diffusion)};
+\node[block, fill=softgreen!25] (reward) at (12,0) {Reward $r_\psi$\\(MLP)};
+\node[block, fill=harvardcrimson!25] (value) at (18,0) {Value $V_\xi$\\(MLP)};
+
+\node[below=0.8cm of policy] {\small BC loss};
+\node[below=0.8cm of dynamics] {\small DSM loss};
+\node[below=0.8cm of reward] {\small MSE loss};
+\node[below=0.8cm of value] {\small TD loss};
+
+\end{tikzpicture}
+\end{center}
+
+\vspace{0.5em}
+\textbf{Advantages:}
+\begin{itemize}
+    \item \textbf{Dynamics \& Reward:} Pure supervised learning, no policy dependence
+    \item \textbf{Value:} Contribution decays as $\gamma^H$ in multi-step planning
+    \item \textbf{Modularity:} Each component improved independently
+\end{itemize}
+\end{block}
+
+\vspace{1cm}
+
+\begin{block}{\Large Coupled Action-State Sampling}
+\textbf{Challenge:} At each diffusion level $t$, need fresh $s'$ samples given current $\hat{a}_0$.
+
+\vspace{0.5em}
+\textbf{Solution:} Maintain a \textbf{population of $s'$ particles} that evolves alongside actions.
+
+\vspace{0.5em}
+\textbf{$s'$-Population Refresh (Recurrence):}
+\begin{enumerate}
+    \item Predict noise: $\hat{\epsilon} = \text{DynNet}_\phi(s, \hat{a}_0, s'_t, t)$
+    \item Tweedie clean estimate: $\hat{s}'_0 = \frac{s'_t - \sqrt{1-\bar{\alpha}_t}\,\hat{\epsilon}}{\sqrt{\bar{\alpha}_t}}$
+    \item Re-noise to level $t$: $s'_t \gets \sqrt{\bar{\alpha}_t}\,\hat{s}'_0 + \sqrt{1-\bar{\alpha}_t}\,\epsilon$
+\end{enumerate}
+
+\vspace{0.5em}
+\textbf{Key insight:} Last $B$ refresh steps allow gradients to flow through recurrence --- the planner can ``steer'' $s'$ particles toward high-value regions.
+\end{block}
+
+\vspace{1cm}
+
+\begin{block}{\Large Guidance Objective}
+\textbf{At inference time}, compute:
+\[
+J(s, a) = \mathbb{E}_{s' \sim p_\phi(\cdot|s,a)}\left[ r_\psi(s, a, s') + \gamma V_\xi(s') \right]
+\]
+
+\textbf{Monte Carlo estimation} with $N$ next-state particles:
+\[
+\hat{J}(s, a) = \frac{1}{N} \sum_{i=1}^{N} \left[ r_\psi(s, a, s'_i) + \gamma V_\xi(s'_i) \right]
+\]
+
+\vspace{0.5em}
+\textbf{Combined energy for MALA:}
+\[
+E_{\text{total}}(a_t) = E_\theta(a_t, s, t) - \lambda \cdot \hat{J}(s, \hat{a}_0(a_t))
+\]
+\end{block}
+
+\end{column}
+
+% ------------------------------------------------------------------------------
+% COLUMN 3: Results & Future Work
+% ------------------------------------------------------------------------------
+\begin{column}{\colwidth}
+
+\begin{block}{\Large Experimental Setup}
+\textbf{Environment:} MuJoCo HalfCheetah-v4
+
+\vspace{0.5em}
+\textbf{Key hyperparameters:}
+\begin{itemize}
+    \item Guidance strength $\lambda = 2$
+    \item MALA correction steps: 2 per diffusion level
+    \item Next-state particles: $N = 32$
+    \item Refresh steps: 6 (with 6 backprop-enabled)
+    \item Updates per iteration: 4
+    \item Buffer size: 200,000 transitions
+\end{itemize}
+
+\vspace{0.5em}
+\textbf{Architecture:}
+\begin{itemize}
+    \item Policy \& Dynamics: Diffusion models (20 steps)
+    \item Reward \& Value: MLPs with 256 hidden units
+\end{itemize}
+\end{block}
+
+\vspace{1cm}
+
+\begin{block}{\Large Results: Online Learning in HalfCheetah}
+\begin{center}
+\includegraphics[width=0.9\textwidth]{training_curve.png}
+\end{center}
+
+\vspace{0.5em}
+\textbf{Key observations:}
+\begin{itemize}
+    \item Diffusion policy with inference-time guidance learns \textbf{stably}
+    \item Compositional model-based objective enables effective planning
+    \item MALA correction with coupled state sampling is \textbf{essential}
+\end{itemize}
+\end{block}
+
+\vspace{1cm}
+
+\begin{block}{\Large Scaling Dimensions for Future Work}
+Unlike vanilla Q-guided diffusion, this approach opens \textbf{multiple axes} for scaling inference-time compute:
+
+\vspace{0.5em}
+\begin{itemize}
+    \item \textbf{State population size} ($N$): More particles $\to$ lower variance
+    \item \textbf{MALA steps} ($K$): Better convergence to tilted distribution
+    \item \textbf{Refresh steps} ($L$): Better $s'$ estimates
+    \item \textbf{Planning horizon} ($H$): Multi-step rollouts
+    \[
+    J_H(s, a_0) = \mathbb{E}\left[\sum_{h=0}^{H-1} \gamma^h r_h + \gamma^H V(s_H)\right]
+    \]
+    \item \textbf{Action particles}: Sample multiple action chains, select best
+\end{itemize}
+
+\vspace{0.5em}
+Each axis trades compute for potentially better action selection.
+\end{block}
+
+\end{column}
+
+\end{columns}
+
+\end{frame}
+\end{document}

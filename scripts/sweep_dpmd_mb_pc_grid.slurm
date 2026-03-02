@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:nvidia_h200:1
 #SBATCH -c 2
 #SBATCH --mem=32G
-#SBATCH -t 0-6:00
+#SBATCH -t 0-8:00
 #SBATCH --array=0-15
 
 # Optional: activate your environment here

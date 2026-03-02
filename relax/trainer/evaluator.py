@@ -14,6 +14,7 @@ from tensorboardX import SummaryWriter
 
 from relax.env import create_env
 from relax.utils.persistence import PersistFunction
+from relax.utils.jax_utils import latent_to_action_normalcdf
 
 def evaluate(env, policy_fn, policy_params, num_episodes):
     ep_len_list = []
@@ -52,6 +53,8 @@ if __name__ == "__main__":
     parser.add_argument("--env", type=str, required=True)
     parser.add_argument("--num_episodes", type=int, required=True)
     parser.add_argument("--seed", type=int, required=True)
+    parser.add_argument("--latent_action_space", action="store_true", default=False)
+    parser.add_argument("--latent_action_eps", type=float, default=1e-6)
     args = parser.parse_args()
 
     master_rng = np.random.default_rng(args.seed)
@@ -61,7 +64,15 @@ if __name__ == "__main__":
     policy = PersistFunction.load(args.policy_root / "deterministic.pkl")
     @jax.jit
     def policy_fn(policy_params, obs):
-        return policy(policy_params, obs).clip(-1, 1)
+        return policy(policy_params, obs)
+
+    def action_for_env(policy_params, obs):
+        act = policy_fn(policy_params, obs)
+        if args.latent_action_space:
+            act = latent_to_action_normalcdf(act, eps=args.latent_action_eps)
+        else:
+            act = act.clip(-1, 1)
+        return np.asarray(act)
 
     # logger = SummaryWriter(args.policy_root)
     logger = Logger(args.policy_root)
@@ -72,7 +83,7 @@ if __name__ == "__main__":
         with open(policy_path, "rb") as f:
             policy_params = pickle.load(f)
 
-        ep_len_list, ep_ret_list = evaluate(env, policy_fn, policy_params, args.num_episodes)
+        ep_len_list, ep_ret_list = evaluate(env, action_for_env, policy_params, args.num_episodes)
 
         ep_len = np.array(ep_len_list)
         ep_ret = np.array(ep_ret_list)

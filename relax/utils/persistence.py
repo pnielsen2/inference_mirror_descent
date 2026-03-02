@@ -6,7 +6,15 @@ import re
 import types
 from typing import Callable, List
 import numpy as np
-import jax, jax.core, jaxlib.xla_client
+import jax, jaxlib.xla_client
+try:
+    from jax.extend.core import Primitive as JaxPrimitive
+except (ImportError, AttributeError):
+    from jax.core import Primitive as JaxPrimitive
+try:
+    from jax.extend.core import Jaxpr as JaxJaxpr
+except (ImportError, AttributeError):
+    from jax.core import Jaxpr as JaxJaxpr
 
 PATTERN = re.compile(r"^jax")
 
@@ -19,7 +27,7 @@ def initialize_primitives(pattern: re.Pattern = PATTERN):
     for mod_name, mod in sys.modules.items():
         if pattern.match(mod_name):
             for name, obj in mod.__dict__.items():
-                if isinstance(obj, jax.core.Primitive):
+                if isinstance(obj, JaxPrimitive):
                     registry[obj.name] = obj
     return registry
 
@@ -36,8 +44,8 @@ def make_persist(f: Callable):
         closed_jaxpr, out_descr = jax.make_jaxpr(f, return_shape=True)(*args)
         out_descr_flat, out_tree = jax.tree_util.tree_flatten(out_descr)
 
-        assert all(x.named_shape == {} and x.sharding is None for x in in_descr_flat)
-        assert all(x.named_shape == {} and x.sharding is None for x in out_descr_flat)
+        assert all(getattr(x, 'named_shape', {}) == {} and getattr(x, 'sharding', None) is None for x in in_descr_flat)
+        assert all(getattr(x, 'named_shape', {}) == {} and getattr(x, 'sharding', None) is None for x in out_descr_flat)
 
         if sig is not None:
             # def f(a, /, b, *args, c, **kwargs): ...
@@ -80,7 +88,7 @@ class PersistFunction:
         self.out_descr_flat = out_descr_flat
         self.arg_names = arg_names
 
-        jaxpr: jax.core.Jaxpr = closed_jaxpr.jaxpr
+        jaxpr: JaxJaxpr = closed_jaxpr.jaxpr
         assert not jaxpr.effects
         # Consider add
         # assert jaxpr.debug_info is None, breakpoint()
@@ -144,7 +152,7 @@ class PersistFunction:
 
 class PersistFunctionPickler(pickle.Pickler):
     def persistent_id(self, obj):
-        if isinstance(obj, jax.core.Primitive):
+        if isinstance(obj, JaxPrimitive):
             if obj.name in BLACKLIST:
                 raise pickle.PickleError(f"Cannot pickle {obj.name}")
             return f"P:{obj.name}"

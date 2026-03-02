@@ -27,14 +27,14 @@ XLA_FLAGS='--xla_gpu_deterministic_ops=true' CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_C
 
 baseline (Plain DPMD):
 ```bash
-python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4 --beta_schedule_type cosine --beta_schedule_scale 1 --dpmd_long_lr_schedule 
+python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4 --beta_schedule_type cosine --beta_schedule_scale 1 --lr_annealing 
 ```
 which achieves an average of 11267.6 (SE: 153) over 5 runs.
 
 There appears to be a bug in the code relating to q-normalization, but fixing it by adding the flag --fix_q_norm_bug: 
 
 ```bash
-python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4 --beta_schedule_type cosine --beta_schedule_scale 1 --dpmd_long_lr_schedule --fix_q_norm_bug
+python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4 --beta_schedule_type cosine --beta_schedule_scale 1 --lr_annealing --fix_q_norm_bug
 ```
 
 doesn't seem to help, achieving a mean of 10263 (SE: 281.2) over 5 runs.
@@ -50,7 +50,7 @@ This project attempts to introduce three things:
 ```bash
 python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4 --dpmd_constant_weight --tfg_lambda 16.0 --num_particles 1 --mala_steps 2 --q_critic_agg mean --beta_schedule_type cosine --beta_schedule_scale 1 --dpmd_no_entropy_tuning --buffer_size 200000
 ```
-which achieves approx 10442 (SE: 233.44) (5 runs in progress):
+which achieves approx 10442 (SE: 233.44) over 5 runs.
 
 We also find that denoising many particles and behavior cloning the best/soft best under the Q function dominates performance:
 
@@ -81,13 +81,19 @@ with an episode return of 6315 (SE: 462.06) over 5 runs.
 
 3. Planning - denoising a sequence of actions and tilting based on the quality of the entire sequence
 
-The best command here is 
+The best command here is this one which chains together 1-step policies and a world model:
+```bash
+python scripts/train_mujoco.py --alg dpmd_mb_pc --env HalfCheetah-v4 --tfg_lambda 2 --mala_steps 1 --pc_use_value --update_per_iteration 4 --lr_dyn 1e-4 --lr_value 3e-3 --buffer_size 200000 --pc_deterministic_dyn --lr_policy 1e-4 --use_validation --validation_ratio 0.0 --pc_H_plan 2 --beta_schedule_type cosine --beta_schedule_scale 1
+```
 
+which achieves an average episode return of 8046 (SE: 193.5152) over 5 runs.
+
+This one directly learns an n-step policy, which doesn't perform as well,
 ```bash
 python scripts/train_mujoco.py --alg dpmd_mb_pc --env HalfCheetah-v4 --tfg_lambda 2 --mala_steps 1 --pc_use_value --sprime_num_particles 32 --update_per_iteration 4 --lr_dyn 1e-4 --lr_value 3e-3 --buffer_size 200000 --pc_deterministic_dyn --lr_policy 1e-4 --use_validation --validation_ratio 0.0 --pc_H_plan 2 --pc_joint_seq --beta_schedule_type cosine --beta_schedule_scale 1
 ```
 
-Which achieves an average episode return of 7173 (SE: 228.43) over 5 runs.
+achieving an average episode return of 7173 (SE: 228.43) over 5 runs.
 
 ## Visualize results
 ```python
@@ -106,20 +112,7 @@ for key, value in patterns_dict.items():
 plot_mean(patterns_dict, env_name)
 ```
 
-## Ackwonledgement
-We developed this repo based on [DACER](https://github.com/happy-yan/DACER-Diffusion-with-Online-RL.git). We thank the authors of DACER for providing high-quality code base.
-
-## Bibtex
-If you used this repo in your paper, please considering 
-giving us a star 🌟 and citing our related paper.
-
-```bibtex
-@article{ma2025soft,
-  title={Efficient Online Reinforcement Learning for Diffusion Policy},
-  author={Ma, Haitong and Chen, Tianyi and Wang, Kai and Li, Na and Dai, Bo},
-  journal={arXiv preprint arXiv:2502.00361},
-  year={2025}
-}
-```
+## Acknowledgement
+We developed this repo based on [Efficient Online Reinforcement Learning for Diffusion Policies] (https://github.com/mahaitongdae/diffusion_policy_online_rl), which was in turn based on [DACER](https://github.com/happy-yan/DACER-Diffusion-with-Online-RL.git). We thank the authors of both repos for providing a high-quality code base.
 
 
