@@ -57,6 +57,29 @@ class QNet(hk.Module):
 
 @dataclass
 @fix_repr
+class QNetWithDPsi(hk.Module):
+    """Q network with an additional D_ψ head sharing the backbone.
+
+    Returns ``(q, d_psi)`` where both are squeezed scalars per sample.
+    The backbone (hidden layers) is shared; Q and D_ψ each get their own
+    final linear layer.
+    """
+    hidden_sizes: Sequence[int]
+    activation: Activation
+    name: str = None
+
+    def __call__(self, obs: jax.Array, act: jax.Array) -> Tuple[jax.Array, jax.Array]:
+        h = jnp.concatenate((obs, act), axis=-1)
+        for hidden_size in self.hidden_sizes:
+            h = hk.Linear(hidden_size)(h)
+            h = self.activation(h)
+        q = jnp.squeeze(hk.Linear(1, name="q_head")(h), axis=-1)
+        d_psi = jnp.squeeze(hk.Linear(1, name="d_psi_head")(h), axis=-1)
+        return q, d_psi
+
+
+@dataclass
+@fix_repr
 class DistributionalQNet(hk.Module):
     hidden_sizes: Sequence[int]
     activation: Activation

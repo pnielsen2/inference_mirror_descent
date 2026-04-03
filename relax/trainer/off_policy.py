@@ -1,6 +1,4 @@
 from pathlib import Path
-import subprocess
-import sys
 from typing import Callable, Optional, Tuple
 import math
 import numbers
@@ -11,14 +9,15 @@ import jax.numpy as jnp
 import numpy as np
 from gymnasium import Env
 from tqdm import tqdm
-from tensorboardX import SummaryWriter
-from tensorboardX.summary import hparams
 import wandb
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from relax.algorithm import Algorithm
 from relax.buffer import ExperienceBuffer, TreeBuffer
 from relax.env.vector import VectorEnv
-from relax.trainer.accumulator import SampleLog, VectorSampleLog, UpdateLog, Interval
+from relax.trainer.accumulator import Accumulator, SampleLog, VectorSampleLog, UpdateLog, Interval
 from relax.utils.experience import Experience
 from relax.utils.jax_utils import action_to_latent_normalcdf, latent_to_action_normalcdf
 
@@ -40,7 +39,7 @@ class OffPolicyTrainer:
         evaluate_every: int = 10000,
         evaluate_n_episode: int = 20,
         sample_log_n_episode: int = 10,
-        update_log_n_step: int = 1000,
+        update_log_n_env_steps: int = 5000,
         debug: bool = False,
         timing_log_every: int = 0,
         done_info_keys: Tuple[str, ...] = (),
@@ -64,9 +63,13 @@ class OffPolicyTrainer:
         latent_action_eps: float = 1e-6,
         tfg_patience: float = float("inf"),
         tfg_reduction_factor: float = 1.0,
-        tfg_lambda_start: float = 0.0,
-        tfg_lambda_end: Optional[float] = None,
+        tfg_eta_start: float = 0.0,
+        tfg_eta_end: Optional[float] = None,
         log_md_kl_every: int = int(1e9),
+        # Soft policy iteration
+        soft_pi_mode: bool = False,
+        iterations_per_pi_step: int = 100000,
+        num_pi_steps: int = 10,
     ):
         self.env = env
         self.algorithm = algorithm
@@ -85,7 +88,9 @@ class OffPolicyTrainer:
         self.evaluate_every = evaluate_every
         self.evaluate_n_episode = evaluate_n_episode
         self.sample_log_n_episode = sample_log_n_episode
-        self.update_log_n_step = update_log_n_step
+        self.update_log_n_env_steps = update_log_n_env_steps
+        self._last_update_log_env_step = 0
+        self._array_accum = {}  # accumulate per-update arrays for averaging at log time
         self.debug = bool(debug)
         self.timing_log_every = int(timing_log_every)
         self.done_info_keys = done_info_keys
@@ -93,7 +98,6 @@ class OffPolicyTrainer:
         self.hparams = hparams
         self.warmup_with = warmup_with
         self.save_value = save_value
-        self.evaluator = None
         self.use_validation = bool(use_validation)
         self.validation_size = int(validation_size)
         self.use_hypergrad = bool(use_hypergrad)
@@ -115,13 +119,30 @@ class OffPolicyTrainer:
         self._tfg_plateau_best_step: int = 0
         self._tfg_plateau_bad_count: int = 0
 
-        # Log-linear tfg_lambda schedule over training
-        self.tfg_lambda_start = float(tfg_lambda_start)
-        self.tfg_lambda_end = float(tfg_lambda_end) if tfg_lambda_end is not None else self.tfg_lambda_start
-        self._tfg_schedule_enabled = (self.tfg_lambda_end != self.tfg_lambda_start)
+        # Log-linear tfg_eta schedule over training
+        self.tfg_eta_start = float(tfg_eta_start)
+        self.tfg_eta_end = float(tfg_eta_end) if tfg_eta_end is not None else self.tfg_eta_start
+        self._tfg_schedule_enabled = (self.tfg_eta_end != self.tfg_eta_start)
+
+        # Accumulator for averaging eta between log steps
+        self._eta_accum: list = []
+
+        # One-step dist-shift covariance: buffer previous advantages and done mask
+        self._prev_adv_per_env: "np.ndarray | None" = None
+        self._prev_valid: "np.ndarray | None" = None
 
         # Periodic KL(π_tilt || π_0) logging
         self.log_md_kl_every = int(log_md_kl_every)
+
+        # Soft policy iteration
+        self.soft_pi_mode = bool(soft_pi_mode)
+        self.iterations_per_pi_step = int(iterations_per_pi_step)
+        self.num_pi_steps = int(num_pi_steps)
+        if self.soft_pi_mode:
+            self.total_step = self.num_pi_steps * self.iterations_per_pi_step
+            self._spi_accumulator = Accumulator()
+            self._spi_pi_step = 0  # current PI step (0 = Q-only)
+            self._spi_prev = None  # prev-step data for on-policy Bellman MSE
 
         if self.latent_action_space and not (self.latent_action_eps > 0.0):
             raise ValueError(
@@ -135,12 +156,14 @@ class OffPolicyTrainer:
         # TODO: re-add done_info_keys support
         # TODO: re-add evaluation support
 
+        self.env_name = env.spec.id if env.spec is not None else "env"
+        _gamma = getattr(self.algorithm, "gamma", 0.99)
         if isinstance(self.env.unwrapped, VectorEnv):
             self.is_vec = True
-            self.sample_log = VectorSampleLog(self.env.unwrapped.num_envs)
+            self.sample_log = VectorSampleLog(self.env.unwrapped.num_envs, env_name=self.env_name, gamma=_gamma)
         else:
             self.is_vec = False
-            self.sample_log = SampleLog()
+            self.sample_log = SampleLog(env_name=self.env_name, gamma=_gamma)
         self.update_log = UpdateLog()
         self.last_metrics = {}
 
@@ -160,7 +183,7 @@ class OffPolicyTrainer:
         wandb.init(
             project="diffusion_online_rl",
             name=log_path.name,
-            dir=log_path,
+            dir="/tmp",
             group=env.spec.id,
             config=self.hparams,
         )
@@ -242,38 +265,7 @@ class OffPolicyTrainer:
     def setup(self, dummy_data: Experience):
         self.algorithm.warmup(dummy_data)
 
-        # Setup logger
-        self.logger = SummaryWriter(str(self.log_path))
         self.progress = tqdm(total=self.total_step, desc="Sample Step", disable=None, dynamic_ncols=True)
-
-        self.algorithm.save_policy_structure(self.log_path, dummy_data.obs[0])
-        if self.save_value:
-            self.algorithm.save_q_structure(self.log_path, dummy_obs=dummy_data.obs[0], dummy_action=dummy_data.action[0])
-        # Only launch an evaluator subprocess if an evaluation environment was provided.
-        if self.evaluate_env is not None:
-            evaluator_cmd = [
-                sys.executable,
-                "-m",
-                "relax.trainer.evaluator",
-                str(self.log_path),
-                "--env",
-                self.env.spec.id,
-                "--num_episodes",
-                str(self.evaluate_n_episode),
-                "--seed",
-                str(0),
-            ]
-            if self.latent_action_space:
-                evaluator_cmd += [
-                    "--latent_action_space",
-                    "--latent_action_eps",
-                    str(self.latent_action_eps),
-                ]
-            self.evaluator = subprocess.Popen(
-                evaluator_cmd,
-                stdin=subprocess.PIPE,
-                bufsize=0,
-            )
 
     def _array_nonfinite_summary(self, x: np.ndarray) -> str:
         if x.size == 0:
@@ -381,7 +373,8 @@ class OffPolicyTrainer:
                 action_env = self.env.action_space.sample()
                 action = action_env
             elif self.warmup_with == "policy":
-                action = self.algorithm.get_action(key_fn(step), train_obs)
+                _action_out = self.algorithm.get_action(key_fn(step), train_obs)
+                action = _action_out[0] if isinstance(_action_out, tuple) else _action_out
                 action_env = action
             else:
                 raise ValueError(f"Invalid warmup_with {self.warmup_with}!")
@@ -479,7 +472,8 @@ class OffPolicyTrainer:
                     val_action_env = self.val_env.action_space.sample()
                     val_action = val_action_env
                 elif self.warmup_with == "policy":
-                    val_action = self.algorithm.get_action(val_key_fn(val_step), val_obs)
+                    _val_action_out = self.algorithm.get_action(val_key_fn(val_step), val_obs)
+                    val_action = _val_action_out[0] if isinstance(_val_action_out, tuple) else _val_action_out
                     val_action_env = val_action
                 else:
                     raise ValueError(f"Invalid warmup_with {self.warmup_with}!")
@@ -522,7 +516,111 @@ class OffPolicyTrainer:
             t0 = time.perf_counter()
             t_action0 = t0
 
-        action = self.algorithm.get_action(sample_key, obs)
+        action_out = self.algorithm.get_action(sample_key, obs)
+        if isinstance(action_out, tuple) and len(action_out) == 3:
+            action, q_agg, q_var = action_out
+        elif isinstance(action_out, tuple) and len(action_out) == 2:
+            action, q_agg = action_out
+            q_var = None
+        else:
+            action, q_agg, q_var = action_out, None, None
+
+        # --- On-policy EMA updates (--kl_budget mode) ---
+        _on_policy_ema = getattr(self.algorithm, 'on_policy_ema', False)
+        _v_per_env_mean = None
+        _adv_for_one_step = None  # saved for buffering after env.step
+        if _on_policy_ema and q_agg is not None and q_var is not None:
+            # q_agg and q_var are actually per-env Q and V arrays
+            q_per_env = np.asarray(q_agg).ravel()   # [num_envs]
+            v_per_env = np.asarray(q_var).ravel()    # [num_envs]
+            adv_per_env = q_per_env - v_per_env
+
+            _dist_shift = getattr(self.algorithm, 'dist_shift_eta', False)
+            _one_step = getattr(self.algorithm, 'one_step_dist_shift_eta', False)
+            _any_dist_shift = _dist_shift or _one_step
+            if _one_step:
+                _adv_for_one_step = adv_per_env
+
+            tau_v = float(self.algorithm.advantage_ema_tau)
+            tau_s = float(self.algorithm.shape_ema_tau)
+            m2_batch = float(np.mean(adv_per_env ** 2))
+            new_m2 = (1 - tau_v) * float(self.algorithm.state.advantage_second_moment_ema) + tau_v * m2_batch
+            new_m3 = float(self.algorithm.state.advantage_third_moment_ema)
+            new_c = float(self.algorithm.state.dist_shift_covariance_ema)
+            new_shape = float(self.algorithm.state.dist_shift_shape_ema)
+
+            if _any_dist_shift:
+                m3_batch = float(np.mean(adv_per_env ** 3))
+                new_m3 = (1 - tau_v) * new_m3 + tau_v * m3_batch
+
+                c_batch = None
+                if _one_step:
+                    # One-step MC covariance: c ≈ E[A(s',a')² · A(s,a)]
+                    # Uses buffered advantages from previous sample step
+                    if self._prev_adv_per_env is not None and self._prev_valid is not None:
+                        valid = self._prev_valid
+                        if np.any(valid):
+                            c_batch = float(np.mean(
+                                adv_per_env[valid] ** 2 * self._prev_adv_per_env[valid]
+                            ))
+                else:
+                    # D_ψ-based covariance: c = E[D_ψ(s,a) · A(s,a)]
+                    d_psi_per_env = self.algorithm.evaluate_d_psi(obs, action)
+                    if d_psi_per_env is not None:
+                        d_psi_per_env = np.asarray(d_psi_per_env).ravel()
+                        c_batch = float(np.mean(d_psi_per_env * adv_per_env))
+
+                # Update individual c/m3 EMAs (for diagnostic logging)
+                if c_batch is not None:
+                    new_c = (1 - tau_v) * new_c + tau_v * c_batch
+
+                # Update dimensionless shape EMA: s = (2γc + κ₃) / v^(3/2)
+                # Tracked with slower EMA; only update when c_batch available
+                if c_batch is not None:
+                    gamma = self.algorithm.gamma
+                    v_raw_safe = max(m2_batch, 1e-8)
+                    d_batch = 2.0 * gamma * c_batch + m3_batch
+                    s_batch = d_batch / (v_raw_safe ** 1.5)
+                    new_shape = (1 - tau_s) * new_shape + tau_s * s_batch
+
+            # Compute η in raw (unnormalized) space, then convert to code
+            # space.  The guidance divides advantages by sqrt(m2), so
+            # η_code = η_raw × sqrt(m2).
+            kl_budget = self.algorithm.kl_budget
+            m2_safe = max(new_m2, 1e-8)
+
+            # KL ceiling (paper §3.1): η_raw ≤ sqrt(2Δ / E[A²])
+            eta_kl_raw = float(np.sqrt(2.0 * kl_budget / m2_safe))
+
+            if _any_dist_shift:
+                # Optimal η via shape decomposition:
+                #   s = (2γc + κ₃) / v^(3/2)  →  η* = -1 / (√v · s)
+                # Only trust when shape is safely negative; otherwise
+                # fall back to KL ceiling.
+                if new_shape < -1e-8:
+                    eta_star_raw = -1.0 / (float(np.sqrt(m2_safe)) * new_shape)
+                else:
+                    eta_star_raw = float('inf')
+                eta_raw = min(eta_star_raw, eta_kl_raw)
+            else:
+                eta_raw = eta_kl_raw
+
+            # Convert to code space (guidance normalises A by sqrt(m2))
+            new_eta = eta_raw * float(np.sqrt(m2_safe))
+
+            # Update algorithm state (outside jit)
+            self.algorithm.state = self.algorithm.state._replace(
+                advantage_second_moment_ema=jnp.float32(new_m2),
+                advantage_third_moment_ema=jnp.float32(new_m3),
+                dist_shift_covariance_ema=jnp.float32(new_c),
+                dist_shift_shape_ema=jnp.float32(new_shape),
+                tfg_eta=jnp.float32(new_eta),
+            )
+
+            # Convert per-env to scalars for downstream logging
+            _v_per_env_mean = float(np.mean(v_per_env))
+            q_agg = float(np.mean(q_per_env))
+            q_var = self.algorithm._compute_q_ensemble_var(action, obs)
 
         if do_timing:
             t_action1 = time.perf_counter()
@@ -534,6 +632,39 @@ class OffPolicyTrainer:
         else:
             action_latent = action
             action_env = action
+
+        # In SPI mode, compute all diagnostics on actual env (obs, action) pairs.
+        # Accumulated and logged at episode boundaries in _train_soft_pi().
+        if self.soft_pi_mode:
+            q_live, q_frozen = self.algorithm.spi_q_values(obs, action_latent)
+            q_live_mean = float(np.mean(q_live))
+            q_frozen_mean = float(np.mean(q_frozen))
+            self._spi_accumulator.add("spi/E_Q_live", q_live_mean)
+            self._spi_accumulator.add("spi/E_Q_frozen", q_frozen_mean)
+            self._spi_accumulator.add("spi/q_shift_delta", q_live_mean - q_frozen_mean)
+
+            # On-policy Bellman MSE (one-step delayed: use prev transition + current Q)
+            if self._spi_prev is not None:
+                prev = self._spi_prev
+                gamma = self.algorithm.gamma
+                done_mask = 1.0 - prev["done"].astype(np.float32)
+                # TD target = r + γ Q(s', a') * (1 - done)
+                td_target_live = prev["reward"] + gamma * q_live * done_mask
+                td_target_frozen = prev["reward"] + gamma * q_frozen * done_mask
+                self._spi_accumulator.add(
+                    "spi/bellman_mse_live",
+                    float(np.mean((prev["q_live"] - td_target_live) ** 2)),
+                )
+                self._spi_accumulator.add(
+                    "spi/bellman_mse_frozen",
+                    float(np.mean((prev["q_frozen"] - td_target_frozen) ** 2)),
+                )
+
+            # Policy distillation loss on actual guided actions (PI step 1+ only)
+            if self._spi_pi_step > 0:
+                ploss_key = jax.random.fold_in(sample_key, 0x5D1)
+                ploss = self.algorithm.evaluate_policy_loss(ploss_key, obs, action_latent)
+                self._spi_accumulator.add("spi/policy_loss", ploss)
 
         self._assert_finite(
             "sample.obs",
@@ -592,15 +723,39 @@ class OffPolicyTrainer:
             update_step=int(self.update_log.update_step),
         )
 
-        if self.latent_action_space:
-            a_env_arr = np.asarray(action_env)
-            info = dict(info)
-            if self.is_vec:
-                info["action_env_mean_abs"] = np.mean(np.abs(a_env_arr), axis=-1)
-                info["action_env_std"] = np.std(a_env_arr, axis=-1)
-            else:
-                info["action_env_mean_abs"] = float(np.mean(np.abs(a_env_arr)))
-                info["action_env_std"] = float(np.std(a_env_arr))
+        # SPI: store transition data for next-step Bellman MSE computation.
+        # q_live/q_frozen were computed above (before env.step); reward/done come
+        # from env.step.  At episode boundaries we reset to avoid cross-episode
+        # Bellman errors.
+        if self.soft_pi_mode:
+            done_arr = np.asarray(terminated) | np.asarray(truncated)
+            self._spi_prev = {
+                "q_live": q_live,
+                "q_frozen": q_frozen,
+                "reward": np.asarray(reward, dtype=np.float32),
+                "done": done_arr,
+            }
+
+        a_env_arr = np.asarray(action_env)
+        info = dict(info)
+        if self.is_vec:
+            info["action_mean"] = np.mean(a_env_arr, axis=-1)
+            info["action_var"] = np.var(a_env_arr, axis=-1)
+            info["action_clip_frac"] = np.mean((np.abs(a_env_arr) > 0.99).astype(np.float32), axis=-1)
+        else:
+            info["action_mean"] = float(np.mean(a_env_arr))
+            info["action_var"] = float(np.var(a_env_arr))
+            info["action_clip_frac"] = float(np.mean(np.abs(a_env_arr) > 0.99))
+        if q_agg is not None:
+            info["q_agg"] = float(q_agg)
+        if q_var is not None:
+            info["q_var"] = float(q_var)
+        if _v_per_env_mean is not None:
+            info["v_value"] = _v_per_env_mean
+        elif hasattr(self.algorithm, 'evaluate_value'):
+            v_value = self.algorithm.evaluate_value(obs)
+            if v_value is not None:
+                info["v_value"] = v_value
 
         experience = Experience.create(obs, action_latent, reward, terminated, truncated, next_obs, info)
         
@@ -634,7 +789,8 @@ class OffPolicyTrainer:
             # based on its own observations to respect potential differences
             # in vectorization layouts.
             val_key = jax.random.fold_in(sample_key, 1)
-            val_action = self.algorithm.get_action(val_key, self.val_obs)
+            _val_action_out = self.algorithm.get_action(val_key, self.val_obs)
+            val_action = _val_action_out[0] if isinstance(_val_action_out, tuple) else _val_action_out
             if self.latent_action_space:
                 val_action_latent = np.asarray(val_action)
                 val_action_env = np.asarray(latent_to_action_normalcdf(jnp.asarray(val_action_latent), eps=self.latent_action_eps))
@@ -667,6 +823,23 @@ class OffPolicyTrainer:
         if any_done:
             if self.sample_log_interval.check(sl.sample_episode):
                 sl.log(self.add_scalar)
+                step = sl.sample_step
+                # Log on-policy EMA metrics at the same frequency as
+                # per-episode critic metrics (Q_agg_tilt_bias, etc.).
+                if (
+                    hasattr(self.algorithm, "on_policy_ema")
+                    and self.algorithm.on_policy_ema
+                    and hasattr(self.algorithm, "state")
+                ):
+                    st = self.algorithm.state
+                    self.add_scalar("Global_EMAs/Advantage_second_moment", float(st.advantage_second_moment_ema), step)
+                    self.add_scalar("Global_EMAs/Advantage_third_moment", float(st.advantage_third_moment_ema), step)
+                    self.add_scalar("Global_EMAs/Distribution_shift_covariance", float(st.dist_shift_covariance_ema), step)
+                    self.add_scalar("Global_EMAs/Distribution_shift_shape", float(st.dist_shift_shape_ema), step)
+                if self._eta_accum:
+                    avg_eta = sum(self._eta_accum) / len(self._eta_accum)
+                    self.add_scalar("Global_EMAs/eta", avg_eta, step)
+                    self._eta_accum.clear()
             self.progress.update(sl.sample_step - self.progress.n)
 
             obs, _ = self.env.reset()
@@ -675,6 +848,17 @@ class OffPolicyTrainer:
                 self.algorithm.reset_open_loop()
         else:
             obs = next_obs
+
+        # Buffer advantages for one-step dist-shift covariance estimation.
+        # Must happen after env.step so we know which envs reset.
+        if _adv_for_one_step is not None:
+            done = np.asarray(terminated, dtype=bool) | np.asarray(truncated, dtype=bool)
+            self._prev_adv_per_env = _adv_for_one_step.copy()
+            self._prev_valid = ~np.atleast_1d(done)
+
+        # Accumulate effective eta for averaged logging
+        if hasattr(self.algorithm, 'get_current_tfg_eta'):
+            self._eta_accum.append(float(self.algorithm.get_current_tfg_eta()))
 
         if do_timing:
             t1 = time.perf_counter()
@@ -745,7 +929,8 @@ class OffPolicyTrainer:
             and have_val_indices
             and (next_update_step % self.hypergrad_period == 0)
         )
-        log_this_step = (next_update_step % self.update_log_n_step == 0)
+        current_env_step = self.sample_log.sample_step
+        log_this_step = (current_env_step - self._last_update_log_env_step >= self.update_log_n_env_steps)
 
         need_val_for_logging = have_val_indices and log_this_step
         if need_val_for_hyper or need_val_for_logging:
@@ -777,7 +962,7 @@ class OffPolicyTrainer:
             # used internally for hypergradients is returned here but we do
             # not rely on it for logging; logging always uses
             # compute_validation_metrics below for consistency.
-            info, dist_info, _ = self.algorithm.hyper_update(update_key, train_data, val_data)
+            info, array_info, _ = self.algorithm.hyper_update(update_key, train_data, val_data)
         else:
             # Standard training update (optionally with supervised warmup)
             if supervised_steps > 1 and hasattr(self.algorithm, "update_supervised"):
@@ -786,9 +971,9 @@ class OffPolicyTrainer:
                     self.algorithm.update_supervised(subkey, train_data)
 
                 key, subkey = jax.random.split(key)
-                info, dist_info = self.algorithm.update(subkey, train_data)
+                info, array_info = self.algorithm.update(subkey, train_data)
             else:
-                info, dist_info = self.algorithm.update(update_key, train_data)
+                info, array_info = self.algorithm.update(update_key, train_data)
         if do_timing:
             t_alg1 = time.perf_counter()
             self._timing_alg_update_s += (t_alg1 - t_alg0)
@@ -800,8 +985,8 @@ class OffPolicyTrainer:
             update_step=int(next_update_step),
         )
         self._assert_finite(
-            "update.dist_info",
-            dist_info,
+            "update.array_info",
+            array_info,
             sample_step=int(self.sample_log.sample_step),
             update_step=int(next_update_step),
         )
@@ -825,6 +1010,22 @@ class OffPolicyTrainer:
                 update_step=int(next_update_step),
             )
 
+        if self.soft_pi_mode:
+            # In SPI mode, all diagnostics are computed on actual env actions
+            # in sample() and accumulated in _spi_accumulator.  The regular
+            # UpdateLog is bypassed (empty dict keeps step counter advancing).
+            ul.add({})
+
+            if do_timing:
+                t1 = time.perf_counter()
+                self._timing_update_s += (t1 - t0)
+                self._timing_update_n += 1
+            return
+
+        # Accumulate array metrics for averaging at log time
+        for k, v in array_info.items():
+            self._array_accum.setdefault(k, []).append(np.asarray(v))
+
         ul.add(info)
 
         if do_timing:
@@ -833,20 +1034,19 @@ class OffPolicyTrainer:
             self._timing_update_n += 1
 
         if log_this_step:
+            self._last_update_log_env_step = current_env_step
             current_step = self.sample_log.sample_step
-            self.add_hist(dist_info, current_step)
 
-            # Log training metrics under a dedicated "training/" section so
-            # they appear in a separate tab analogous to the validation tab.
+            # Average accumulated arrays over updates since last log
+            averaged_arrays = {}
+            for k, v_list in self._array_accum.items():
+                averaged_arrays[k] = sum(v_list) / len(v_list)
+            self._array_accum.clear()
+            self.add_arrays(averaged_arrays, current_step)
+
             ul.log(
                 lambda tag, value, _step: self.add_scalar(
-                    tag
-                    if (
-                        tag.startswith("MALA/")
-                        or tag.startswith("td/")
-                        or tag.startswith("act/")
-                    )
-                    else f"training/{tag}",
+                    tag,
                     value,
                     current_step,
                 )
@@ -908,6 +1108,7 @@ class OffPolicyTrainer:
                     # scalars, skip logging rather than failing.
                     pass
 
+
     def train(self, key: jax.Array):
         key, warmup_key = jax.random.split(key)
 
@@ -915,6 +1116,13 @@ class OffPolicyTrainer:
         # training observations after the replay buffer has been populated.
         obs = self.warmup(warmup_key)
 
+        if self.soft_pi_mode:
+            obs = self._train_soft_pi(key, obs)
+        else:
+            obs = self._train_standard(key, obs)
+
+    def _train_standard(self, key: jax.Array, obs):
+        """Original training loop (no soft-PI)."""
         iter_key_fn = create_iter_key_fn(key, self.sample_per_iteration, self.update_per_iteration)
         sl, ul = self.sample_log, self.update_log
 
@@ -928,8 +1136,8 @@ class OffPolicyTrainer:
             for i in range(self.update_per_iteration):
                 self.update(update_keys[i])
 
-            # Update tfg_lambda according to log-linear schedule
-            self._update_tfg_lambda_schedule(sl.sample_step)
+            # Update tfg_eta according to log-linear schedule
+            self._update_tfg_eta_schedule(sl.sample_step)
 
             # Periodic KL(π_tilt || π_0) logging
             if sl.sample_step % self.log_md_kl_every == 0:
@@ -938,19 +1146,82 @@ class OffPolicyTrainer:
             if self.timing_log_every > 0 and (sl.sample_step % self.timing_log_every == 0):
                 self._log_timing(sl.sample_step)
 
-            if self.save_policy_interval.check(sl.sample_step):
-                policy_pkl_name = self.policy_pkl_template.format(
-                    sample_step=sl.sample_step,
-                    update_step=ul.update_step,
-                )
-                self.algorithm.save_policy(self.log_path / policy_pkl_name)
-                
-                if self.save_value:
-                    self.algorithm.save_q(self.log_path / policy_pkl_name.replace('policy', 'value'))
-                
-                if self.evaluator is not None:
-                    command = f"{sl.sample_step},{self.log_path / policy_pkl_name}\n"
-                    self.evaluator.stdin.write(command.encode())
+        return obs
+
+    def _train_soft_pi(self, key: jax.Array, obs):
+        """Soft policy iteration training loop.
+
+        PI step 0: Q-only (policy frozen, base policy collects data).
+        PI step 1+: Q + policy training (policy distills guided actions).
+
+        iterations_per_pi_step counts training iterations (each iteration =
+        sample_per_iteration env steps + update_per_iteration gradient steps).
+        SPI diagnostic metrics are accumulated and logged at episode boundaries.
+        """
+        iter_key_fn = create_iter_key_fn(key, self.sample_per_iteration, self.update_per_iteration)
+        sl, ul = self.sample_log, self.update_log
+
+        prev_episode_count = sl.sample_episode
+
+        self.progress.unpause()
+        for pi_step in range(self.num_pi_steps):
+            # --- Start of policy improvement step ---
+            self.algorithm.freeze_guidance_q()
+            pi_step_start_sample = sl.sample_step
+
+            # PI step 0: Q-only training (policy frozen).
+            # PI step 1+: enable policy training (distill guided actions).
+            self._spi_pi_step = pi_step
+            if pi_step == 0:
+                self.algorithm.set_train_policy(False)
+            else:
+                self.algorithm.set_train_policy(True)
+
+            print(f"[soft-PI] PI step {pi_step}/{self.num_pi_steps}, "
+                  f"policy={'ON' if pi_step > 0 else 'OFF'}, "
+                  f"sample_step={sl.sample_step}")
+
+            self.add_scalar("pi_step/id", pi_step, sl.sample_step)
+
+            for iteration_in_step in range(self.iterations_per_pi_step):
+                sample_keys, update_keys = iter_key_fn(sl.sample_step)
+
+                for i in range(self.sample_per_iteration):
+                    obs = self.sample(sample_keys[i], obs)
+
+                for i in range(self.update_per_iteration):
+                    self.update(update_keys[i])
+
+                # At episode boundaries, log accumulated SPI diagnostics
+                if sl.sample_episode > prev_episode_count:
+                    current_step = sl.sample_step
+                    self._spi_accumulator.log(
+                        lambda k, v: self.add_scalar(k, v, current_step)
+                    )
+                    self._spi_accumulator.reset()
+                    self.add_scalar("pi_step/id", pi_step, current_step)
+                    self.add_scalar("pi_step/iteration", iteration_in_step, current_step)
+                    prev_episode_count = sl.sample_episode
+
+                # Update tfg_eta according to log-linear schedule
+                self._update_tfg_eta_schedule(sl.sample_step)
+
+                # Periodic KL(π_tilt || π_0) logging
+                if sl.sample_step % self.log_md_kl_every == 0:
+                    self._log_md_kl(sample_keys[0], obs, sl.sample_step)
+
+                if self.timing_log_every > 0 and (sl.sample_step % self.timing_log_every == 0):
+                    self._log_timing(sl.sample_step)
+
+
+            # --- End of policy improvement step ---
+            env_steps_this_pi = sl.sample_step - pi_step_start_sample
+            self.add_scalar("pi_step/total_env_steps", env_steps_this_pi, sl.sample_step)
+            print(f"[soft-PI] Completed PI step {pi_step}, "
+                  f"ran {env_steps_this_pi} env steps ({iteration_in_step} iters), "
+                  f"sample_step={sl.sample_step}")
+
+        return obs
 
     def _log_timing(self, step: int) -> None:
         if self._timing_sample_n <= 0 and self._timing_update_n <= 0:
@@ -987,24 +1258,22 @@ class OffPolicyTrainer:
         self._timing_last_logged_sample_step = int(step)
 
     def add_scalar(self, tag: str, value: float, step: int):
-        if tag == "sample/episode_return":
-            self._maybe_reduce_tfg_lambda_on_plateau(float(value), int(step))
+        if tag.startswith("episode_return/"):
+            self._maybe_reduce_tfg_eta_on_plateau(float(value), int(step))
         self.last_metrics[tag] = value
         wandb.log({tag: value}, step=step)
-        self.logger.add_scalar(tag, value, step)
-        self.logger.flush()
 
-    def _maybe_reduce_tfg_lambda_on_plateau(self, episode_return: float, step: int) -> None:
+    def _maybe_reduce_tfg_eta_on_plateau(self, episode_return: float, step: int) -> None:
         if not np.isfinite(self.tfg_patience):
             return
         if not (self.tfg_reduction_factor < 1.0):
             return
-        if not hasattr(self.algorithm, "get_current_tfg_lambda"):
+        if not hasattr(self.algorithm, "get_current_tfg_eta"):
             return
-        if not hasattr(self.algorithm, "set_tfg_lambda"):
+        if not hasattr(self.algorithm, "set_tfg_eta"):
             return
 
-        current_lambda = float(self.algorithm.get_current_tfg_lambda())
+        current_lambda = float(self.algorithm.get_current_tfg_eta())
         if self._tfg_plateau_lambda is None or (current_lambda != self._tfg_plateau_lambda):
             self._tfg_plateau_lambda = current_lambda
             self._tfg_plateau_best_return = -float("inf")
@@ -1026,24 +1295,22 @@ class OffPolicyTrainer:
         if new_lambda == current_lambda:
             return
 
-        self.algorithm.set_tfg_lambda(new_lambda)
+        self.algorithm.set_tfg_eta(new_lambda)
 
-        tag = "hyperparameters/tfg_lambda"
+        tag = "hyperparameters/tfg_eta"
         self.last_metrics[tag] = float(new_lambda)
         wandb.log({tag: float(new_lambda)}, step=step)
-        self.logger.add_scalar(tag, float(new_lambda), step)
-        self.logger.flush()
 
         self._tfg_plateau_lambda = float(new_lambda)
         self._tfg_plateau_best_return = -float("inf")
         self._tfg_plateau_best_step = step
         self._tfg_plateau_bad_count = 0
 
-    def _update_tfg_lambda_schedule(self, step: int) -> None:
-        """Update tfg_lambda according to log-linear schedule over training."""
+    def _update_tfg_eta_schedule(self, step: int) -> None:
+        """Update tfg_eta according to log-linear schedule over training."""
         if not self._tfg_schedule_enabled:
             return
-        if not hasattr(self.algorithm, "set_tfg_lambda"):
+        if not hasattr(self.algorithm, "set_tfg_eta"):
             return
 
         # Compute progress t in [0, 1] from start_step to total_step
@@ -1058,8 +1325,8 @@ class OffPolicyTrainer:
         # Log-linear interpolation: log(lambda_t) = (1-t)*log(start) + t*log(end)
         # lambda_t = start^(1-t) * end^t
         # Handle edge case where either endpoint is 0
-        start = self.tfg_lambda_start
-        end = self.tfg_lambda_end
+        start = self.tfg_eta_start
+        end = self.tfg_eta_end
         if start > 0 and end > 0:
             new_lambda = (start ** (1.0 - t)) * (end ** t)
         elif start == 0 and end == 0:
@@ -1068,7 +1335,7 @@ class OffPolicyTrainer:
             # Fallback to linear interpolation if one endpoint is 0
             new_lambda = (1.0 - t) * start + t * end
 
-        self.algorithm.set_tfg_lambda(float(new_lambda))
+        self.algorithm.set_tfg_eta(float(new_lambda))
 
     def _log_md_kl(self, key: jax.Array, obs: np.ndarray, step: int) -> None:
         """Log KL(π_tilt || π_0) for mirror descent monitoring."""
@@ -1081,14 +1348,59 @@ class OffPolicyTrainer:
         tag = "mirror_descent/kl_tilt_base"
         self.last_metrics[tag] = float(kl)
         wandb.log({tag: float(kl)}, step=step)
-        self.logger.add_scalar(tag, float(kl), step)
-        self.logger.flush()
 
-    def add_hist(self, info_hist, step):
-        for tag, value in info_hist.items():
-            self.logger.add_histogram(tag, np.array(value), step)
-            wandb.log({tag: wandb.Histogram(np.array(value))}, step=step)
-        self.logger.flush()
+    def add_arrays(self, array_info, step):
+        if not array_info:
+            return
+
+        snr = getattr(self.algorithm, "_snr", None)
+        if snr is not None:
+            log2_snr = np.log2(np.maximum(snr, 1e-12))
+
+        # Log MALA per-level metrics as matplotlib images so that wandb
+        # provides a step slider for each chart.  Enable "Sync slider by
+        # key (Step)" in workspace settings to compare across runs.
+        mala_keys = ("MALA/eta_scale", "MALA/acceptance_rate", "MALA/clip_frac")
+        has_mala = any(k in array_info for k in mala_keys)
+        if has_mala and snr is not None:
+            mala_metrics = {
+                "MALA/eta_scale": np.asarray(array_info.get("MALA/eta_scale", np.full_like(log2_snr, np.nan))),
+                "MALA/acceptance_rate": np.asarray(array_info.get("MALA/acceptance_rate", np.full_like(log2_snr, np.nan))),
+                "MALA/clip_frac": np.asarray(array_info.get("MALA/clip_frac", np.full_like(log2_snr, np.nan))),
+            }
+            log_dict = {}
+            for metric_name, values in mala_metrics.items():
+                if np.all(np.isnan(values)):
+                    continue
+                fig, ax = plt.subplots(figsize=(6, 4))
+                ax.plot(log2_snr, values)
+                ax.set_xlabel("log2(SNR)")
+                ax.set_ylabel(metric_name.split("/")[-1])
+                ax.set_title(f"{metric_name} ({self.env_name})")
+                ax.grid(True, alpha=0.3)
+                fig.tight_layout()
+                log_dict[metric_name] = wandb.Image(fig)
+                plt.close(fig)
+            if log_dict:
+                wandb.log(log_dict, step=step)
+
+        # Log remaining non-MALA arrays as raw tables
+        mala_key_set = set(mala_keys)
+        for tag, value in array_info.items():
+            if tag in mala_key_set:
+                continue
+            arr = np.asarray(value)
+            if snr is not None and len(arr) == len(snr):
+                table = wandb.Table(
+                    columns=["log2_snr", "value"],
+                    data=[[float(log2_snr[i]), float(arr[i])] for i in range(len(arr))],
+                )
+            else:
+                table = wandb.Table(
+                    columns=["level", "value"],
+                    data=[[int(i), float(arr[i])] for i in range(len(arr))],
+                )
+            wandb.log({tag: table}, step=step)
 
     def run(self, key: jax.Array):
         try:
@@ -1100,17 +1412,8 @@ class OffPolicyTrainer:
 
     def finish(self):
         self.env.close()
-        self.algorithm.save(self.log_path / "state.pkl")
-        if self.hparams is not None and len(self.last_metrics) > 0:
-            exp, ssi, sei = hparams(self.hparams, self.last_metrics)
-            self.logger.file_writer.add_summary(exp)
-            self.logger.file_writer.add_summary(ssi)
-            self.logger.file_writer.add_summary(sei)
-        self.logger.close()
         self.progress.close()
-        if self.evaluator is not None:
-            self.evaluator.stdin.close()
-            self.evaluator.wait()
+        wandb.finish()
 
 def create_iter_key_fn(key: jax.Array, sample_per_iteration: int, update_per_iteration: int) -> Callable[[int], Tuple[jax.Array, jax.Array]]:
     def iter_key_fn(step: int):

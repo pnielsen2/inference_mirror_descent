@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -J dpmdmbpc_lr_grid
-#SBATCH -p seas_gpu
-#SBATCH --gres=gpu:nvidia_h200:1
+#SBATCH -p kempner_h100
+#SBATCH --gres=gpu:nvidia_h100:1
 #SBATCH -c 2
 #SBATCH --mem=32G
 #SBATCH -t 0-8:00

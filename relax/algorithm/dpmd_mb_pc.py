@@ -54,7 +54,7 @@ class DPMDMBPC(Algorithm):
         sprime_cs: float = 0.08,
         bprop_refresh_steps: int = 0,
         use_crn: bool = True,
-        tfg_lambda: float = 0.0,
+        tfg_eta: float = 0.0,
         action_steps_per_level: int = 0,
         action_recur_steps: int = 0,
         H_plan: int = 1,
@@ -90,7 +90,7 @@ class DPMDMBPC(Algorithm):
         self.sprime_cs = float(sprime_cs)
         self.bprop_refresh_steps = int(bprop_refresh_steps)
         self.use_crn = bool(use_crn)
-        self.tfg_lambda = float(tfg_lambda)
+        self.tfg_eta = float(tfg_eta)
         self.action_steps_per_level = int(action_steps_per_level)
         self.action_recur_steps = int(action_recur_steps)
         self.H_plan = int(H_plan)
@@ -1010,13 +1010,13 @@ class DPMDMBPC(Algorithm):
                         mean_q = jnp.mean(q_vals)
                         std_q = jnp.std(q_vals)
                         mean_r = mean_q + self.ucb_sprime_coeff * std_q
-                    elif self.entropic_sprime_agg and self.tfg_lambda != 0.0:
-                        z = self.tfg_lambda * q_vals
+                    elif self.entropic_sprime_agg and self.tfg_eta != 0.0:
+                        z = self.tfg_eta * q_vals
                         z_max = jnp.max(z)
                         log_mean_exp = z_max + jnp.log(
                             jnp.mean(jnp.exp(z - z_max))
                         )
-                        mean_r = log_mean_exp / self.tfg_lambda
+                        mean_r = log_mean_exp / self.tfg_eta
                     else:
                         mean_r = jnp.mean(q_vals)
                     aux = (noise_pred_local, key_s_new, sps_new, sps_clean)
@@ -1053,8 +1053,8 @@ class DPMDMBPC(Algorithm):
                             E_model = jnp.array(0.0, dtype=jnp.float32)
 
                         # Total energy: base model energy minus long-horizon-scaled reward.
-                        # Include tfg_lambda so that MALA and diffusion guidance share the same tilt.
-                        E = E_model - self.tfg_lambda * mean_r
+                        # Include tfg_eta so that MALA and diffusion guidance share the same tilt.
+                        E = E_model - self.tfg_eta * mean_r
                         aux = (key_s_new, sps_new)
                         return E, aux
 
@@ -1170,7 +1170,7 @@ class DPMDMBPC(Algorithm):
                         sps_t,
                     )
 
-                    if self.tfg_lambda != 0.0:
+                    if self.tfg_eta != 0.0:
                         if getattr(self.agent, "energy_mode", False) and self.agent.energy_fn is not None:
                             def energy_model_single(x_in: jax.Array) -> jax.Array:
                                 # Always pass h=0 for single-step planner
@@ -1188,7 +1188,7 @@ class DPMDMBPC(Algorithm):
                         else:
                             grad_E_model = jnp.zeros_like(x_used)
 
-                        grad_x = (grad_E_model - grad_E_used) / self.tfg_lambda
+                        grad_x = (grad_E_model - grad_E_used) / self.tfg_eta
                     else:
                         grad_x = jnp.zeros_like(x_used)
 
@@ -1209,7 +1209,7 @@ class DPMDMBPC(Algorithm):
                         )(x_cur, key_s_cur, sps_cur)
 
                         sigma_t = B_act.sqrt_one_minus_alphas_cumprod[t]
-                        eps_guided = noise_pred_recur - self.tfg_lambda * sigma_t * grad_x_recur
+                        eps_guided = noise_pred_recur - self.tfg_eta * sigma_t * grad_x_recur
                         model_mean_recur, model_log_variance_recur = self.agent.diffusion.p_mean_variance(
                             t,
                             x_cur,
@@ -1248,7 +1248,7 @@ class DPMDMBPC(Algorithm):
                     )(x_used, key_s_used, sps_used)
 
                 sigma_t = B_act.sqrt_one_minus_alphas_cumprod[t]
-                noise_pred_guided = noise_pred - self.tfg_lambda * sigma_t * grad_x
+                noise_pred_guided = noise_pred - self.tfg_eta * sigma_t * grad_x
                 model_mean, model_log_variance = self.agent.diffusion.p_mean_variance(
                     t,
                     x_used,
@@ -1565,7 +1565,7 @@ class DPMDMBPC(Algorithm):
                 else:
                     E_model = jnp.array(0.0, dtype=jnp.float32)
 
-                E = E_model - self.tfg_lambda * obj
+                E = E_model - self.tfg_eta * obj
                 return E, aux
 
             def mala_corrector_horizon(
@@ -1662,13 +1662,13 @@ class DPMDMBPC(Algorithm):
                     x_used, t, obs_i, key_dyn,
                 )
 
-                # Guidance gradient if tfg_lambda > 0
-                if self.tfg_lambda != 0.0:
+                # Guidance gradient if tfg_eta > 0
+                if self.tfg_eta != 0.0:
                     grad_obj = jax.grad(
                         lambda x: compute_horizon_objective(x, t, obs_i, key_dyn_grad)[0],
                     )(x_used)
                     sigma_t = B_act.sqrt_one_minus_alphas_cumprod[t]
-                    noise_preds_guided = noise_preds - self.tfg_lambda * sigma_t * grad_obj
+                    noise_preds_guided = noise_preds - self.tfg_eta * sigma_t * grad_obj
                 else:
                     noise_preds_guided = noise_preds
 
@@ -2009,7 +2009,9 @@ class DPMDMBPC(Algorithm):
 
     def update_supervised(self, key: jax.Array, data: Experience) -> Metric:
         self.state, info = self._update_supervised(key, self.state, data)
-        return {k: float(v) for k, v in info.items() if not k.startswith('hist')}, {k: v for k, v in info.items() if k.startswith('hist')}
+        scalar_info = {k: float(v) for k, v in info.items() if jnp.ndim(v) == 0}
+        array_info = {k: np.asarray(v) for k, v in info.items() if jnp.ndim(v) > 0}
+        return scalar_info, array_info
 
     def hyper_update(
         self,
@@ -2021,7 +2023,7 @@ class DPMDMBPC(Algorithm):
 
         This is only used when the trainer enables hypergradient updates.
         It performs a single train+validation hyper step on the internal
-        MbPcTrainState and returns (info, dist_info, val_info) dictionaries
+        MbPcTrainState and returns (info, array_info, val_info) dictionaries
         following the OffPolicyTrainer.update convention.
         """
 
@@ -2029,10 +2031,10 @@ class DPMDMBPC(Algorithm):
             # Fallback: behave like a standard update followed by validation
             # metrics. This should not normally be hit when the trainer gate
             # is configured correctly, but keeps behavior well-defined.
-            info, dist_info_only = self.update(key, train_data)
+            info, array_info_only = self.update(key, train_data)
             val_key = jax.random.fold_in(key, 1)
             val_info_only = self.compute_validation_metrics(val_key, val_data)
-            return info, dist_info_only, val_info_only
+            return info, array_info_only, val_info_only
 
         # Perform a single hypergradient step using the Adam meta-optimizer
         # configured with hypergrad_lr.
@@ -2044,10 +2046,10 @@ class DPMDMBPC(Algorithm):
         )
         self.state = new_state
 
-        info = {k: float(v) for k, v in train_logs.items() if not k.startswith("hist")}
-        dist_info: Metric = {}
-        val_info = {k: float(v) for k, v in val_logs.items() if not k.startswith("hist")}
-        return info, dist_info, val_info
+        info = {k: float(v) for k, v in train_logs.items() if jnp.ndim(v) == 0}
+        array_info = {k: np.asarray(v) for k, v in train_logs.items() if jnp.ndim(v) > 0}
+        val_info = {k: float(v) for k, v in val_logs.items() if jnp.ndim(v) == 0}
+        return info, array_info, val_info
 
     def get_action(self, key: jax.Array, obs: np.ndarray) -> np.ndarray:
         """Get action with optional open-loop execution.

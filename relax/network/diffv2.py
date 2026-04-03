@@ -5,19 +5,17 @@ import jax, jax.numpy as jnp
 import haiku as hk
 import math
 
-from relax.network.blocks import Activation, DistributionalQNet2, DACERPolicyNet, QNet, EnergyPolicyNet
+from relax.network.blocks import Activation, DistributionalQNet2, DACERPolicyNet, QNet, QNetWithDPsi, EnergyPolicyNet
 from relax.utils.dist_aggregation import get_mean_only
 from relax.network.common import WithSquashedGaussianPolicy
 from relax.utils.diffusion import GaussianDiffusion
 from relax.utils.jax_utils import random_key_from_data
 
 class Diffv2Params(NamedTuple):
-    q1: hk.Params
-    q2: hk.Params
-    target_q1: hk.Params
-    target_q2: hk.Params
+    q: Tuple  # tuple of N Q network params
+    target_q: Tuple  # tuple of N target Q network params
     policy: hk.Params
-    target_poicy: hk.Params
+    target_policy: hk.Params
     log_alpha: jax.Array
 
 
@@ -38,6 +36,8 @@ class Diffv2Net:
     energy_fn: Optional[Callable[[hk.Params, jax.Array, jax.Array, jax.Array], jax.Array]] = None
     mala_steps: int = 1
     distributional_critic: bool = False
+    d_psi: Optional[Callable[[hk.Params, jax.Array, jax.Array], jax.Array]] = None
+    q_and_d_psi: Optional[Callable] = None  # (params, obs, act) -> (q_mean, q_var, d_psi)
 
     @property
     def diffusion(self) -> GaussianDiffusion:
@@ -48,13 +48,13 @@ class Diffv2Net:
                                  snr_max=self.snr_max)
 
     def get_action(self, key: jax.Array, policy_params: hk.Params, obs: jax.Array) -> jax.Array:
-        policy_params, log_alpha, q1_params, q2_params = policy_params[:4]
+        policy_params_inner, log_alpha, q_params_tuple = policy_params[0], policy_params[1], policy_params[2]
 
         def model_fn(t, x):
-            return self.policy(policy_params, obs, x, t)
+            return self.policy(policy_params_inner, obs, x, t)
 
         def energy_model_fn(t, x):
-            return self.energy_fn(policy_params, obs, x, t)
+            return self.energy_fn(policy_params_inner, obs, x, t)
 
         def sample(key: jax.Array) -> Union[jax.Array, jax.Array]:
             if self.energy_mode:
@@ -68,9 +68,10 @@ class Diffv2Net:
                 r = jnp.float32(self.x_recon_clip_radius)
                 act_out = jnp.clip(act, -r, r)
 
-            q1 = self.q(q1_params, obs, act_out)
-            q2 = self.q(q2_params, obs, act_out)
-            q = jnp.minimum(q1, q2)
+            q_vals = [self.q(qp, obs, act_out)[0] for qp in q_params_tuple]
+            q = q_vals[0]
+            for qv in q_vals[1:]:
+                q = jnp.minimum(q, qv)
             return act_out, q
 
         key, noise_key = jax.random.split(key)
@@ -189,10 +190,10 @@ class Diffv2Net:
         return x_final
 
     def get_action_guided(self, key: jax.Array, policy_params: hk.Params, obs: jax.Array) -> jax.Array:
-        policy_params, log_alpha, q1_params, q2_params = policy_params[:4]
+        policy_params_inner, log_alpha, q_params_tuple = policy_params[0], policy_params[1], policy_params[2]
 
         def model_fn(t, x):
-            return self.policy(policy_params, obs, x, t)
+            return self.policy(policy_params_inner, obs, x, t)
 
         def guided_sample(single_key: jax.Array) -> Tuple[jax.Array, jax.Array]:
             x_key, noise_key = jax.random.split(single_key)
@@ -227,9 +228,10 @@ class Diffv2Net:
                 act_final = jnp.clip(x_final, -r, r)
                 x_guide_out = jnp.clip(x_guide, -r, r)
 
-            q1 = self.q(q1_params, obs, x_guide_out)
-            q2 = self.q(q2_params, obs, x_guide_out)
-            q = jnp.minimum(q1, q2)
+            q_vals = [self.q(qp, obs, x_guide_out)[0] for qp in q_params_tuple]
+            q = q_vals[0]
+            for qv in q_vals[1:]:
+                q = jnp.minimum(q, qv)
             return act_final, q
 
         key, noise_key = jax.random.split(key)
@@ -259,9 +261,9 @@ class Diffv2Net:
 
     def get_deterministic_action(self, policy_params: hk.Params, obs: jax.Array) -> jax.Array:
         key = random_key_from_data(obs)
-        policy_params, log_alpha, q1_params, q2_params = policy_params[:4]
+        policy_params_inner, log_alpha, q_params_tuple = policy_params[0], policy_params[1], policy_params[2]
         log_alpha = -jnp.inf
-        policy_params = (policy_params, log_alpha, q1_params, q2_params)
+        policy_params = (policy_params_inner, log_alpha, q_params_tuple)
         return self.get_action(key, policy_params, obs)
 
     def q_evaluate(
@@ -294,11 +296,34 @@ def create_diffv2_net(
     distributional_critic: bool = False,
     snr_max: float = 124.0,
     zero_init_q: bool = False,
+    num_q_networks: int = 2,
+    dist_shift_eta: bool = False,
     ) -> Tuple[Diffv2Net, Diffv2Params]:
-    if distributional_critic:
+    # D_ψ callables (set below when dist_shift_eta is True)
+    d_psi_apply_fn = None
+    q_and_d_psi_apply_fn = None
+
+    if dist_shift_eta and not distributional_critic:
+        # Q network with shared backbone + D_ψ head
+        q_dpsi_net = hk.without_apply_rng(
+            hk.transform(lambda obs, act: QNetWithDPsi(hidden_sizes, activation)(obs, act))
+        )
+        q_net = q_dpsi_net  # same transform used for init
+
+        def q_apply(params, obs, act):
+            q_val, _d_psi = q_dpsi_net.apply(params, obs, act)
+            return q_val, jnp.zeros_like(q_val)
+
+        d_psi_apply_fn = lambda params, obs, act: q_dpsi_net.apply(params, obs, act)[1]
+
+        def q_and_d_psi_apply_fn(params, obs, act):
+            q_val, d_psi_val = q_dpsi_net.apply(params, obs, act)
+            return q_val, jnp.zeros_like(q_val), d_psi_val
+
+    elif distributional_critic:
         # Distributional Q network outputs (mean, std)
         q_net = hk.without_apply_rng(hk.transform(lambda obs, act: DistributionalQNet2(hidden_sizes, activation)(obs, act)))
-        
+
         def q_apply(params, obs, act):
             mean, std = q_net.apply(params, obs, act)
             var = std ** 2
@@ -397,21 +422,23 @@ def create_diffv2_net(
                 return policy.apply(params, obs, act, t, h_zeros)
         energy_apply = None
 
+    num_q = int(num_q_networks)
+
     @jax.jit
     def init(key, obs, act):
-        q1_key, q2_key, policy_key = jax.random.split(key, 3)
-        q1_params = q.init(q1_key, obs, act)
+        keys = jax.random.split(key, num_q + 1)
+        policy_key = keys[-1]
+        q_params_list = []
+        for i in range(num_q):
+            q_params_list.append(q.init(keys[i], obs, act))
         if single_q_network:
-            # Use the same params for both Q networks
-            q2_params = q1_params
-        else:
-            q2_params = q.init(q2_key, obs, act)
-        target_q1_params = q1_params
-        target_q2_params = q2_params
+            q_params_list = [q_params_list[0]] * num_q
+        q_params = tuple(q_params_list)
+        target_q_params = tuple(jax.tree.map(lambda x: x, qp) for qp in q_params)
         policy_params = policy.init(policy_key, obs, act, 0, jnp.zeros((1,), dtype=jnp.float32))
         target_policy_params = policy_params
-        log_alpha = jnp.array(math.log(5), dtype=jnp.float32) # math.log(3) or math.log(5) choose one
-        return Diffv2Params(q1_params, q2_params, target_q1_params, target_q2_params, policy_params, target_policy_params, log_alpha)
+        log_alpha = jnp.array(math.log(5), dtype=jnp.float32)
+        return Diffv2Params(q_params, target_q_params, policy_params, target_policy_params, log_alpha)
 
     sample_obs = jnp.zeros((1, obs_dim))
     sample_act = jnp.zeros((1, act_dim))
@@ -433,5 +460,7 @@ def create_diffv2_net(
         energy_fn=energy_apply,
         mala_steps=mala_steps,
         distributional_critic=distributional_critic,
+        d_psi=d_psi_apply_fn,
+        q_and_d_psi=q_and_d_psi_apply_fn,
     )
     return net, params

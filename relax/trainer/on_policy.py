@@ -6,8 +6,7 @@ from numba import njit, types as nt
 import numpy as np
 from gymnasium import Env
 from tqdm import tqdm
-from tensorboardX import SummaryWriter
-from tensorboardX.summary import hparams
+import wandb
 
 from relax.algorithm import Algorithm
 from relax.env import RelaxWrapper
@@ -47,7 +46,8 @@ class OnPolicySampler:
 
     def sample(self, keys: jax.Array):
         for i in range(self.rollout_fragment_length):
-            action = self.algorithm.get_action(keys[i], self.obs)
+            _action_out = self.algorithm.get_action(keys[i], self.obs)
+            action = _action_out[0] if isinstance(_action_out, tuple) else _action_out
             action_clipped = np.clip(action, -1, 1)  # Crucial!
             next_obs, reward, terminated, truncated, _ = self.env.step(action_clipped)
             any_done = np.any(terminated) or np.any(truncated)
@@ -184,11 +184,7 @@ class OnPolicyTrainer:
     def setup(self, dummy_data: GAEExperience):
         self.algorithm.warmup(dummy_data)
 
-        # Setup logger
-        self.logger = SummaryWriter(str(self.log_path))
         self.progress = tqdm(range(self.total_iter), desc="Train Step", disable=None, dynamic_ncols=True)
-
-        self.algorithm.save_policy_structure(self.log_path, dummy_data.obs[0])
 
     def train(self, key: jax.Array):
         iter_key_fn = create_iter_key_fn(key, self.sampler.rollout_fragment_length)
@@ -204,15 +200,10 @@ class OnPolicyTrainer:
             for k, v in metrics.items():
                 self.add_scalar(f"update/{k}", v, i * self.batch_size)
 
-            if i % self.save_policy_every == 0:
-                policy_pkl_name = self.policy_pkl_template.format(
-                    sample_step=i * self.batch_size,
-                )
-                self.algorithm.save_policy(self.log_path / policy_pkl_name)
 
     def add_scalar(self, tag: str, value: float, step: int):
         self.last_metrics[tag] = value
-        self.logger.add_scalar(tag, value, step)
+        wandb.log({tag: value}, step=step)
 
     def run(self, key: jax.Array):
         try:
@@ -224,14 +215,8 @@ class OnPolicyTrainer:
 
     def finish(self):
         self.sampler.env.close()
-        self.algorithm.save(self.log_path / "state.pkl")
-        if self.hparams is not None and len(self.last_metrics) > 0:
-            exp, ssi, sei = hparams(self.hparams, self.last_metrics)
-            self.logger.file_writer.add_summary(exp)
-            self.logger.file_writer.add_summary(ssi)
-            self.logger.file_writer.add_summary(sei)
-        self.logger.close()
         self.progress.close()
+        wandb.finish()
 
 def create_iter_key_fn(key: jax.Array, rollout_fragment_length: int) -> Callable[[int], Tuple[jax.Array, jax.Array]]:
     def iter_key_fn(step: int):

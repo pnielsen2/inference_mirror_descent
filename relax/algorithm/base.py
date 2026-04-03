@@ -21,7 +21,14 @@ class Algorithm:
 
     def update(self, key: jax.Array, data: Experience) -> Metric:
         self.state, info = self._update(key, self.state, data)
-        return {k: float(v) for k, v in info.items() if not k.startswith('hist')}, {k: v for k, v in info.items() if k.startswith('hist')}
+        scalar_info = {}
+        array_info = {}
+        for k, v in info.items():
+            if jnp.ndim(v) == 0:
+                scalar_info[k] = float(v)
+            else:
+                array_info[k] = np.asarray(v)
+        return scalar_info, array_info
 
     def get_action(self, key: jax.Array, obs: np.ndarray) -> np.ndarray:
         action = self._get_action(key, self.get_policy_params(), obs)
@@ -103,7 +110,7 @@ class Algorithm:
         """
 
         _, info = self._update(key, self.state, data)
-        return {k: float(v) for k, v in info.items() if not k.startswith('hist')}
+        return {k: float(v) for k, v in info.items() if jnp.ndim(v) == 0}
 
     def get_effective_hparams(self) -> dict:
         """Return a dict of effective hyperparameters for logging.

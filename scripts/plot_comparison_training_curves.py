@@ -30,7 +30,7 @@ MUJOCO_ENVS = [
 MALA_GUIDED_CONFIG = {
     "alg": "dpmd",
     "dpmd_constant_weight": True,
-    "tfg_lambda": 16.0,
+    "tfg_eta": 16.0,
     "num_particles": 1,
     "mala_steps": 2,
     "q_critic_agg": "mean",
@@ -70,7 +70,7 @@ def fetch_mala_guided_runs(api, env_name, seeds=[0, 1, 2, 3, 4]):
         "config.alg": "dpmd",
         "config.env": env_name,
         "config.dpmd_constant_weight": True,
-        "config.tfg_lambda": MALA_GUIDED_CONFIG["tfg_lambda"],
+        "config.tfg_eta": MALA_GUIDED_CONFIG["tfg_eta"],
         "config.num_particles": 1,
         "config.mala_steps": 2,
         "config.q_critic_agg": "mean",
@@ -112,19 +112,27 @@ def fetch_mala_guided_runs(api, env_name, seeds=[0, 1, 2, 3, 4]):
     return runs_by_seed
 
 
-def get_training_curve(run, max_steps=1000000, step_interval=10000):
+def get_training_curve(run, env_name=None, max_steps=1000000, step_interval=10000):
     """Get interpolated training curve from run history."""
-    history = run.history(keys=["sample/episode_return", "_step"], samples=5000)
-    
-    if history.empty or "sample/episode_return" not in history.columns:
+    if env_name is None:
+        env_name = run.config.get("env", "env")
+    new_key = f"episode_return/{env_name}"
+    legacy_key = "sample/episode_return"
+    history = run.history(keys=[new_key, legacy_key, "_step"], samples=5000)
+
+    if not history.empty and new_key in history.columns and history[new_key].notna().any():
+        metric_key = new_key
+    elif not history.empty and legacy_key in history.columns and history[legacy_key].notna().any():
+        metric_key = legacy_key
+    else:
         return None, None
     
-    history = history.dropna(subset=["sample/episode_return"])
+    history = history.dropna(subset=[metric_key])
     if len(history) == 0:
         return None, None
     
     steps = history["_step"].values
-    values = history["sample/episode_return"].values
+    values = history[metric_key].values
     
     target_steps = np.arange(0, max_steps + step_interval, step_interval)
     interp_values = np.interp(target_steps, steps, values, left=np.nan, right=values[-1])

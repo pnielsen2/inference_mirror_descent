@@ -23,7 +23,7 @@ MUJOCO_ENVS = [
 ]
 
 # Target command pattern for model-free MALA-guided DPMD
-# (without seed and tfg_lambda which may vary)
+# (without seed and tfg_eta which may vary)
 MODEL_FREE_TARGET_ARGS = {
     "alg": "dpmd",
     "dpmd_constant_weight": True,
@@ -44,7 +44,7 @@ MODEL_FREE_TARGET_ARGS = {
 }
 
 
-def run_matches_target(run_config, target_args, env_name=None, tfg_lambda=None):
+def run_matches_target(run_config, target_args, env_name=None, tfg_eta=None):
     """Check if a run's config matches the target args."""
     for key, target_val in target_args.items():
         run_val = run_config.get(key)
@@ -64,22 +64,31 @@ def run_matches_target(run_config, target_args, env_name=None, tfg_lambda=None):
         if run_config.get("env") != env_name:
             return False
     
-    # Check tfg_lambda if specified
-    if tfg_lambda is not None:
-        run_tfg = run_config.get("tfg_lambda")
-        if run_tfg is None or abs(float(run_tfg) - float(tfg_lambda)) > 1e-6:
+    # Check tfg_eta if specified
+    if tfg_eta is not None:
+        run_tfg = run_config.get("tfg_eta")
+        if run_tfg is None or abs(float(run_tfg) - float(tfg_eta)) > 1e-6:
             return False
     
     return True
 
 
-def get_training_curve(run, metric_key="sample/episode_return", max_steps=1000000, step_interval=10000):
+def get_training_curve(run, env_name=None, max_steps=1000000, step_interval=10000):
     """
     Get training curve data from a run's history.
     Returns steps and values arrays, interpolated to regular intervals.
     """
-    history = run.history(keys=[metric_key, "_step"], samples=10000)
-    if history.empty or metric_key not in history.columns:
+    if env_name is None:
+        env_name = run.config.get("env", "env")
+    new_key = f"episode_return/{env_name}"
+    legacy_key = "sample/episode_return"
+    history = run.history(keys=[new_key, legacy_key, "_step"], samples=10000)
+
+    if not history.empty and new_key in history.columns and history[new_key].notna().any():
+        metric_key = new_key
+    elif not history.empty and legacy_key in history.columns and history[legacy_key].notna().any():
+        metric_key = legacy_key
+    else:
         return None, None
     
     # Drop NaN values
@@ -97,14 +106,14 @@ def get_training_curve(run, metric_key="sample/episode_return", max_steps=100000
     return target_steps, interp_values
 
 
-def find_runs_for_env(api, env_name, tfg_lambda=16.0, seeds=None, most_recent_n=5):
+def find_runs_for_env(api, env_name, tfg_eta=16.0, seeds=None, most_recent_n=5):
     """
     Find runs matching the model-free target args for a specific environment.
     
     Args:
         api: wandb API object
         env_name: Environment name (e.g., "HalfCheetah-v4")
-        tfg_lambda: TFG lambda value to filter by
+        tfg_eta: TFG lambda value to filter by
         seeds: List of seeds to include (if None, uses most recent runs)
         most_recent_n: Number of most recent runs to return per seed
     
@@ -121,7 +130,7 @@ def find_runs_for_env(api, env_name, tfg_lambda=16.0, seeds=None, most_recent_n=
             continue
         
         config = run.config
-        if not run_matches_target(config, MODEL_FREE_TARGET_ARGS, env_name, tfg_lambda):
+        if not run_matches_target(config, MODEL_FREE_TARGET_ARGS, env_name, tfg_eta):
             continue
         
         seed = config.get("seed")
@@ -226,7 +235,7 @@ def main():
     api = wandb.Api(timeout=60)
     
     # Configuration
-    tfg_lambda = 16.0
+    tfg_eta = 16.0
     target_seeds = [0, 1, 2, 3, 4]
     
     figures_dir = "/n/home09/pnielsen/inference_mirror_descent/figures"
@@ -243,7 +252,7 @@ def main():
         runs = find_runs_for_env(
             api, 
             env_name, 
-            tfg_lambda=tfg_lambda, 
+            tfg_eta=tfg_eta, 
             seeds=target_seeds,
             most_recent_n=1
         )
@@ -287,7 +296,7 @@ def main():
             print(f"  {env_name}: n={n_seeds}, mean={mean_return:.1f} ± {se:.1f}")
         
         # Plot training curve for this environment
-        env_curves_dict = {f"MALA-Guided DPMD (λ={tfg_lambda})": curves}
+        env_curves_dict = {f"MALA-Guided DPMD (λ={tfg_eta})": curves}
         output_path = os.path.join(figures_dir, f"training_curve_{env_name.replace('-', '_')}.png")
         plot_training_curves(
             env_curves_dict, 
