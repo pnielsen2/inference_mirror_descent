@@ -14,7 +14,7 @@ import json
 # Use longer timeout
 api = wandb.Api(timeout=120)
 
-def fetch_model_free_runs(env_name="HalfCheetah-v4", tfg_lambda=16.0, seeds=[0,1,2,3,4]):
+def fetch_model_free_runs(env_name="HalfCheetah-v4", tfg_eta=16.0, seeds=[0,1,2,3,4]):
     """
     Fetch runs using wandb filters for efficiency.
     """
@@ -23,7 +23,7 @@ def fetch_model_free_runs(env_name="HalfCheetah-v4", tfg_lambda=16.0, seeds=[0,1
         "config.alg": "dpmd",
         "config.env": env_name,
         "config.dpmd_constant_weight": True,
-        "config.tfg_lambda": tfg_lambda,
+        "config.tfg_eta": tfg_eta,
         "config.num_particles": 1,
         "config.mala_steps": 2,
         "config.q_critic_agg": "mean",
@@ -32,7 +32,7 @@ def fetch_model_free_runs(env_name="HalfCheetah-v4", tfg_lambda=16.0, seeds=[0,1
         "state": "finished",
     }
     
-    print(f"Querying wandb with filters for {env_name}, tfg_lambda={tfg_lambda}...")
+    print(f"Querying wandb with filters for {env_name}, tfg_eta={tfg_eta}...")
     runs = api.runs("diffusion_online_rl", filters=filters)
     
     # Group by seed and get most recent
@@ -69,20 +69,31 @@ def fetch_model_free_runs(env_name="HalfCheetah-v4", tfg_lambda=16.0, seeds=[0,1
     return runs_by_seed
 
 
-def get_training_curve(run, max_steps=1000000, step_interval=10000):
+def get_training_curve(run, env_name=None, max_steps=1000000, step_interval=10000):
     """Get training curve from run history."""
     print(f"  Fetching history for {run.name}...")
-    history = run.history(keys=["sample/episode_return", "_step"], samples=5000)
+    # Determine metric key: new format uses episode_return/{env},
+    # fall back to legacy sample/episode_return for old runs.
+    if env_name is None:
+        env_name = run.config.get("env", "env")
+    new_key = f"episode_return/{env_name}"
+    legacy_key = "sample/episode_return"
+    history = run.history(keys=[new_key, legacy_key, "_step"], samples=5000)
     
-    if history.empty or "sample/episode_return" not in history.columns:
+    # Prefer new key, fall back to legacy
+    if not history.empty and new_key in history.columns and history[new_key].notna().any():
+        metric_key = new_key
+    elif not history.empty and legacy_key in history.columns and history[legacy_key].notna().any():
+        metric_key = legacy_key
+    else:
         return None, None
     
-    history = history.dropna(subset=["sample/episode_return"])
+    history = history.dropna(subset=[metric_key])
     if len(history) == 0:
         return None, None
     
     steps = history["_step"].values
-    values = history["sample/episode_return"].values
+    values = history[metric_key].values
     
     # Interpolate to regular intervals
     target_steps = np.arange(0, max_steps + step_interval, step_interval)
@@ -139,11 +150,11 @@ def main():
     os.makedirs(figures_dir, exist_ok=True)
     
     env_name = "HalfCheetah-v4"
-    tfg_lambda = 16.0
+    tfg_eta = 16.0
     seeds = [0, 1, 2, 3, 4]
     
     # Fetch runs
-    runs_by_seed = fetch_model_free_runs(env_name, tfg_lambda, seeds)
+    runs_by_seed = fetch_model_free_runs(env_name, tfg_eta, seeds)
     
     if not runs_by_seed:
         print("No matching runs found!")
@@ -169,14 +180,14 @@ def main():
         print(f"\nFinal Return: {mean_return:.1f} ± {se:.1f} (n={len(final_returns)})")
     
     # Plot
-    curves_dict = {f"MALA-Guided DPMD (λ={tfg_lambda})": curves}
+    curves_dict = {f"MALA-Guided DPMD (λ={tfg_eta})": curves}
     output_path = os.path.join(figures_dir, f"model_free_training_curve_{env_name.replace('-','_')}.png")
     plot_training_curve(curves_dict, env_name, output_path)
     
     # Save data to JSON for later use
     data = {
         "env": env_name,
-        "tfg_lambda": tfg_lambda,
+        "tfg_eta": tfg_eta,
         "seeds": list(runs_by_seed.keys()),
         "final_returns": final_returns,
         "mean_return": mean_return if final_returns else None,

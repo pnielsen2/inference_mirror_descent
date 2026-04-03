@@ -109,8 +109,8 @@ class ThompsonState:
     min_seeds_for_promotion: int = 4
     
     # SLURM settings
-    partition: str = "gpu_requeue"
-    gpu_type: str = "nvidia_h200"
+    partition: str = "kempner_h100"
+    gpu_type: str = "nvidia_h100"
     num_gpus: int = 1
     cpus: int = 2
     mem: str = "32G"
@@ -1244,8 +1244,8 @@ def main():
                         help="Check status of a sweep")
     
     # SLURM options
-    parser.add_argument("--partition", "-p", type=str, default="gpu_requeue")
-    parser.add_argument("--gpu-type", type=str, default="nvidia_h200")
+    parser.add_argument("--partition", "-p", type=str, default="kempner_h100")
+    parser.add_argument("--gpu-type", type=str, default="nvidia_h100")
     parser.add_argument("--num-gpus", type=int, default=1)
     parser.add_argument("--cpus", "-c", type=int, default=2)
     parser.add_argument("--mem", type=str, default="32G")

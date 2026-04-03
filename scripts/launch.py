@@ -10,13 +10,13 @@ Usage examples:
     python scripts/launch.py --cmd "python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4" --seeds 0 1 2 3 4
 
     # Ablation sweep (changes from base command)
-    python scripts/launch.py --cmd "python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4 --tfg_lambda 16" \\
-        --ablate tfg_lambda 8 16 32
+    python scripts/launch.py --cmd "python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4 --tfg_eta 16" \\
+        --ablate tfg_eta 8 16 32
 
     # Multiple ablations with seeds
     python scripts/launch.py --cmd "python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4" \\
         --seeds 100 101 102 \\
-        --ablate tfg_lambda 8 16 32 \\
+        --ablate tfg_eta 8 16 32 \\
         --ablate num_particles 1 64 128
 
     # Dry run (print commands without submitting)
@@ -42,7 +42,8 @@ SBATCH_TEMPLATE = """#!/bin/bash
 #SBATCH -e {log_dir}/%j.err
 #SBATCH --job-name={job_name}
 
-source ~/.venvs/general/bin/activate
+export PATH="$HOME/.venvs/general/bin:$PATH"
+export VIRTUAL_ENV="$HOME/.venvs/general"
 cd {project_dir}
 
 echo "Job ID: $SLURM_JOB_ID"
@@ -73,10 +74,10 @@ def parse_args():
                         help="Ablation: --ablate flag_name val1 val2 val3. Can be used multiple times.")
     
     # SLURM options
-    parser.add_argument("--partition", "-p", type=str, default="seas_gpu",
-                        help="SLURM partition (default: seas_gpu)")
-    parser.add_argument("--gpu-type", type=str, default="nvidia_h200",
-                        help="GPU type (default: nvidia_h200)")
+    parser.add_argument("--partition", "-p", type=str, default="kempner_h100",
+                        help="SLURM partition (default: kempner_h100)")
+    parser.add_argument("--gpu-type", type=str, default="nvidia_h100",
+                        help="GPU type (default: nvidia_h100)")
     parser.add_argument("--num-gpus", type=int, default=1,
                         help="Number of GPUs (default: 1)")
     parser.add_argument("--cpus", "-c", type=int, default=2,
