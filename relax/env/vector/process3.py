@@ -15,7 +15,8 @@ from relax.futex import futex_server_wait, futex_server_notify
 WORKER_PATH = Path(__file__).parent / "worker3.py"
 
 class ProcessVectorEnv(VectorEnv):
-    def __init__(self, name: str, num_envs: int, seed: int, *, num_workers: int = None):
+    def __init__(self, name: str, num_envs: int, seed: int, *,
+                 num_workers: int = None, seeds_override: list = None):
         if num_workers is None:
             num_workers = num_envs
         else:
@@ -54,7 +55,11 @@ class ProcessVectorEnv(VectorEnv):
             dtype=self.single_action_space.dtype,
         )
 
-        if num_envs > 1:
+        if seeds_override is not None:
+            assert len(seeds_override) == num_envs, \
+                f"seeds_override length {len(seeds_override)} != num_envs {num_envs}"
+            seeds = [int(s) for s in seeds_override]
+        elif num_envs > 1:
             rng = np.random.default_rng(seed)
             seeds = rng.integers(0, 2**32 - 1, self.num_envs).tolist()
         else:

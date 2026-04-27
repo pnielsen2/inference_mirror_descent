@@ -126,8 +126,40 @@ class DummyActionPenaltyVectorWrapper(Wrapper, VectorEnv):
         info["reward_env"] = reward
         return obs, reward - penalty, terminated, truncated, info
 
+class _PerEntrySampledBox:
+    """Duck-typed stand-in for gym.spaces.Box whose ``sample()`` concatenates
+    samples from N independent sub-Boxes (one per vmap entry), each with its
+    own RNG seeded from a per-entry master. Only used for the normalized
+    [-1, 1] action space built by ``RelaxWrapper`` -- its only consumer is
+    ``self.env.action_space.sample()`` in the trainers, so we implement just
+    enough of the Box API for that.
+    """
+    def __init__(self, total_envs, act_dim, per_entry_action_seeds,
+                 num_vec_envs_per_entry, dtype=np.float32):
+        assert len(per_entry_action_seeds) * num_vec_envs_per_entry == total_envs
+        self.shape = (total_envs, act_dim)
+        self.dtype = dtype
+        self.low = np.full(self.shape, -1.0, dtype=dtype)
+        self.high = np.full(self.shape, 1.0, dtype=dtype)
+        self._subs = [
+            Box(low=-1.0, high=1.0,
+                shape=(num_vec_envs_per_entry, act_dim),
+                dtype=dtype, seed=int(s))
+            for s in per_entry_action_seeds
+        ]
+
+    def sample(self):
+        return np.concatenate([sub.sample() for sub in self._subs], axis=0)
+
+    def contains(self, x):
+        return bool(np.all(x >= -1.0) and np.all(x <= 1.0)
+                    and tuple(x.shape) == self.shape)
+
+
 class RelaxWrapper(Wrapper):
-    def __init__(self, env: Env, action_seed: int = 0):
+    def __init__(self, env: Env, action_seed: int = 0, *,
+                 per_entry_action_seeds: list = None,
+                 num_vec_envs_per_entry: int = None):
         super().__init__(env)
         self.env: Env[np.ndarray, np.ndarray]
 
@@ -151,13 +183,26 @@ class RelaxWrapper(Wrapper):
             self.needs_rescale = False
         self.original_action_dtype = env.action_space.dtype
 
-        self._action_space = Box(
-            low=-1,
-            high=1,
-            shape=env.action_space.shape,
-            dtype=np.float32,
-            seed=action_seed
-        )
+        if per_entry_action_seeds is not None:
+            assert isinstance(env, VectorEnv), \
+                "per_entry_action_seeds is only supported for VectorEnv"
+            assert num_vec_envs_per_entry is not None
+            total_envs, _ = env.action_space.shape
+            self._action_space = _PerEntrySampledBox(
+                total_envs=total_envs,
+                act_dim=self.act_dim,
+                per_entry_action_seeds=per_entry_action_seeds,
+                num_vec_envs_per_entry=num_vec_envs_per_entry,
+                dtype=np.float32,
+            )
+        else:
+            self._action_space = Box(
+                low=-1,
+                high=1,
+                shape=env.action_space.shape,
+                dtype=np.float32,
+                seed=action_seed,
+            )
 
     def reset(self, *, seed=None, options=None):
         obs, info = self.env.reset(seed=seed, options=options)
@@ -194,16 +239,61 @@ def create_env(
     env = RelaxWrapper(env, action_seed)
     return env, env.obs_dim, env.act_dim
 
-def create_vector_env(name: str, num_envs: int, seed: int, action_seed: int = 0, mode: str = "serial", backend: str = "gymnasium", **kwargs):
+def create_vector_env(name: str, num_envs: int, seed: int, action_seed: int = 0,
+                      mode: str = "serial", backend: str = "gymnasium",
+                      *,
+                      per_entry_env_seeds: list = None,
+                      per_entry_action_seeds: list = None,
+                      **kwargs):
+    """Build a VectorEnv of size ``num_envs``.
+
+    When ``per_entry_env_seeds`` is provided (list of length ``N`` with
+    ``num_envs == N * num_vec_envs_per_entry``), the returned VectorEnv's
+    per-env seeds are chosen to match what ``N`` standalone runs, each with
+    its own master seed from the list, would have produced for their own
+    length-``num_vec_envs_per_entry`` VectorEnvs. Similarly,
+    ``per_entry_action_seeds`` gives each vmap entry its own random-action
+    RNG for the warmup sampler. Together these make a vmapped pack behave
+    exactly like running each entry standalone -- at the env/action-seed
+    sites, not just buffer/network init."""
+    dummy_action_dim = int(kwargs.pop("dummy_action_dim", 0) or 0)
+    dummy_action_alpha = float(kwargs.pop("dummy_action_alpha", 0.0) or 0.0)
+
+    num_vec_envs_per_entry = None
+    seeds_override = None
+    if per_entry_env_seeds is not None:
+        N = len(per_entry_env_seeds)
+        assert num_envs % N == 0, \
+            f"num_envs={num_envs} must be divisible by len(per_entry_env_seeds)={N}"
+        num_vec_envs_per_entry = num_envs // N
+        # Each entry's per-env seeds are derived exactly as a standalone
+        # VectorEnv of size num_vec_envs_per_entry would derive them.
+        flat = []
+        for env_s in per_entry_env_seeds:
+            if num_vec_envs_per_entry > 1:
+                rng_i = np.random.default_rng(int(env_s))
+                flat.extend(rng_i.integers(0, 2**32 - 1, num_vec_envs_per_entry).tolist())
+            else:
+                flat.append(int(env_s))
+        seeds_override = flat
+
+    if per_entry_action_seeds is not None:
+        assert per_entry_env_seeds is not None, \
+            "per_entry_action_seeds requires per_entry_env_seeds (they come in pairs)"
+        assert len(per_entry_action_seeds) == len(per_entry_env_seeds)
+
     if backend == "mjx":
         from relax.env.mjx_wrapper import BraxVectorEnv
-        dummy_action_dim = int(kwargs.pop("dummy_action_dim", 0) or 0)
-        dummy_action_alpha = float(kwargs.pop("dummy_action_alpha", 0.0) or 0.0)
+        if per_entry_env_seeds is not None:
+            raise NotImplementedError(
+                "per_entry_env_seeds is not yet supported for backend='mjx'"
+            )
         env = BraxVectorEnv(name, num_envs, seed)
         if dummy_action_dim and dummy_action_dim > 0:
             env = DummyActionPenaltyVectorWrapper(env, dummy_action_dim=dummy_action_dim, dummy_action_alpha=dummy_action_alpha)
         env = RelaxWrapper(env, action_seed)
         return env, env.obs_dim, env.act_dim
+
     Impl = {
         "serial": SerialVectorEnv,
         "gym": GymProcessVectorEnv,
@@ -211,10 +301,16 @@ def create_vector_env(name: str, num_envs: int, seed: int, action_seed: int = 0,
         "spinlock": SpinlockProcessVectorEnv,
         "futex": FutexProcessVectorEnv,
     }[mode]
-    dummy_action_dim = int(kwargs.pop("dummy_action_dim", 0) or 0)
-    dummy_action_alpha = float(kwargs.pop("dummy_action_alpha", 0.0) or 0.0)
-    env = Impl(name, num_envs, seed, **kwargs)
+    impl_kwargs = dict(kwargs)
+    if seeds_override is not None:
+        impl_kwargs["seeds_override"] = seeds_override
+    env = Impl(name, num_envs, seed, **impl_kwargs)
     if dummy_action_dim and dummy_action_dim > 0:
         env = DummyActionPenaltyVectorWrapper(env, dummy_action_dim=dummy_action_dim, dummy_action_alpha=dummy_action_alpha)
-    env = RelaxWrapper(env, action_seed)
+    if per_entry_action_seeds is not None:
+        env = RelaxWrapper(env, action_seed,
+                           per_entry_action_seeds=per_entry_action_seeds,
+                           num_vec_envs_per_entry=num_vec_envs_per_entry)
+    else:
+        env = RelaxWrapper(env, action_seed)
     return env, env.obs_dim, env.act_dim

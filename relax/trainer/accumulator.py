@@ -31,116 +31,163 @@ class Accumulator:
             log_fn(key, value)
 
 class SampleLog:
+    """Unified episode tracker for 1..N parallel environments.
+
+    Each call to ``add()`` corresponds to one synchronous batch step across all
+    ``num_envs`` environments.  ``sample_step`` advances by ``num_envs`` per
+    call, so that the per-env sub-step for env *i* finishing on batch step *N* is
+
+        env_step = (N - 1) * num_envs + (i + 1)
+
+    Episode returns are recorded in ``_pending_episode_returns`` and drained by
+    the trainer via ``take_pending_episode_returns()``.
+    """
     __slots__ = (
-        "sample_step",
-        "sample_episode",
+        "num_envs",
         "env_name",
         "gamma",
+        "q_label",
+        "env_can_terminate",
+        "sample_step",
+        "sample_episode",
         "episode_return",
         "episode_length",
         "episode_reward_sum",
         "episode_action_mean_sum",
         "episode_action_var_sum",
         "episode_action_clip_frac_sum",
-        "episode_q_agg_sum",
         "episode_q_var_sum",
         "_has_q_agg",
         "_has_q_var",
-        "_episode_q_agg_list",
-        "_episode_reward_list",
-        "_episode_terminated_list",
+        "_episode_q_agg_lists",
+        "_episode_reward_lists",
+        "_episode_terminated_lists",
+        "_pending_episode_returns",
         "accumulator",
     )
 
-    def __init__(self, env_name: str = "env", gamma: float = 0.99):
-        self.sample_step = 0
-        self.sample_episode = 0
+    def __init__(self, num_envs: int = 1, env_name: str = "env", gamma: float = 0.99, q_label: str = "Q", env_can_terminate: bool = True):
+        self.num_envs = num_envs
         self.env_name = env_name
         self.gamma = gamma
-        self.episode_return = 0.0
-        self.episode_length = 0
-        self.episode_reward_sum = 0.0
-        self.episode_action_mean_sum = 0.0
-        self.episode_action_var_sum = 0.0
-        self.episode_action_clip_frac_sum = 0.0
-        self.episode_q_agg_sum = 0.0
-        self.episode_q_var_sum = 0.0
-        self._has_q_agg = False
-        self._has_q_var = False
-        self._episode_q_agg_list = []
-        self._episode_reward_list = []
-        self._episode_terminated_list = []
+        self.q_label = q_label
+        self.env_can_terminate = env_can_terminate
+        self.sample_step = 0
+        self.sample_episode = 0
+        self.episode_return = np.zeros((num_envs,), dtype=np.float64)
+        self.episode_length = np.zeros((num_envs,), dtype=np.int64)
+        self.episode_reward_sum = np.zeros((num_envs,), dtype=np.float64)
+        self.episode_action_mean_sum = np.zeros((num_envs,), dtype=np.float64)
+        self.episode_action_var_sum = np.zeros((num_envs,), dtype=np.float64)
+        self.episode_action_clip_frac_sum = np.zeros((num_envs,), dtype=np.float64)
+        self.episode_q_var_sum = np.zeros((num_envs,), dtype=np.float64)
+        self._has_q_agg = np.zeros((num_envs,), dtype=np.bool_)
+        self._has_q_var = np.zeros((num_envs,), dtype=np.bool_)
+        self._episode_q_agg_lists = [[] for _ in range(num_envs)]
+        self._episode_reward_lists = [[] for _ in range(num_envs)]
+        self._episode_terminated_lists = [[] for _ in range(num_envs)]
+        self._pending_episode_returns = []
         self.accumulator = Accumulator("")
 
-    def add(self, reward: float, terminated: bool, truncated: bool, info: dict):
+    def add(self, reward, terminated, truncated, info: dict):
+        """Record one synchronous step across all envs.
+
+        ``reward``, ``terminated``, ``truncated`` are arrays of shape
+        ``(num_envs,)`` (or scalars when ``num_envs == 1``).
+        """
+        reward = np.atleast_1d(np.asarray(reward, dtype=np.float64))
+        terminated = np.atleast_1d(np.asarray(terminated, dtype=np.bool_))
+        truncated = np.atleast_1d(np.asarray(truncated, dtype=np.bool_))
+
         self.episode_return += reward
         self.episode_reward_sum += reward
         self.episode_length += 1
-        self.sample_step += 1
+        self.sample_step += self.num_envs
 
         if "action_mean" in info:
-            self.episode_action_mean_sum += float(info["action_mean"])
+            self.episode_action_mean_sum += np.atleast_1d(np.asarray(info["action_mean"], dtype=np.float64))
         if "action_var" in info:
-            self.episode_action_var_sum += float(info["action_var"])
+            self.episode_action_var_sum += np.atleast_1d(np.asarray(info["action_var"], dtype=np.float64))
         if "action_clip_frac" in info:
-            self.episode_action_clip_frac_sum += float(info["action_clip_frac"])
+            self.episode_action_clip_frac_sum += np.atleast_1d(np.asarray(info["action_clip_frac"], dtype=np.float64))
         if "q_agg" in info:
-            self.episode_q_agg_sum += float(info["q_agg"])
-            self._has_q_agg = True
-            self._episode_q_agg_list.append(float(info["q_agg"]))
-            self._episode_reward_list.append(float(reward))
-            self._episode_terminated_list.append(bool(terminated))
-            self.accumulator.add("Critic/average_Q", float(info["q_agg"]))
+            q_agg_val = float(info["q_agg"])
+            self._has_q_agg[:] = True
+            for i in range(self.num_envs):
+                self._episode_q_agg_lists[i].append(q_agg_val)
+                self._episode_reward_lists[i].append(float(reward[i]))
+                self._episode_terminated_lists[i].append(bool(terminated[i]))
+            self.accumulator.add(f"Critic/average_{self.q_label}", q_agg_val)
         if "q_var" in info:
             self.episode_q_var_sum += float(info["q_var"])
-            self._has_q_var = True
+            self._has_q_var[:] = True
         if "v_value" in info:
             self.accumulator.add("Critic/average_V", float(info["v_value"]))
 
-        done = terminated or truncated
-        if done:
-            self.sample_episode += 1
-            ep_return_key = f"episode_return/{self.env_name}"
-            self.accumulator.add(ep_return_key, float(self.episode_return))
-            L = max(self.episode_length, 1)
-            if terminated:
-                self.accumulator.add("episodes/reward_mean", self.episode_reward_sum / L)
-                self.accumulator.add("episodes/episode_length", float(self.episode_length))
-            self.accumulator.add("actions/action_mean", self.episode_action_mean_sum / L)
-            self.accumulator.add("actions/action_var", self.episode_action_var_sum / L)
-            self.accumulator.add("actions/final_action_clip_frac", self.episode_action_clip_frac_sum / L)
-            if self._has_q_var:
-                self.accumulator.add("Critic/E(Var({Q_i})_env)", self.episode_q_var_sum / L)
-            if self._has_q_agg and len(self._episode_q_agg_list) > 0:
-                bias = _compute_q_agg_tilt_bias(
-                    self._episode_q_agg_list,
-                    self._episode_reward_list,
-                    self._episode_terminated_list,
-                    self.gamma,
-                    terminated,
+        done = terminated | truncated
+        done_indices = np.flatnonzero(done)
+        done_count = len(done_indices)
+
+        self.sample_episode += done_count
+
+        if done_count > 0:
+            for env_idx in done_indices:
+                env_step = self.sample_step - (self.num_envs - 1 - int(env_idx))
+                self._pending_episode_returns.append(
+                    (env_step, float(self.episode_return[env_idx]))
                 )
-                if bias is not None:
-                    self.accumulator.add("Critic/Q_agg_tilt_bias", bias)
-            self._reset_episode()
 
-        return done
+            denom = np.maximum(self.episode_length[done_indices], 1).astype(np.float64)
+            if self.env_can_terminate:
+                self.accumulator.add_vec("episodes/reward_mean", (self.episode_reward_sum[done_indices] / denom).tolist())
+                self.accumulator.add_vec("episodes/episode_length", self.episode_length[done_indices].astype(np.float64).tolist())
+            self.accumulator.add_vec("actions/action_mean", (self.episode_action_mean_sum[done_indices] / denom).tolist())
+            self.accumulator.add_vec("actions/action_var", (self.episode_action_var_sum[done_indices] / denom).tolist())
+            self.accumulator.add_vec("actions/final_action_clip_frac", (self.episode_action_clip_frac_sum[done_indices] / denom).tolist())
+            ql = self.q_label
+            if np.any(self._has_q_var[done_indices]):
+                q_var_mask = self._has_q_var[done_indices]
+                self.accumulator.add_vec(f"Critic/E(Var({{{ql}_i}})_env)", (self.episode_q_var_sum[done_indices][q_var_mask] / denom[q_var_mask]).tolist())
+            for idx in done_indices:
+                if self._has_q_agg[idx] and len(self._episode_q_agg_lists[idx]) > 0:
+                    bias = _compute_q_agg_tilt_bias(
+                        self._episode_q_agg_lists[idx],
+                        self._episode_reward_lists[idx],
+                        self._episode_terminated_lists[idx],
+                        self.gamma,
+                        bool(terminated[idx]),
+                    )
+                    if bias is not None:
+                        self.accumulator.add(f"Critic/{ql}_agg_tilt_bias", bias)
 
-    def _reset_episode(self):
-        self.episode_return = 0.0
-        self.episode_length = 0
-        self.episode_reward_sum = 0.0
-        self.episode_action_mean_sum = 0.0
-        self.episode_action_var_sum = 0.0
-        self.episode_action_clip_frac_sum = 0.0
-        self.episode_q_agg_sum = 0.0
-        self.episode_q_var_sum = 0.0
-        self._has_q_agg = False
-        self._has_q_var = False
-        self._episode_q_agg_list.clear()
-        self._episode_reward_list.clear()
-        self._episode_terminated_list.clear()
+            # Reset done envs
+            self.episode_return[done_indices] = 0.0
+            self.episode_length[done_indices] = 0
+            self.episode_reward_sum[done_indices] = 0.0
+            self.episode_action_mean_sum[done_indices] = 0.0
+            self.episode_action_var_sum[done_indices] = 0.0
+            self.episode_action_clip_frac_sum[done_indices] = 0.0
+            self.episode_q_var_sum[done_indices] = 0.0
+            self._has_q_agg[done_indices] = False
+            self._has_q_var[done_indices] = False
+            for idx in done_indices:
+                self._episode_q_agg_lists[idx].clear()
+                self._episode_reward_lists[idx].clear()
+                self._episode_terminated_lists[idx].clear()
 
-    def log(self, log_fn: Callable[[str, float, int], None]):
+        return done_count > 0
+
+    def take_pending_episode_returns(self):
+        """Return and clear pending (env_step, return) tuples for episodes
+        that finished since the last call."""
+        pending = self._pending_episode_returns
+        self._pending_episode_returns = []
+        return pending
+
+    def log_accumulator(self, log_fn: Callable[[str, float, int], None]):
+        """Flush averaged accumulator metrics at the current sample_step.
+        Episode returns are drained separately via
+        ``take_pending_episode_returns``."""
         self.accumulator.log(lambda k, v: log_fn(k, v, self.sample_step))
         self.accumulator.reset()
 
@@ -172,130 +219,6 @@ def _compute_q_agg_tilt_bias(q_list, reward_list, terminated_list, gamma, episod
 
     return float(np.mean(bias))
 
-
-class VectorSampleLog:
-    __slots__ = (
-        "num_envs",
-        "env_name",
-        "gamma",
-        "sample_step",
-        "sample_episode",
-        "episode_return",
-        "episode_length",
-        "episode_reward_sum",
-        "episode_action_mean_sum",
-        "episode_action_var_sum",
-        "episode_action_clip_frac_sum",
-        "episode_q_var_sum",
-        "_has_q_agg",
-        "_has_q_var",
-        "_episode_q_agg_lists",
-        "_episode_reward_lists",
-        "_episode_terminated_lists",
-        "accumulator",
-    )
-
-    def __init__(self, num_envs: int, env_name: str = "env", gamma: float = 0.99):
-        self.num_envs = num_envs
-        self.env_name = env_name
-        self.gamma = gamma
-        self.sample_step = 0
-        self.sample_episode = 0
-        self.episode_return = np.zeros((num_envs,), dtype=np.float64)
-        self.episode_length = np.zeros((num_envs,), dtype=np.int64)
-        self.episode_reward_sum = np.zeros((num_envs,), dtype=np.float64)
-        self.episode_action_mean_sum = np.zeros((num_envs,), dtype=np.float64)
-        self.episode_action_var_sum = np.zeros((num_envs,), dtype=np.float64)
-        self.episode_action_clip_frac_sum = np.zeros((num_envs,), dtype=np.float64)
-        self.episode_q_var_sum = np.zeros((num_envs,), dtype=np.float64)
-        self._has_q_agg = False
-        self._has_q_var = False
-        self._episode_q_agg_lists = [[] for _ in range(num_envs)]
-        self._episode_reward_lists = [[] for _ in range(num_envs)]
-        self._episode_terminated_lists = [[] for _ in range(num_envs)]
-        self.accumulator = Accumulator("")
-
-    def add(self, reward: np.ndarray, terminated: np.ndarray, truncated: np.ndarray, info: dict):
-        self.episode_return += reward
-        self.episode_reward_sum += reward
-        self.episode_length += 1
-        self.sample_step += self.num_envs
-
-        if "action_mean" in info:
-            self.episode_action_mean_sum += np.asarray(info["action_mean"], dtype=np.float64)
-        if "action_var" in info:
-            self.episode_action_var_sum += np.asarray(info["action_var"], dtype=np.float64)
-        if "action_clip_frac" in info:
-            self.episode_action_clip_frac_sum += np.asarray(info["action_clip_frac"], dtype=np.float64)
-        if "q_agg" in info:
-            q_agg_val = float(info["q_agg"])
-            self._has_q_agg = True
-            for i in range(self.num_envs):
-                self._episode_q_agg_lists[i].append(q_agg_val)
-                self._episode_reward_lists[i].append(float(reward[i]))
-                self._episode_terminated_lists[i].append(bool(terminated[i]))
-            self.accumulator.add("Critic/average_Q", q_agg_val)
-        if "q_var" in info:
-            self.episode_q_var_sum += float(info["q_var"])
-            self._has_q_var = True
-        if "v_value" in info:
-            self.accumulator.add("Critic/average_V", float(info["v_value"]))
-
-        done = terminated | truncated
-        done_count = np.count_nonzero(done)
-
-        ep_return_key = f"episode_return/{self.env_name}"
-        self.sample_episode += done_count
-
-        if done_count > 0:
-            denom = np.maximum(self.episode_length[done], 1).astype(np.float64)
-            self.accumulator.add_vec(ep_return_key, self.episode_return[done].tolist())
-            term_done = terminated[done]
-            if np.any(term_done):
-                term_denom = np.maximum(self.episode_length[done][term_done], 1).astype(np.float64)
-                self.accumulator.add_vec("episodes/reward_mean", (self.episode_reward_sum[done][term_done] / term_denom).tolist())
-                self.accumulator.add_vec("episodes/episode_length", self.episode_length[done][term_done].astype(np.float64).tolist())
-            self.accumulator.add_vec("actions/action_mean", (self.episode_action_mean_sum[done] / denom).tolist())
-            self.accumulator.add_vec("actions/action_var", (self.episode_action_var_sum[done] / denom).tolist())
-            self.accumulator.add_vec("actions/final_action_clip_frac", (self.episode_action_clip_frac_sum[done] / denom).tolist())
-            if self._has_q_var:
-                self.accumulator.add_vec("Critic/E(Var({Q_i})_env)", (self.episode_q_var_sum[done] / denom).tolist())
-            if self._has_q_agg:
-                done_indices = np.flatnonzero(done)
-                for idx in done_indices:
-                    if len(self._episode_q_agg_lists[idx]) > 0:
-                        bias = _compute_q_agg_tilt_bias(
-                            self._episode_q_agg_lists[idx],
-                            self._episode_reward_lists[idx],
-                            self._episode_terminated_lists[idx],
-                            self.gamma,
-                            bool(terminated[idx]),
-                        )
-                        if bias is not None:
-                            self.accumulator.add("Critic/Q_agg_tilt_bias", bias)
-
-        # Reset done envs
-        self.episode_return[done] = 0.0
-        self.episode_length[done] = 0
-        self.episode_reward_sum[done] = 0.0
-        self.episode_action_mean_sum[done] = 0.0
-        self.episode_action_var_sum[done] = 0.0
-        self.episode_action_clip_frac_sum[done] = 0.0
-        self.episode_q_var_sum[done] = 0.0
-        if done_count > 0:
-            done_indices = np.flatnonzero(done)
-            for idx in done_indices:
-                self._episode_q_agg_lists[idx].clear()
-                self._episode_reward_lists[idx].clear()
-                self._episode_terminated_lists[idx].clear()
-            self._has_q_agg = False
-            self._has_q_var = False
-
-        return done_count > 0
-
-    def log(self, log_fn: Callable[[str, float, int], None]):
-        self.accumulator.log(lambda k, v: log_fn(k, v, self.sample_step))
-        self.accumulator.reset()
 
 class VectorFragmentSampleLog:
     __slots__ = ("num_envs", "fragment_length", "sample_step", "sample_episode", "episode_return", "episode_length", "accumulator")

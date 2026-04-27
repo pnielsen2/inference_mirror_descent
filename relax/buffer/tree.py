@@ -262,7 +262,23 @@ class TreeBuffer(Buffer[T]):
         else:
             leaves = self.buffers
         with path.open("wb") as f:
-            pickle.dump(leaves, f)
+            pickle.dump((leaves, self.len, self.ptr), f)
+
+    def load(self, path: Path) -> None:
+        with path.open("rb") as f:
+            data = pickle.load(f)
+        # Support both old format (just leaves) and new format (leaves, len, ptr)
+        if isinstance(data, tuple) and len(data) == 3 and isinstance(data[1], int):
+            leaves, saved_len, saved_ptr = data
+        else:
+            leaves = data
+            saved_len = len(leaves[0])
+            saved_ptr = saved_len % self.max_len
+        for saved_leaf, buf in zip(leaves, self.buffers):
+            n = len(saved_leaf)
+            buf[:n] = saved_leaf
+        self.len = saved_len
+        self.ptr = saved_ptr
 
     def _advance(self, size: int = 1):
         self.len = min(self.len + size, self.max_len)

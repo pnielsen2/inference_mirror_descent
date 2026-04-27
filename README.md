@@ -1,118 +1,108 @@
 # Efficient Online Reinforcement Learning for Diffusion Policies
 
-This is the official implementation of
+This repository contains the current JAX/Haiku training code for our diffusion-policy RL experiments.
 
-## Installation
+## Harvard RC copy-paste setup for the real `*-v3` example
+
+The real packed-seed launch below uses Gymnasium's `mujoco-py` path, so on Harvard RC you need both the Python environment and a user-space install of `MuJoCo 2.1` plus the `GLEW` headers. The block below is the tested end-to-end setup sequence.
 
 ```bash
-# Create environment
-conda create -n inf-md python=3.10 numpy tqdm tensorboardX matplotlib scikit-learn black snakeviz ipykernel setproctitle numba
-conda activate inf-md
+export PYTHON_BIN=/n/sw/Mambaforge-23.11.0-0/bin/python
+mkdir -p "$HOME/.mujoco" "$HOME/.local/glew"
 
-# One of: Install jax WITH CUDA 
-pip install --upgrade "jax[cuda12]==0.4.27" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+if [ ! -f "$HOME/.mujoco/mujoco210/bin/libmujoco210.so" ]; then
+  wget -O /tmp/mujoco210-linux-x86_64.tar.gz https://mujoco.org/download/mujoco210-linux-x86_64.tar.gz
+  tar -xzf /tmp/mujoco210-linux-x86_64.tar.gz -C "$HOME/.mujoco"
+fi
 
-# Install package
+if [ ! -f "$HOME/.local/glew/glew-2.1.0/include/GL/glew.h" ]; then
+  wget -O /tmp/glew-2.1.0.tgz https://downloads.sourceforge.net/project/glew/glew/2.1.0/glew-2.1.0.tgz
+  tar -xzf /tmp/glew-2.1.0.tgz -C "$HOME/.local/glew"
+fi
+
+test -f "$HOME/.mujoco/mujoco210/bin/libmujoco210.so"
+test -f "$HOME/.local/glew/glew-2.1.0/include/GL/glew.h"
+
+export LD_LIBRARY_PATH="$HOME/.mujoco/mujoco210/bin:/usr/lib/nvidia:/lib64:${LD_LIBRARY_PATH:-}"
+export CPATH="$HOME/.local/glew/glew-2.1.0/include:${CPATH:-}"
+
+"$PYTHON_BIN" --version
+"$PYTHON_BIN" -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install "jax[cuda12]==0.6.2"
 pip install -r requirements.txt
 pip install -e .
 ```
 
+`requirements.txt` installs a venv-local `patchelf`, which `mujoco-py` needs if it has to build `cymj` on the compute node the first time it imports a `*-v3` environment. The explicit `LD_LIBRARY_PATH` / `CPATH` exports above mirror what `scripts/launch.py` later injects into the generated `sbatch` script.
+The example launch below includes `--no-sweep-id` so it works from a fresh Harvard RC account without requiring a prior `wandb login` on the login node. If you want `launch.py` to auto-assign a sweep id and the background sync loop to upload runs to W&B, run `wandb login` first and remove `--no-sweep-id`.
 
+## Optional extras not included in `requirements.txt`
 
-## Run
-```bash
-# Run one experiment
-XLA_FLAGS='--xla_gpu_deterministic_ops=true' CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_MEM_FRACTION=.1 python scripts/train_mujoco.py --alg sdac --seed 100
-```
+- `brax==0.14.0` if you want `--backend mjx`
 
-baseline (Plain DPMD):
-```bash
-python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4 --beta_schedule_type cosine --beta_schedule_scale 1 --lr_annealing 
-```
-which achieves an average of 11267.6 (SE: 153) over 5 runs.
-
-There appears to be a bug in the code relating to q-normalization, but fixing it by adding the flag --fix_q_norm_bug: 
+## Sanity checks after install
 
 ```bash
-python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4 --beta_schedule_type cosine --beta_schedule_scale 1 --lr_annealing --fix_q_norm_bug
+python -c "import relax.futex, relax.spinlock, relax.prctl; import scripts.launch, scripts.train_mujoco"
+python scripts/train_mujoco.py --help >/dev/null
+python scripts/launch.py --help >/dev/null
 ```
 
-doesn't seem to help, achieving a mean of 10263 (SE: 281.2) over 5 runs.
+## Example: real `*-v3` packed-seed launch
+
+The command below matches the real packed-seed test launch shape: four `*-v3` MuJoCo jobs (`HalfCheetah`, `Ant`, `Walker2d`, `Humanoid`), each packing seeds `0` and `1` together on one GPU.
 
 ```bash
-python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4 --beta_schedule_type cosine --beta_schedule_scale 1 --fix_q_norm_bug
+python scripts/launch.py \
+  --venv "$PWD/.venv" \
+  --no-sweep-id \
+  --job-name dpmd_H3 \
+  --log-dir "$PWD/logs/slurm/packed_seed_real" \
+  --wandb-offline-base "$PWD/wandb_offline" \
+  --cmd "python scripts/train_mujoco.py \
+    --alg dpmd \
+    --env HalfCheetah-v3 \
+    --dpmd_constant_weight \
+    --tfg_eta 8.0 \
+    --num_particles 1 \
+    --mala_steps 2 \
+    --q_critic_agg mean \
+    --beta_schedule_type cosine \
+    --beta_schedule_scale 1 \
+    --dpmd_no_entropy_tuning \
+    --buffer_size 400000 \
+    --x0_hat_clip_radius 3.0 \
+    --mala_adapt_rate 0.2 \
+    --mala_per_level_eta \
+    --q_td_huber_width 30.0 \
+    --update_per_iteration 8 \
+    --lr_q 0.00015 \
+    --mala_guided_predictor \
+    --ddim_predictor \
+    --kl_budget 1024 \
+    --one_step_dist_shift_eta" \
+  --seeds 0 1 \
+  --ablate env HalfCheetah-v3 Ant-v3 Walker2d-v3 Humanoid-v3 \
+  --max-runs-per-gpu 2 \
+  --cpus 10 \
+  --time 1-06:00 \
+  --mem 64G
 ```
 
-same with this, which gets 10146.4 (SE: 244.46) over 5 runs.
+Once that launch works, scale it up by adding `--ablate` or `--oat-ablate` axes. (Adding these additional ablate axes to manually pack more runs on a single GPU seems to be broken right now)
 
-This project attempts to introduce three things: 
-1. inference time tilt of policies. For this modification alone, the best performing command so far is
-```bash
-python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4 --dpmd_constant_weight --tfg_lambda 16.0 --num_particles 1 --mala_steps 2 --q_critic_agg mean --beta_schedule_type cosine --beta_schedule_scale 1 --dpmd_no_entropy_tuning --buffer_size 200000
-```
-which achieves approx 10442 (SE: 233.44) over 5 runs.
+`scripts/launch.py` will automatically:
 
-We also find that denoising many particles and behavior cloning the best/soft best under the Q function dominates performance:
+- use `--venv PATH` when you want an explicit environment such as `"$PWD/.venv"`; otherwise it infers a default cluster venv from the command's `--env` version
+- prepend any CUDA runtime libraries bundled inside that venv to `PATH` / `LD_LIBRARY_PATH`
+- verify that JAX actually sees a GPU on the allocated node before starting training
+- inject `--parallel_seeds K` for each packed job
+- inline the per-slot overrides via `--hp_pack_inline '<json>'`
+- auto-pick CPUs as `min(pack_size * num_vec_envs, 24)` unless you override `--cpus`
 
-```bash
-python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4 --dpmd_constant_weight --num_particles 128 --q_critic_agg mean --particle_selection_lambda 64 --beta_schedule_type cosine --beta_schedule_scale 1
-```
-
-This command achieves an average of 10941 (SE: 183.78) without any Q-guidance at inference time or Q-based reweighting during training. This is purely the result of behavior cloning the best/soft best over many denoised action particles under the Q function.
-
-
-2. Use of transition models and reward models to guide tilts, rather than Q
-
-There are two methods employed in this project: a deterministic dynamics model and a diffusion based dynamics model. For the deterministic model, the best performance is achieved by this command:
-
-```bash
-python scripts/train_mujoco.py --alg dpmd_mb_pc --env HalfCheetah-v4 --tfg_lambda 2 --mala_steps 1 --pc_use_value --update_per_iteration 4 --lr_dyn 1e-4 --lr_value 3e-3 --buffer_size 200000 --pc_deterministic_dyn --lr_policy 1e-4 --use_validation --validation_ratio 0.0 --diffusion_steps 20 --beta_schedule_type cosine --beta_schedule_scale 1
-```
-
-with an average episode return of around 8962 (SE: 481.1) over 5 runs.
-
-For the diffusion based model, the best performance is achieved by this command:
-
-```bash
-python scripts/train_mujoco.py --alg dpmd_mb_pc --env HalfCheetah-v4 --tfg_lambda 2 --mala_steps 1 --pc_use_value --sprime_num_particles 32 --update_per_iteration 4 --lr_dyn 3e-3 --lr_value 3e-3 --sprime_refresh_steps 6 --bprop_refresh_steps 6 --buffer_size 200000 --beta_schedule_type cosine --beta_schedule_scale 1
-```
-with an episode return of 6315 (SE: 462.06) over 5 runs.
-
-
-3. Planning - denoising a sequence of actions and tilting based on the quality of the entire sequence
-
-The best command here is this one which chains together 1-step policies and a world model:
-```bash
-python scripts/train_mujoco.py --alg dpmd_mb_pc --env HalfCheetah-v4 --tfg_lambda 2 --mala_steps 1 --pc_use_value --update_per_iteration 4 --lr_dyn 1e-4 --lr_value 3e-3 --buffer_size 200000 --pc_deterministic_dyn --lr_policy 1e-4 --use_validation --validation_ratio 0.0 --pc_H_plan 2 --beta_schedule_type cosine --beta_schedule_scale 1
-```
-
-which achieves an average episode return of 8046 (SE: 193.5152) over 5 runs.
-
-This one directly learns an n-step policy, which doesn't perform as well,
-```bash
-python scripts/train_mujoco.py --alg dpmd_mb_pc --env HalfCheetah-v4 --tfg_lambda 2 --mala_steps 1 --pc_use_value --sprime_num_particles 32 --update_per_iteration 4 --lr_dyn 1e-4 --lr_value 3e-3 --buffer_size 200000 --pc_deterministic_dyn --lr_policy 1e-4 --use_validation --validation_ratio 0.0 --pc_H_plan 2 --pc_joint_seq --beta_schedule_type cosine --beta_schedule_scale 1
-```
-
-achieving an average episode return of 7173 (SE: 228.43) over 5 runs.
-
-## Visualize results
-```python
-from relax.utils.inspect_results import load_results, plot_mean
-
-env_name = 'Ant-v4'
-
-patterns_dict = {
-        'sdac': r'sdac.*' # regex expression of saved folders
-    }
-
-for key, value in patterns_dict.items():
-    print(key)
-    _ = load_results(value, env_name, show_df=False)
-
-plot_mean(patterns_dict, env_name)
-```
+If you do not want offline WandB staging, replace `--wandb-offline-base ...` with `--no-wandb-offline`.
 
 ## Acknowledgement
 We developed this repo based on [Efficient Online Reinforcement Learning for Diffusion Policies] (https://github.com/mahaitongdae/diffusion_policy_online_rl), which was in turn based on [DACER](https://github.com/happy-yan/DACER-Diffusion-with-Online-RL.git). We thank the authors of both repos for providing a high-quality code base.
-
-
