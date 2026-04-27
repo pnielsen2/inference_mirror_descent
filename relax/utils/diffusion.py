@@ -189,14 +189,16 @@ class GaussianDiffusion:
         return loss.mean()
 
     def weighted_p_loss(self, key: jax.Array, weights: jax.Array, model: DiffusionModel, t: jax.Array,
-                        x_start: jax.Array):
+                        x_start: jax.Array, reduction: str = "mean"):
         if len(weights.shape) == 1:
             weights = weights.reshape(-1, 1)
         assert t.ndim == 1 and t.shape[0] == x_start.shape[0]
         noise = jax.random.normal(key, x_start.shape)
         x_noisy = jax.vmap(self.q_sample)(t, x_start, noise)
         noise_pred = model(t, x_noisy)
-        loss = weights * optax.squared_error(noise_pred, noise)
+        loss = weights * optax.squared_error(noise_pred, noise)  # [batch, act_dim]
+        if reduction == "sum":
+            return loss.sum(axis=-1).mean()  # sum over act_dim, mean over batch
         return loss.mean()
     
     def ula_weighted_p_loss(self, key: jax.Array, sample_weights: jax.Array, model: DiffusionModel, t: jax.Array,

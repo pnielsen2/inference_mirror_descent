@@ -337,12 +337,38 @@ class Diffv2TrainState(NamedTuple):
     dsac_b_ema: float = 1.0      # EMA of batch-mean predicted std (for adaptive clipping)
     # Normalized advantage guidance state
     value_params: hk.Params = None  # V(s) network params (optional)
+    target_value_params: hk.Params = None  # Polyak-averaged V target (for td_value_training)
     advantage_second_moment_ema: float = 1.0  # EMA of E[A^2] where A = Q - V
     advantage_third_moment_ema: float = 0.0   # EMA of E[A^3] (skewness), for dist_shift_eta
     dist_shift_covariance_ema: float = 0.0    # EMA of E[D_psi * A] (covariance), for dist_shift_eta
-    dist_shift_shape_ema: float = -1.0        # EMA of s = (2γc + κ₃) / v^(3/2), dimensionless shape
+    dist_shift_shape_ema: float = -1.0        # EMA of s₂ = (2γc + κ₃) / v^(3/2), dimensionless shape
+    dist_shift_coeff_ema: float = -1.0        # EMA of B = 2γc + κ₃, raw η²-coefficient (alt to shape)
+    dist_shift_shape3_ema: float = 0.0       # EMA of s₃ = τ / v², third-order dimensionless shape
     frozen_q: tuple = None  # tuple of N frozen Q params (or None) for soft-PI
     train_policy: float = 1.0  # 0.0 during Q-only phase of soft-PI
+    # Per-seed vmappable hyperparameters. Scalars in single-seed mode; under
+    # VmapOffPolicyTrainer each field becomes a [N]-shaped array so vmap maps
+    # one scalar value to each seed.
+    gamma: jax.Array = 0.99            # discount factor
+    polyak_tau: jax.Array = 0.005       # target net soft-update rate
+    lr_q: jax.Array = 1e-4              # Q optimizer LR (applied as -lr*update)
+    lr_policy: jax.Array = 1e-4         # policy optimizer LR
+    guidance_mult: jax.Array = 1.0      # guidance strength multiplier
+    adv_ema_tau: jax.Array = 0.0005     # advantage-moment EMA rate
+    shape_ema_tau: jax.Array = 0.0001   # dimensionless shape EMA rate
+    kl_budget_val: jax.Array = 1.0      # KL budget δ (host uses for η cap)
+    reward_scale: jax.Array = 1.0       # reward scaling for TD / huber δ
+    x0_hat_clip_radius: jax.Array = 1.0  # clip radius for x0 prediction
+    mala_adapt_rate: jax.Array = 0.05   # MALA step-size adaptation rate
+    q_td_huber_width: jax.Array = float("inf")  # Q TD huber loss width (in reward units)
+    shape3_ema_tau: jax.Array = 5e-5    # third-order dimensionless shape EMA rate
+    # Per-slot mean-vs-min Q-aggregation selector used only when the algo is
+    # instantiated with q_critic_agg == "vmap_mean_min". 0.0 => mean, 1.0 =>
+    # min, interpolated linearly in between. Threaded through both the
+    # training-time Q signal (stateless_update's aggregate_q_n) and the
+    # sampling-time aggregator (via the params tuple into sample_action_with_agg),
+    # so the vmap path mirrors the non-vmap 'mean'/'min' paths exactly.
+    q_critic_agg_idx: jax.Array = 0.0
 
 class DPMD(Algorithm):
 
@@ -378,6 +404,46 @@ class DPMD(Algorithm):
             transition_begin=begin,
         )
 
+    @staticmethod
+    def _lr_at_step(schedule_type: str, init_lr: jax.Array, end_lr: float,
+                    steps: int, begin: int, count: jax.Array) -> jax.Array:
+        init_lr = jnp.asarray(init_lr, dtype=jnp.float32)
+        end_lr = jnp.asarray(end_lr, dtype=jnp.float32)
+        count = jnp.asarray(count, dtype=jnp.float32)
+        if schedule_type == "constant" or steps <= 0:
+            return init_lr
+        if schedule_type == "cosine":
+            t = jnp.clip(count / max(int(steps), 1), 0.0, 1.0)
+            decay = jnp.float32(0.5) * (jnp.float32(1.0) + jnp.cos(jnp.pi * t))
+            return end_lr + (init_lr - end_lr) * decay
+        t = jnp.clip((count - int(begin)) / max(int(steps), 1), 0.0, 1.0)
+        if schedule_type == "log_linear":
+            log_lr = jnp.exp(
+                (jnp.float32(1.0) - t) * jnp.log(jnp.maximum(init_lr, jnp.float32(1e-30)))
+                + t * jnp.log(jnp.maximum(end_lr, jnp.float32(1e-30)))
+            )
+            linear_lr = (jnp.float32(1.0) - t) * init_lr + t * end_lr
+            return jnp.where((init_lr > 0) & (end_lr > 0), log_lr, linear_lr)
+        return (jnp.float32(1.0) - t) * init_lr + t * end_lr
+
+    def _policy_lr_at_step(self, init_lr: jax.Array, step: jax.Array) -> jax.Array:
+        return self._lr_at_step(
+            self._policy_lr_schedule_type,
+            init_lr,
+            self._policy_lr_schedule_end,
+            self._policy_lr_schedule_steps,
+            self._policy_lr_schedule_begin,
+            step,
+        )
+
+    @staticmethod
+    def _optimizer_count(opt_state) -> jax.Array:
+        if hasattr(opt_state, "count"):
+            return opt_state.count
+        if isinstance(opt_state, tuple) and len(opt_state) > 0 and hasattr(opt_state[0], "count"):
+            return opt_state[0].count
+        raise TypeError(f"Unsupported optimizer state type for count extraction: {type(opt_state)}")
+
     def __init__(
         self,
         agent: Diffv2Net,
@@ -402,6 +468,7 @@ class DPMD(Algorithm):
         off_policy_td: bool = False,
         no_entropy_tuning: bool = False,
         q_critic_agg: str = "min",
+        q_critic_agg_idx: float = 0.0,
         entropic_risk_beta: float = 1.0,
         fix_q_norm_bug: bool = False,
         tfg_eta: float = 0.0,
@@ -425,6 +492,9 @@ class DPMD(Algorithm):
         decorrelated_q_batches: bool = False,
         q_bootstrap_agg: str = "min",
         langevin_q_noise: bool = False,
+        td_use_target_policy: bool = False,
+        batch_independent_guidance: bool = False,
+        guidance_strength_multiplier: float = 1.0,
         critic_grad_modifier: str = "none",
         natural_gradient_critic: bool = False,
         # DSAC-T refinements
@@ -437,9 +507,13 @@ class DPMD(Algorithm):
         # Critic normalization for guidance
         critic_normalization: str = "none",  # "none", "ema", "distributional"
         advantage_ema_tau: float = 0.0005,
-        shape_ema_tau: float = 0.0001,  # slower EMA for dimensionless shape s = (2γc+κ₃)/v^(3/2)
+        shape_ema_tau: float = 0.0001,  # slower EMA for dimensionless shape s₂ = (2γc+κ₃)/v^(3/2)
+        initial_advantage_second_moment_ema: float = 1.0,
+        initial_dist_shift_shape_ema: float = -1.0,
+        shape3_ema_tau: float = 0.00005,  # even slower EMA for s₃ = τ/v² (third-order shape)
         # Policy loss type
         policy_loss_type: str = "eps_mse",  # "eps_mse" or "ula_kl"
+        policy_loss_reduction: str = "mean",  # "mean" or "sum" (sum over action dims, mean over batch)
         # Soft policy iteration mode
         soft_pi_mode: bool = False,
         # Optimizer choice and LR schedule
@@ -452,6 +526,14 @@ class DPMD(Algorithm):
         kl_budget: float | None = None,
         dist_shift_eta: bool = False,
         one_step_dist_shift_eta: bool = False,
+        two_step_dist_shift_eta: bool = False,
+        direct_eta_coeff_ema: bool = False,
+        # Entropic-risk / exponential-moment critic parameterization:
+        #   "none" = standard Q critic
+        #   "u"    = raw output is u = η·Q_η, trained with pseudo-loss
+        #   "w"    = raw output is W, trained with direct MSE Bellman regression
+        entropic_critic_param: str = "none",
+        td_value_training: bool = False,
     ):
         self.agent = agent
         timesteps = self.agent.num_timesteps
@@ -476,6 +558,17 @@ class DPMD(Algorithm):
             if optimizer_type == "adamw":
                 return optax.adamw(learning_rate=lr_or_schedule, weight_decay=weight_decay)
             return optax.adam(learning_rate=lr_or_schedule)
+        def _make_optimizer_unscaled():
+            # Returns an optimizer whose update is NOT multiplied by -lr.
+            # Caller must apply `-state.lr_X * update` manually before
+            # optax.apply_updates. Lets the LR be a per-seed runtime value
+            # (vmappable) instead of baked into the chain at construction.
+            if optimizer_type == "adamw":
+                return optax.chain(
+                    optax.scale_by_adam(),
+                    optax.add_decayed_weights(weight_decay),
+                )
+            return optax.scale_by_adam()
         self._make_optimizer = _make_optimizer
 
         # Q optimizer (with optional schedule)
@@ -487,13 +580,20 @@ class DPMD(Algorithm):
                 int(lr_schedule_steps), int(lr_schedule_begin),
             )
             self.optim = _make_optimizer(q_lr_sched)
+            self._q_lr_runtime = False  # LR baked into the schedule chain
         else:
-            self.optim = _make_optimizer(lr_q_eff)
+            # Constant LR path: use unscaled optimizer and apply lr at update time.
+            # This makes state.lr_q a per-seed runtime value under vmap.
+            self.optim = _make_optimizer_unscaled()
+            self._q_lr_runtime = True
         self.latent_action_space = bool(latent_action_space)
         self.q_td_huber_width = float(q_td_huber_width)
         self.decorrelated_q_batches = bool(decorrelated_q_batches)
         self.q_bootstrap_agg = str(q_bootstrap_agg)
         self.langevin_q_noise = bool(langevin_q_noise)
+        self.td_use_target_policy = bool(td_use_target_policy)
+        self.batch_independent_guidance = bool(batch_independent_guidance)
+        self.guidance_strength_multiplier = float(guidance_strength_multiplier)
 
         critic_grad_modifier = str(critic_grad_modifier)
         if bool(natural_gradient_critic) and critic_grad_modifier == "none":
@@ -507,13 +607,13 @@ class DPMD(Algorithm):
         # Policy optimizer (with optional schedule)
         lr_policy_schedule_type = str(lr_policy_schedule_type).lower()
         if lr_policy_schedule_type != "constant" and lr_schedule_steps > 0:
-            policy_lr_sched = self._make_lr_schedule(
-                lr_policy_schedule_type, lr_policy_eff, lr_schedule_end,
-                int(lr_schedule_steps), int(lr_schedule_begin),
-            )
-            self.policy_optim = _make_optimizer(policy_lr_sched)
+            self._policy_lr_schedule_type = lr_policy_schedule_type
         else:
-            self.policy_optim = _make_optimizer(lr_policy_eff)
+            self._policy_lr_schedule_type = "constant"
+        self._policy_lr_schedule_end = float(lr_schedule_end)
+        self._policy_lr_schedule_steps = int(lr_schedule_steps)
+        self._policy_lr_schedule_begin = int(lr_schedule_begin)
+        self.policy_optim = _make_optimizer_unscaled()
         self.alpha_optim = optax.adam(alpha_lr)
         self.entropy = 0.0
 
@@ -573,30 +673,26 @@ class DPMD(Algorithm):
             self._obs_dim = None
 
         self.soft_pi_mode = bool(soft_pi_mode)
-        frozen_q_init = tuple(jax.tree.map(lambda x: x, qp) for qp in params.q) if self.soft_pi_mode else None
+        # Cached for rebuilding states (single-seed init + vmap init).
+        self._init_log_eta_scale = init_log_eta_scale
+        self._init_tfg_eta = float(tfg_eta)
+        self._timesteps = int(timesteps)
+        self._td_value_training = bool(td_value_training)
 
-        self.state = Diffv2TrainState(
-            params=params,
-            opt_state=Diffv2OptStates(
-                q=tuple(self.optim.init(qp) for qp in params.q),
-                policy=self.policy_optim.init(params.policy),
-                log_alpha=self.alpha_optim.init(params.log_alpha),
-                value=value_opt_state_init,
-            ),
-            step=jnp.int32(0),
-            entropy=jnp.float32(0.0),
-            running_mean=jnp.float32(0.0),
-            running_std=jnp.float32(1.0),
-            log_eta_scales=jnp.full((timesteps,), init_log_eta_scale, dtype=jnp.float32),
-            tfg_eta=jnp.float32(tfg_eta),
-            value_params=value_params_init,
-            advantage_second_moment_ema=jnp.float32(1.0),
-            advantage_third_moment_ema=jnp.float32(0.0),
-            dist_shift_covariance_ema=jnp.float32(0.0),
-            dist_shift_shape_ema=jnp.float32(-1.0),
-            frozen_q=frozen_q_init,
-            train_policy=jnp.float32(1.0),
-        )
+        # Per-seed hp attrs needed by _build_initial_state; the canonical
+        # assignments below re-set the same values with no behavior change.
+        self.advantage_ema_tau = float(advantage_ema_tau)
+        self.shape_ema_tau = float(shape_ema_tau)
+        self.initial_advantage_second_moment_ema = float(initial_advantage_second_moment_ema)
+        self.initial_dist_shift_shape_ema = float(initial_dist_shift_shape_ema)
+        self.initial_dist_shift_coeff_ema = self.initial_dist_shift_shape_ema * (max(self.initial_advantage_second_moment_ema, 0.0) ** 1.5)
+        self.kl_budget = float(kl_budget) if kl_budget is not None else None
+        self.x0_hat_clip_radius = float(x0_hat_clip_radius)
+        self.mala_adapt_rate = float(mala_adapt_rate)
+        self.shape3_ema_tau = float(shape3_ema_tau)
+        self.q_critic_agg_idx = float(q_critic_agg_idx)
+
+        self.state = self._build_initial_state(params, value_params_init, value_opt_state_init)
         self.use_ema = use_ema
         self.use_reweighting = use_reweighting
         self.use_reward_critic = use_reward_critic
@@ -640,10 +736,33 @@ class DPMD(Algorithm):
         self.kl_budget = float(kl_budget) if kl_budget is not None else None
         self.dist_shift_eta = bool(dist_shift_eta)
         self.one_step_dist_shift_eta = bool(one_step_dist_shift_eta)
+        self.two_step_dist_shift_eta = bool(two_step_dist_shift_eta)
+        self.direct_eta_coeff_ema = bool(direct_eta_coeff_ema)
+        self.shape3_ema_tau = float(shape3_ema_tau)
+        self.td_value_training = bool(td_value_training)
         self.on_policy_ema = (self.kl_budget is not None)
+
+        # Entropic-risk / exponential-moment critic.
+        # "u" mode: raw output is u = η·Q_η; W = exp(u).
+        # "w" mode: raw output is W directly; Q_η = log(max(W,ε))/η.
+        # η is identified with reward_scale.
+        # Discounted entropic-risk with a stationary critic is approximate
+        # (not exact for γ < 1) in both modes.
+        self.entropic_critic_param = str(entropic_critic_param).lower()
+        if self.entropic_critic_param not in ("none", "u", "w"):
+            raise ValueError(f"entropic_critic_param must be 'none', 'u', or 'w', got '{self.entropic_critic_param}'")
+        self.use_entropic_q = (self.entropic_critic_param != "none")
+        self._entropic_u_mode = (self.entropic_critic_param == "u")
+        self._entropic_w_mode = (self.entropic_critic_param == "w")
+        if self.use_entropic_q:
+            if self.agent.distributional_critic:
+                raise ValueError("--entropic_critic_param is incompatible with --distributional_critic")
+            # Small positive ε for clipping W in target-side Bellman recursion (w-mode)
+            self._entropic_w_eps = 1e-6
 
         # Policy loss type: "eps_mse" (standard) or "ula_kl" (ULA-step KL weighting)
         self.policy_loss_type = str(policy_loss_type)
+        self.policy_loss_reduction = str(policy_loss_reduction)  # "mean" or "sum"
         _policy_loss_key_map = {
             "eps_mse": "losses/Policy_epsilon_MSE",
             "ula_kl": "losses/Policy_ULA_KL",
@@ -688,41 +807,94 @@ class DPMD(Algorithm):
         # For distributional critics, Q returns (mean, var). We aggregate means for signals.
         # TD targets use q_bootstrap_agg for distributional aggregation.
 
+        # --- Entropic-Q readout for downstream consumers (signals, guidance).
+        # u-mode: raw output is u = η·Q_η  →  Q_η = u / η
+        # w-mode: raw output is W           →  Q_η = log(max(W, ε)) / η
+        # η is the *dynamic* tfg_eta (= state.tfg_eta), set via _entropic_eta_ref
+        # at the start of each traced function.  The TD backup path uses raw
+        # network output and does NOT go through this.
+        #
+        # Mutable closure ref: set to tfg_eta_current at each JIT entry point
+        # so that _u_to_q picks up the traced value.
+        _entropic_eta_ref = [jnp.float32(self.reward_scale)]  # default; overwritten per-call
+        if self._entropic_u_mode:
+            def _u_to_q(val):
+                return val / _entropic_eta_ref[0]
+        elif self._entropic_w_mode:
+            _w_eps = jnp.float32(self._entropic_w_eps)
+            def _u_to_q(val):
+                return jnp.log(jnp.maximum(val, _w_eps)) / _entropic_eta_ref[0]
+        else:
+            def _u_to_q(val):
+                return val
+
         # --- N-ary Q aggregation helpers (used by sampling and update) ---
         def hard_min_q_n(q_means, q_vars=None):
             """Element-wise min across N Q means."""
             q = q_means[0]
             for m in q_means[1:]:
                 q = jnp.minimum(q, m)
-            return q
+            return _u_to_q(q)
 
-        def aggregate_q_fn_outer(q_means, q_vars):
-            """N-ary aggregation used by sampling functions."""
-            n = len(q_means)
-            if q_critic_agg == "precision":
-                eps = jnp.float32(1e-6)
-                precisions = [jnp.reciprocal(jax.lax.stop_gradient(v) + eps) for v in q_vars]
-                total_prec = sum(precisions)
-                return sum(p * m for p, m in zip(precisions, q_means)) / total_prec
-            elif q_critic_agg == "min":
-                return hard_min_q_n(q_means)
-            elif q_critic_agg == "mean":
-                return sum(q_means) * jnp.float32(1.0 / n)
-            elif q_critic_agg == "max":
-                q = q_means[0]
-                for m in q_means[1:]:
-                    q = jnp.maximum(q, m)
-                return q
-            elif q_critic_agg == "entropic":
-                _ent_beta = jnp.float32(self.entropic_risk_beta)
-                _use_mean_fallback = jnp.abs(_ent_beta) < 1e-6
-                mean_val = sum(q_means) * jnp.float32(1.0 / n)
-                stacked = jnp.stack([_ent_beta * m for m in q_means], axis=0)
-                ent_val = (jnp.float32(1.0) / _ent_beta) * (jax.scipy.special.logsumexp(stacked, axis=0) - jnp.log(jnp.float32(n)))
-                return jnp.where(_use_mean_fallback, mean_val, ent_val)
-            else:
-                # Default fallback (random, unknown): use min
-                return hard_min_q_n(q_means)
+        def make_aggregate_q_fn(q_critic_agg_idx_hp=None):
+            """Build the N-ary aggregation used by sampling functions.
+
+            Returns Q-like values (u/η when entropic_q is on).
+
+            When q_critic_agg == "vmap_mean_min", the returned function closes
+            over ``q_critic_agg_idx_hp`` (a JAX scalar) and blends mean/min
+            per slot: (1-idx)*mean + idx*min. All other Python-level branches
+            are unchanged. Callers that have the per-slot value in scope
+            (either via state.q_critic_agg_idx or the params tuple) pass it
+            here so the sampling path matches the training path exactly.
+            """
+            def aggregate_q_fn(q_means, q_vars):
+                n = len(q_means)
+                if q_critic_agg == "vmap_mean_min":
+                    mean_val = sum(q_means) * jnp.float32(1.0 / n)
+                    min_q = q_means[0]
+                    for m in q_means[1:]:
+                        min_q = jnp.minimum(min_q, m)
+                    if q_critic_agg_idx_hp is None:
+                        # No per-slot idx in scope: fall back to 'min' so the
+                        # mode is still a defined function. In practice every
+                        # call site that uses vmap_mean_min threads the idx.
+                        return _u_to_q(min_q)
+                    idx = jnp.clip(jnp.float32(q_critic_agg_idx_hp), 0.0, 1.0)
+                    return _u_to_q((1.0 - idx) * mean_val + idx * min_q)
+                if q_critic_agg == "precision":
+                    eps = jnp.float32(1e-6)
+                    precisions = [jnp.reciprocal(jax.lax.stop_gradient(v) + eps) for v in q_vars]
+                    total_prec = sum(precisions)
+                    return _u_to_q(sum(p * m for p, m in zip(precisions, q_means)) / total_prec)
+                elif q_critic_agg == "min":
+                    return hard_min_q_n(q_means)  # already applies _u_to_q
+                elif q_critic_agg == "mean":
+                    return _u_to_q(sum(q_means) * jnp.float32(1.0 / n))
+                elif q_critic_agg == "max":
+                    q = q_means[0]
+                    for m in q_means[1:]:
+                        q = jnp.maximum(q, m)
+                    return _u_to_q(q)
+                elif q_critic_agg == "entropic":
+                    _ent_beta = jnp.float32(self.entropic_risk_beta)
+                    _use_mean_fallback = jnp.abs(_ent_beta) < 1e-6
+                    mean_val = sum(q_means) * jnp.float32(1.0 / n)
+                    stacked = jnp.stack([_ent_beta * m for m in q_means], axis=0)
+                    ent_val = (jnp.float32(1.0) / _ent_beta) * (jax.scipy.special.logsumexp(stacked, axis=0) - jnp.log(jnp.float32(n)))
+                    return _u_to_q(jnp.where(_use_mean_fallback, mean_val, ent_val))
+                else:
+                    # Default fallback (random, unknown): use min
+                    return hard_min_q_n(q_means)  # already applies _u_to_q
+            return aggregate_q_fn
+
+        # Default aggregator without a bound idx. Used only by call sites
+        # that do not need per-slot behavior (e.g. the outer stateless_get_action
+        # entry point, which then passes params into sample_action_with_agg
+        # where the per-slot rebind happens). Any site that needs the per-slot
+        # variant under vmap_mean_min must build a fresh aggregator with
+        # make_aggregate_q_fn(idx_hp).
+        aggregate_q_fn_outer = make_aggregate_q_fn(None)
 
         if np.isinf(particle_selection_lambda):
             def select_action_from_particles(acts: jax.Array, qs: jax.Array, key: jax.Array):
@@ -773,7 +945,20 @@ class DPMD(Algorithm):
             aggregate_q_fn,
             randomize_q: bool = False,
         ) -> jax.Array:
-            policy_params, log_alpha, q_params_tuple, log_eta_scales_in, tfg_eta_current, value_params, adv_second_moment_ema = params
+            policy_params, log_alpha, q_params_tuple, log_eta_scales_in, tfg_eta_current, value_params, adv_second_moment_ema, target_value_params, reward_scale_hp, x0_hat_clip_radius_hp, mala_adapt_rate_hp, guidance_mult_hp, gamma_hp, q_critic_agg_idx_hp = params
+            _entropic_eta_ref[0] = tfg_eta_current
+            # Rebind aggregate_q_fn so the sampling path respects the per-slot
+            # q_critic_agg_idx when the algo is in vmap_mean_min mode -- but
+            # ONLY for the policy-side tilting aggregator. Callers that pin
+            # aggregation to hard_min_q_n (e.g. stateless_update's TD-target
+            # action sampling at line 2043, and sample_action_with_agg_metrics
+            # which forwards the caller's hard_min_q_n) are intentionally
+            # asking for min because the TD target always uses min regardless
+            # of q_critic_agg. Detect that by identity: only rebind if the
+            # caller handed us the no-idx-bound aggregate_q_fn_outer (the
+            # neutral tilting aggregator).
+            if q_critic_agg == "vmap_mean_min" and aggregate_q_fn is aggregate_q_fn_outer:
+                aggregate_q_fn = make_aggregate_q_fn(q_critic_agg_idx_hp)
             if self.agent.energy_mode and self.agent.mala_steps > 0:
                 return stateless_get_action_mala(key, params, obs, aggregate_q_fn, randomize_q=randomize_q)
             elif self.tfg_recur_steps > 0:
@@ -802,6 +987,7 @@ class DPMD(Algorithm):
             target_q_params = state.params.target_q  # tuple of N target Q params
             policy_params = state.params.policy
             target_policy_params = state.params.target_policy
+            td_policy_params = target_policy_params if self.td_use_target_policy else policy_params
             log_alpha = state.params.log_alpha
             q_opt_states = state.opt_state.q   # tuple of N opt states
             policy_opt_state = state.opt_state.policy
@@ -812,6 +998,7 @@ class DPMD(Algorithm):
             running_std = state.running_std
             log_eta_scales = state.log_eta_scales
             tfg_eta_current = state.tfg_eta
+            _entropic_eta_ref[0] = tfg_eta_current
             dsac_omega_ema = state.dsac_omega_ema
             dsac_b_ema = state.dsac_b_ema
             num_q = len(q_params)
@@ -855,50 +1042,67 @@ class DPMD(Algorithm):
 
                 def aggregate_q_n(q_means, q_vars):
                     stacked = jnp.stack(q_means, axis=0)
-                    return stacked[critic_idx]
+                    return _u_to_q(stacked[critic_idx])
 
             else:
 
                 def aggregate_q_n(q_means, q_vars):
+                    if q_critic_agg == "vmap_mean_min":
+                        # Per-slot selector: compute both reductions, blend
+                        # with state.q_critic_agg_idx (0 = mean, 1 = min).
+                        # Under vmap the selector is a [N]-shaped array, so
+                        # the blend is per-slot. Broadcast rhs-scalar over
+                        # the (batch, ...) shape of the Q reductions.
+                        mean_val = sum(q_means) * jnp.float32(1.0 / num_q)
+                        min_val = reduce_min_q(q_means)
+                        idx = jnp.clip(jnp.float32(state.q_critic_agg_idx), 0.0, 1.0)
+                        return _u_to_q((1.0 - idx) * mean_val + idx * min_val)
                     if q_critic_agg == "min":
-                        return reduce_min_q(q_means)
+                        return _u_to_q(reduce_min_q(q_means))
                     elif q_critic_agg == "mean":
-                        return sum(q_means) * jnp.float32(1.0 / num_q)
+                        return _u_to_q(sum(q_means) * jnp.float32(1.0 / num_q))
                     elif q_critic_agg == "max":
                         q = q_means[0]
                         for m in q_means[1:]:
                             q = jnp.maximum(q, m)
-                        return q
+                        return _u_to_q(q)
                     elif q_critic_agg == "entropic":
                         _ent_beta = jnp.float32(self.entropic_risk_beta)
                         _use_mean_fallback = jnp.abs(_ent_beta) < 1e-6
                         mean_val = sum(q_means) * jnp.float32(1.0 / num_q)
                         stacked = jnp.stack([_ent_beta * m for m in q_means], axis=0)
                         ent_val = (jnp.float32(1.0) / _ent_beta) * (jax.scipy.special.logsumexp(stacked, axis=0) - jnp.log(jnp.float32(num_q)))
-                        return jnp.where(_use_mean_fallback, mean_val, ent_val)
+                        return _u_to_q(jnp.where(_use_mean_fallback, mean_val, ent_val))
                     elif q_critic_agg == "precision":
                         # Precision-weighted mean
                         eps = jnp.float32(1e-6)
                         precisions = [jnp.float32(1.0) / jnp.maximum(v, eps) for v in q_vars]
                         total_prec = sum(precisions)
-                        return sum(p * m for p, m in zip(precisions, q_means)) / total_prec
+                        return _u_to_q(sum(p * m for p, m in zip(precisions, q_means)) / total_prec)
                     else:
-                        return reduce_min_q(q_means)
+                        return _u_to_q(reduce_min_q(q_means))
 
-            reward *= self.reward_scale
+            reward *= state.reward_scale
 
             def get_min_q(s, a):
-                """Get aggregated Q value (mean only) for signals like reweighting."""
+                """Get aggregated Q value (mean only) for signals like reweighting.
+
+                Returns Q_η = u/η when entropic_q is on (via aggregate_q_n
+                which calls _u_to_q internally).
+                """
                 q_means, q_vars = eval_all_q(q_params, s, a)
                 q_mean = aggregate_q_n(q_means, q_vars)
                 if self.use_reward_critic:
-                    q_mean = q_mean * (jnp.float32(1.0) / jnp.float32(1.0 - self.gamma))
+                    q_mean = q_mean * (jnp.float32(1.0) / jnp.float32(1.0 - state.gamma))
                 return q_mean
 
             def get_min_target_q(s, a):
-                """Get min target Q mean for action selection."""
+                """Get min target Q mean for action selection.
+
+                Returns Q_η = u/η when entropic_q is on.
+                """
                 q_means, _q_vars = eval_all_q(target_q_params, s, a)
-                return reduce_min_q(q_means)
+                return _u_to_q(reduce_min_q(q_means))
 
             def get_target_q_dist(s, a):
                 """Get all N Q distributions from target networks."""
@@ -920,6 +1124,7 @@ class DPMD(Algorithm):
             q_backup_max = jnp.float32(jnp.nan)
             q_target_mean = jnp.float32(jnp.nan)
             q_target_std = jnp.float32(jnp.nan)
+            q_target_var_mean = jnp.float32(jnp.nan)
             reward_mean = jnp.float32(jnp.nan)
             done_frac = jnp.float32(jnp.nan)
 
@@ -934,6 +1139,14 @@ class DPMD(Algorithm):
             std_action = jnp.float32(jnp.nan)
             clip_frac = jnp.float32(jnp.nan)
 
+            _use_entropic_q = self.use_entropic_q  # True for either u or w mode
+            _entropic_u = self._entropic_u_mode
+            _entropic_w = self._entropic_w_mode
+
+            q_backup_for_v = None
+            q_target_for_v = None
+            next_obs_for_v = None
+
             if not self.use_reward_critic:
                 if self.off_policy_td:
                     # SARSA-style off-policy: use the action actually taken at next_obs
@@ -947,7 +1160,7 @@ class DPMD(Algorithm):
                     q_target_var_per_q = tq_vars  # list of N vars
                 else:
                     # On-policy: sample fresh actions from current policy
-                    td_params = (policy_params, log_alpha, guidance_q, log_eta_scales, tfg_eta_current, state.value_params, state.advantage_second_moment_ema)
+                    td_params = (td_policy_params, log_alpha, guidance_q, log_eta_scales, tfg_eta_current, state.value_params, state.advantage_second_moment_ema, state.target_value_params, state.reward_scale, state.x0_hat_clip_radius, state.mala_adapt_rate, state.guidance_mult, state.gamma, state.q_critic_agg_idx)
                     use_multi_td = jnp.bool_(self.td_actions > 1)
 
                     if (not self.mala_per_level_eta) and self.agent.energy_mode and self.agent.mala_steps > 0:
@@ -956,7 +1169,7 @@ class DPMD(Algorithm):
                     def sample_next_action_and_stats(k: jax.Array, log_eta_scales_in: jax.Array):
                         act, log_eta_scales_out, mala_acc_rate_out, mala_eta_scale_out, pl_acc_out, pl_clip_out = sample_action_with_agg_metrics(
                             k,
-                            (policy_params, log_alpha, guidance_q, log_eta_scales_in, tfg_eta_current, state.value_params, state.advantage_second_moment_ema),
+                            (td_policy_params, log_alpha, guidance_q, log_eta_scales_in, tfg_eta_current, state.value_params, state.advantage_second_moment_ema, state.target_value_params, state.reward_scale, state.x0_hat_clip_radius, state.mala_adapt_rate, state.guidance_mult, state.gamma, state.q_critic_agg_idx),
                             next_obs,
                             hard_min_q_n,
                         )
@@ -970,7 +1183,7 @@ class DPMD(Algorithm):
                         next_obs_rep = jnp.tile(next_obs, (int(self.td_actions), 1))
                         act_sel_flat, acts_particles, probs_particles, log_eta_scales_out, mala_acc_rate_out, mala_eta_scale_out, pl_acc_out, pl_clip_out = sample_action_with_particle_details_metrics(
                             next_eval_key,
-                            (policy_params, log_alpha, guidance_q, log_eta_scales, tfg_eta_current, state.value_params, state.advantage_second_moment_ema),
+                            (td_policy_params, log_alpha, guidance_q, log_eta_scales, tfg_eta_current, state.value_params, state.advantage_second_moment_ema, state.target_value_params, state.reward_scale, state.x0_hat_clip_radius, state.mala_adapt_rate, state.guidance_mult, state.gamma, state.q_critic_agg_idx),
                             next_obs_rep,
                             hard_min_q_n,
                         )
@@ -984,25 +1197,52 @@ class DPMD(Algorithm):
                             per_q_vars_list.append(qv)
 
                         # Per-Q mixture aggregation across particles
+                        # u-mode: logsumexp (entropic aggregation in log-W space)
+                        # w-mode / standard: weighted arithmetic mean
                         q_target_per_q_list = []
                         q_target_var_per_q_list = []
-                        for qm, qv in zip(per_q_means_list, per_q_vars_list):
-                            mix_m, mix_v = mixture_mean_var(qm, qv, probs_particles)
-                            q_target_per_q_list.append(mix_m.reshape((int(self.td_actions), batch)).mean(axis=0))
-                            q_target_var_per_q_list.append(mix_v.reshape((int(self.td_actions), batch)).mean(axis=0))
+                        if _entropic_u:
+                            for qm in per_q_means_list:
+                                agg = _entropic_particle_agg(qm, probs_particles)
+                                q_target_per_q_list.append(agg.reshape((int(self.td_actions), batch)).mean(axis=0))
+                                q_target_var_per_q_list.append(jnp.zeros_like(q_target_per_q_list[-1]))
+                        else:
+                            for qm, qv in zip(per_q_means_list, per_q_vars_list):
+                                mix_m, mix_v = mixture_mean_var(qm, qv, probs_particles)
+                                q_target_per_q_list.append(mix_m.reshape((int(self.td_actions), batch)).mean(axis=0))
+                                q_target_var_per_q_list.append(mix_v.reshape((int(self.td_actions), batch)).mean(axis=0))
 
                         # Min-Q across critics for overall target
                         min_q_particles = per_q_means_list[0]
                         for mqm in per_q_means_list[1:]:
                             min_q_particles = jnp.minimum(min_q_particles, mqm)
-                        q_exp = jnp.sum(probs_particles * min_q_particles, axis=0)
-                        q_t = q_exp.reshape((int(self.td_actions), batch)).mean(axis=0)
+                        if _entropic_u:
+                            q_t = _entropic_particle_agg(min_q_particles, probs_particles)
+                            q_t = q_t.reshape((int(self.td_actions), batch)).mean(axis=0)
+                        else:
+                            q_exp = jnp.sum(probs_particles * min_q_particles, axis=0)
+                            q_t = q_exp.reshape((int(self.td_actions), batch)).mean(axis=0)
                         return acts_sel[0], log_eta_scales_out, mala_acc_rate_out, mala_eta_scale_out, pl_acc_out, pl_clip_out, q_t, q_target_per_q_list, q_target_var_per_q_list
+
+                    _entropic_gamma = jnp.float32(state.gamma)
+                    _entropic_inv_gamma = jnp.where(_entropic_gamma > 0, jnp.float32(1.0) / _entropic_gamma, jnp.float32(0.0))
+
+                    def _entropic_particle_agg(u_particles, weights):
+                        """Weighted logsumexp: logsumexp_k(γ·u_k + log w_k) / γ.
+
+                        Used only in u-mode.  Replaces the arithmetic weighted
+                        mean Σ w_k·u_k.  For a single particle with weight 1
+                        this reduces to u, matching the K=1 case.
+                        """
+                        log_w = jnp.log(weights + 1e-30)
+                        return jax.scipy.special.logsumexp(
+                            _entropic_gamma * u_particles + log_w, axis=0
+                        ) * _entropic_inv_gamma
 
                     def pick_td(_):
                         a, acts_particles, probs_particles, log_eta_scales_out, mala_acc_rate_out, mala_eta_scale_out, pl_acc_out, pl_clip_out = sample_action_with_particle_details_metrics(
                             next_eval_key,
-                            (policy_params, log_alpha, guidance_q, log_eta_scales, tfg_eta_current, state.value_params, state.advantage_second_moment_ema),
+                            (td_policy_params, log_alpha, guidance_q, log_eta_scales, tfg_eta_current, state.value_params, state.advantage_second_moment_ema, state.target_value_params, state.reward_scale, state.x0_hat_clip_radius, state.mala_adapt_rate, state.guidance_mult, state.gamma, state.q_critic_agg_idx),
                             next_obs,
                             hard_min_q_n,
                         )
@@ -1016,15 +1256,24 @@ class DPMD(Algorithm):
 
                         q_target_per_q_list = []
                         q_target_var_per_q_list = []
-                        for qm, qv in zip(per_q_means_list, per_q_vars_list):
-                            mix_m, mix_v = mixture_mean_var(qm, qv, probs_particles)
-                            q_target_per_q_list.append(mix_m)
-                            q_target_var_per_q_list.append(mix_v)
+                        if _entropic_u:
+                            # u-mode: logsumexp aggregation across particles
+                            for qm in per_q_means_list:
+                                q_target_per_q_list.append(_entropic_particle_agg(qm, probs_particles))
+                                q_target_var_per_q_list.append(jnp.zeros_like(q_target_per_q_list[-1]))
+                        else:
+                            for qm, qv in zip(per_q_means_list, per_q_vars_list):
+                                mix_m, mix_v = mixture_mean_var(qm, qv, probs_particles)
+                                q_target_per_q_list.append(mix_m)
+                                q_target_var_per_q_list.append(mix_v)
 
                         min_q_particles = per_q_means_list[0]
                         for mqm in per_q_means_list[1:]:
                             min_q_particles = jnp.minimum(min_q_particles, mqm)
-                        q_t = jnp.sum(probs_particles * min_q_particles, axis=0)
+                        if _entropic_u:
+                            q_t = _entropic_particle_agg(min_q_particles, probs_particles)
+                        else:
+                            q_t = jnp.sum(probs_particles * min_q_particles, axis=0)
                         return a, log_eta_scales_out, mala_acc_rate_out, mala_eta_scale_out, pl_acc_out, pl_clip_out, q_t, q_target_per_q_list, q_target_var_per_q_list
 
                     def pick_multi(_):
@@ -1040,19 +1289,19 @@ class DPMD(Algorithm):
 
                 # Compute TD backups based on q_bootstrap_agg mode
                 # q_target_per_q: list of N target means; q_target_var_per_q: list of N target vars
-                gamma_sq = jnp.float32(self.gamma ** 2)
+                gamma_sq = jnp.float32(state.gamma) ** 2
                 not_done = (1 - done)
-                
+
                 if self.q_bootstrap_agg == "independent":
                     # Each Q bootstraps from its own target network
-                    q_backup_per_q = [reward + not_done * self.gamma * tqm for tqm in q_target_per_q]
+                    q_backup_per_q = [reward + not_done * state.gamma * tqm for tqm in q_target_per_q]
                     q_backup_var_per_q = [not_done * gamma_sq * tqv for tqv in q_target_var_per_q]
                 elif self.q_bootstrap_agg == "mean":
                     # All Qs bootstrap from the mean of all target networks
                     inv_n = jnp.float32(1.0 / num_q)
                     q_target_avg = sum(q_target_per_q) * inv_n
                     q_target_avg_var = sum(q_target_var_per_q) * (inv_n ** 2)
-                    shared_backup = reward + not_done * self.gamma * q_target_avg
+                    shared_backup = reward + not_done * state.gamma * q_target_avg
                     shared_backup_var = not_done * gamma_sq * q_target_avg_var
                     q_backup_per_q = [shared_backup] * num_q
                     q_backup_var_per_q = [shared_backup_var] * num_q
@@ -1074,11 +1323,46 @@ class DPMD(Algorithm):
                         for i in range(1, num_q):
                             is_min = q_target_per_q[i] <= q_agg_mean + 1e-8
                             q_agg_var = jnp.where(is_min, q_target_var_per_q[i], q_agg_var)
-                    shared_backup = reward + not_done * self.gamma * q_agg_mean
+                    shared_backup = reward + not_done * state.gamma * q_agg_mean
                     shared_backup_var = not_done * gamma_sq * q_agg_var
                     q_backup_per_q = [shared_backup] * num_q
                     q_backup_var_per_q = [shared_backup_var] * num_q
+                if _entropic_w:
+                    # w-mode Bellman target: y = exp(η·r) · clip(W_next, ε)^γ
+                    # when done, y = exp(η·r) (continuation term vanishes).
+                    # reward was scaled by reward_scale; entropic η is tfg_eta.
+                    # So η·r = (tfg_eta / reward_scale) · reward.
+                    _w_eps_jnp = jnp.float32(self._entropic_w_eps)
+                    _gamma_jnp = jnp.float32(state.gamma)
+                    _eta_over_rs = tfg_eta_current / state.reward_scale
+                    exp_reward = jnp.exp(reward * _eta_over_rs)
+                    def _w_backup(w_next):
+                        w_next_clipped = jnp.maximum(w_next, _w_eps_jnp)
+                        return exp_reward * jnp.where(done > 0.5, jnp.float32(1.0),
+                                                      jnp.power(w_next_clipped, _gamma_jnp))
+                    if self.q_bootstrap_agg == "independent":
+                        q_backup_per_q = [_w_backup(tqm) for tqm in q_target_per_q]
+                    elif self.q_bootstrap_agg == "mean":
+                        inv_n = jnp.float32(1.0 / num_q)
+                        w_avg = sum(q_target_per_q) * inv_n
+                        shared_w_backup = _w_backup(w_avg)
+                        q_backup_per_q = [shared_w_backup] * num_q
+                    else:
+                        w_min = reduce_min_q(q_target_per_q)
+                        shared_w_backup = _w_backup(w_min)
+                        q_backup_per_q = [shared_w_backup] * num_q
+                    q_backup_var_per_q = [jnp.zeros_like(q_backup_per_q[0])] * num_q
+                elif _entropic_u:
+                    # u-mode: backup is η·r + γ·u_target.  reward = reward_scale·r.
+                    # Correct reward contribution: (η / reward_scale) · reward.
+                    _eta_over_rs = tfg_eta_current / state.reward_scale
+                    _reward_correction = reward * (_eta_over_rs - jnp.float32(1.0))
+                    q_backup_per_q = [qb + _reward_correction for qb in q_backup_per_q]
+
                 q_backup = q_backup_per_q[0]  # For logging (uses Q0's backup as representative)
+                q_backup_for_v = q_backup
+                q_target_for_v = q_target
+                next_obs_for_v = next_obs
 
                 q_backup_mean = jnp.mean(q_backup)
                 q_backup_std = jnp.std(q_backup)
@@ -1086,26 +1370,44 @@ class DPMD(Algorithm):
                 q_backup_max = jnp.max(q_backup)
                 q_target_mean = jnp.mean(q_target)
                 q_target_std = jnp.std(q_target)
+                if self.agent.distributional_critic:
+                    q_target_var_mean = jnp.mean(jnp.stack(q_target_var_per_q))
                 reward_mean = jnp.mean(reward)
                 done_frac = jnp.mean(done)
 
-                # Huber loss helper (shared by Q1 and Q2)
-                delta = jnp.float32(self.q_td_huber_width) * jnp.float32(self.reward_scale)
+                # Huber loss helper (shared by Q1 and Q2). delta is per-seed under
+                # vmap; clamp to finite for the huber branch so inf·0 doesn't
+                # produce NaN gradients when jax.vmap rewrites lax.cond → where.
+                delta = state.q_td_huber_width * state.reward_scale
                 use_huber = jnp.isfinite(delta)
+                delta_safe = jnp.where(use_huber, delta, jnp.float32(1.0))
 
                 def huber_loss(e):
                     abs_e = jnp.abs(e)
-                    quad = jnp.minimum(abs_e, delta)
+                    quad = jnp.minimum(abs_e, delta_safe)
                     lin = abs_e - quad
-                    return jnp.float32(0.5) * quad * quad + delta * lin
+                    return jnp.float32(0.5) * quad * quad + delta_safe * lin
 
                 def compute_td_loss(td_err):
-                    per_elem = jax.lax.cond(
-                        use_huber,
-                        lambda ee: huber_loss(ee),
-                        lambda ee: ee * ee,
-                        td_err,
-                    )
+                    per_elem = jnp.where(use_huber, huber_loss(td_err), td_err * td_err)
+                    return jnp.mean(per_elem)
+
+                def compute_entropic_loss(u_pred, t_target):
+                    """Pseudo-loss whose gradient in u matches MSE in W=exp(u) space.
+
+                    L(u, t) = exp(t - u) - (t - u) - 1
+
+                    dL/du = 1 - exp(t - u) = 1 - y_W / W_θ
+
+                    The induced update in W-space is, to first order, the same as
+                    ordinary MSE regression on W.
+                    """
+                    diff = t_target - u_pred  # t - u
+                    # Clamp diff to avoid exp overflow.  At diff=30, exp≈1e13 which
+                    # is already far into float32 territory; beyond that the loss is
+                    # dominated by the linear term anyway.
+                    diff_clamped = jnp.clip(diff, -30.0, 30.0)
+                    per_elem = jnp.exp(diff_clamped) - diff - jnp.float32(1.0)
                     return jnp.mean(per_elem)
                 
                 # DSAC-T refinements: compute omega scale factor for loss scaling
@@ -1152,7 +1454,7 @@ class DPMD(Algorithm):
                     d_psi_bootstrap = [self.agent.d_psi(tqp, next_obs, next_action)
                                        for tqp in target_q_params]
                     d_psi_bootstrap_mean = sum(d_psi_bootstrap) * jnp.float32(1.0 / num_q)
-                    d_psi_td_target = adv_sq + jnp.float32(self.gamma) * not_done * d_psi_bootstrap_mean
+                    d_psi_td_target = adv_sq + jnp.float32(state.gamma) * not_done * d_psi_bootstrap_mean
                 else:
                     d_psi_td_target = None
 
@@ -1191,7 +1493,17 @@ class DPMD(Algorithm):
                             q_mean, q_var, d_psi_pred = self.agent.q_and_d_psi(p, obs_qi, act_qi)
                         else:
                             q_mean, q_var = self.agent.q(p, obs_qi, act_qi)
-                        if self.agent.distributional_critic:
+                        if _entropic_u:
+                            # u-mode pseudo-loss: network output u ≈ η·Q_η.
+                            # backup_qi is the log-target t = η·r + (1-d)·γ·u_target.
+                            loss = compute_entropic_loss(q_mean, backup_qi)
+                        elif _entropic_w:
+                            # w-mode MSE: network output is W directly.
+                            # backup_qi is y = exp(η·r) · clip(W_next, ε)^γ.
+                            # Raw prediction is unconstrained; only target-side
+                            # continuation output is clipped (in _w_backup above).
+                            loss = jnp.mean((q_mean - backup_qi) ** 2)
+                        elif self.agent.distributional_critic:
                             loss = compute_distributional_td_loss(q_mean, q_var, backup_qi, backup_var_qi)
                         else:
                             td_err = q_mean - backup_qi
@@ -1203,13 +1515,15 @@ class DPMD(Algorithm):
                     (qi_loss, qi_pred), qi_grads = jax.value_and_grad(q_loss_fn, has_aux=True)(qp)
                     if self.langevin_q_noise:
                         batch_size_eff = obs_qi.shape[0]
-                        langevin_scale = jnp.sqrt(2.0 * self.lr_q / batch_size_eff)
+                        langevin_scale = jnp.sqrt(2.0 * state.lr_q / batch_size_eff)
                         flat_grads, treedef = jax.tree_util.tree_flatten(qi_grads)
                         noise_keys = jax.random.split(lang_key, len(flat_grads))
                         noisy_flat = [g + langevin_scale * jax.random.normal(k, g.shape)
                                       for g, k in zip(flat_grads, noise_keys)]
                         qi_grads = jax.tree_util.tree_unflatten(treedef, noisy_flat)
                     update, new_opt = self.optim.update(qi_grads, opt_s, params=qp)
+                    if self._q_lr_runtime:
+                        update = jax.tree.map(lambda u: -state.lr_q * u, update)
                     new_qp = optax.apply_updates(qp, update)
                     return new_qp, new_opt, qi_loss, qi_pred
 
@@ -1256,7 +1570,7 @@ class DPMD(Algorithm):
                 if self.pure_bc_training:
                     next_action = action
                 else:
-                    td_params = (policy_params, log_alpha, guidance_q, log_eta_scales, tfg_eta_current, state.value_params, state.advantage_second_moment_ema)
+                    td_params = (td_policy_params, log_alpha, guidance_q, log_eta_scales, tfg_eta_current, state.value_params, state.advantage_second_moment_ema, state.target_value_params, state.reward_scale, state.x0_hat_clip_radius, state.mala_adapt_rate, state.guidance_mult, state.gamma, state.q_critic_agg_idx)
 
                     if (not self.mala_per_level_eta) and self.agent.energy_mode and self.agent.mala_steps > 0:
                         mala_eta_scale_in = jnp.exp(log_eta_scales[0])
@@ -1294,6 +1608,8 @@ class DPMD(Algorithm):
                     else:
                         (ri_loss, _qi_pred), qi_grads = jax.value_and_grad(reward_loss_fn, has_aux=True)(new_q_params_list[qi])
                         qi_update, qi_new_opt = self.optim.update(qi_grads, new_q_opt_states_list[qi], params=new_q_params_list[qi])
+                        if self._q_lr_runtime:
+                            qi_update = jax.tree.map(lambda u: -state.lr_q * u, qi_update)
                         new_q_params_list[qi] = optax.apply_updates(new_q_params_list[qi], qi_update)
                         new_q_opt_states_list[qi] = qi_new_opt
                         r_losses.append(ri_loss)
@@ -1365,11 +1681,14 @@ class DPMD(Algorithm):
                     x_noisy = jax.vmap(self.agent.diffusion.q_sample)(t, target_action_sg, noise)
                     noise_pred = denoiser(t, x_noisy)
 
+                    _sum_reduction = (self.policy_loss_reduction == "sum")
                     if self.policy_loss_type == "ula_kl":
                         # --- IS-corrected ULA-KL: mean_w * ||eps_theta - eps||^2 ---
-                        per_sample_loss = mean_is_w * jnp.sum(
-                            (noise_pred - noise) ** 2, axis=-1
-                        )
+                        sq_err = (noise_pred - noise) ** 2
+                        if _sum_reduction:
+                            per_sample_loss = mean_is_w * jnp.sum(sq_err, axis=-1)
+                        else:
+                            per_sample_loss = mean_is_w * jnp.mean(sq_err, axis=-1)
                         loss = (loss_weights.reshape(-1) * per_sample_loss).mean()
 
                     elif self.policy_loss_type == "guided_ula_kl":
@@ -1403,7 +1722,8 @@ class DPMD(Algorithm):
                         M_t = jnp.eye(act_dim)[None] + c_t[:, None, None] * H_Q
 
                         M_delta_s = jnp.einsum('bij,bj->bi', M_t, delta_s)
-                        per_sample_loss = (mean_is_w / 4.0) * jnp.sum(M_delta_s ** 2, axis=-1)
+                        _reduce_dims = jnp.sum if _sum_reduction else jnp.mean
+                        per_sample_loss = (mean_is_w / 4.0) * _reduce_dims(M_delta_s ** 2, axis=-1)
                         loss = (loss_weights.reshape(-1) * per_sample_loss).mean()
 
                     else:  # e2e_guided_ula_kl
@@ -1419,8 +1739,8 @@ class DPMD(Algorithm):
                         x0_hat_theta = (x_noisy - sqrt_1m_abar * noise_pred) / sqrt_abar
                         x0_hat_clipped = jnp.clip(
                             x0_hat_theta,
-                            -self.x0_hat_clip_radius,
-                            self.x0_hat_clip_radius,
+                            -state.x0_hat_clip_radius,
+                            state.x0_hat_clip_radius,
                         )
 
                         # Scalar Q for a single (action, obs) pair
@@ -1450,7 +1770,8 @@ class DPMD(Algorithm):
                         )
 
                         delta_g = g_theta - g_target
-                        per_sample_loss = (mean_is_w / 4.0) * jnp.sum(delta_g ** 2, axis=-1)
+                        _reduce_dims = jnp.sum if _sum_reduction else jnp.mean
+                        per_sample_loss = (mean_is_w / 4.0) * _reduce_dims(delta_g ** 2, axis=-1)
                         loss = (loss_weights.reshape(-1) * per_sample_loss).mean()
 
                 else:
@@ -1467,6 +1788,7 @@ class DPMD(Algorithm):
                         denoiser,
                         t,
                         jax.lax.stop_gradient(target_action),
+                        reduction=self.policy_loss_reduction,
                     )
 
                 return loss, (base_q_weights, scaled_q, q_mean, q_std)
@@ -1480,25 +1802,27 @@ class DPMD(Algorithm):
                 return log_alpha_loss
 
             # update networks
-            def param_update(optim, params, grads, opt_state):
+            def param_update(optim, params, grads, opt_state, lr_value=None):
                 update, new_opt_state = optim.update(grads, opt_state, params=params)
+                if lr_value is not None:
+                    update = jax.tree.map(lambda u: -lr_value * u, update)
                 new_params = optax.apply_updates(params, update)
                 return new_params, new_opt_state
 
-            def delay_param_update(optim, params, grads, opt_state):
+            def delay_param_update(optim, params, grads, opt_state, lr_value=None):
                 return jax.lax.cond(
                     step % self.delay_update == 0,
-                    lambda params, opt_state: param_update(optim, params, grads, opt_state),
-                    lambda params, opt_state: (params, opt_state),
-                    params, opt_state
+                    lambda po: param_update(optim, po[0], grads, po[1], lr_value),
+                    lambda po: po,
+                    (params, opt_state)
                 )
 
             def delay_alpha_param_update(optim, params, opt_state):
                 return jax.lax.cond(
                     step % self.delay_alpha_update == 0,
-                    lambda params, opt_state: param_update(optim, params, jax.grad(log_alpha_loss_fn)(params), opt_state),
-                    lambda params, opt_state: (params, opt_state),
-                    params, opt_state
+                    lambda po: param_update(optim, po[0], jax.grad(log_alpha_loss_fn)(po[0]), po[1]),
+                    lambda po: po,
+                    (params, opt_state)
                 )
 
             def delay_target_update(params, target_params, tau):
@@ -1509,7 +1833,8 @@ class DPMD(Algorithm):
                     target_params
                 )
 
-            policy_params, policy_opt_state = delay_param_update(self.policy_optim, policy_params, policy_grads, policy_opt_state)
+            policy_lr = self._policy_lr_at_step(state.lr_policy, self._optimizer_count(policy_opt_state))
+            policy_params, policy_opt_state = delay_param_update(self.policy_optim, policy_params, policy_grads, policy_opt_state, lr_value=policy_lr)
             if not self.no_entropy_tuning:
                 log_alpha, log_alpha_opt_state = delay_alpha_param_update(self.alpha_optim, log_alpha, log_alpha_opt_state)
 
@@ -1518,9 +1843,9 @@ class DPMD(Algorithm):
                 if self.single_q_network and qi > 0:
                     new_target_q_list.append(new_target_q_list[0])
                 else:
-                    new_target_q_list.append(delay_target_update(q_params[qi], target_q_params[qi], self.tau))
+                    new_target_q_list.append(delay_target_update(q_params[qi], target_q_params[qi], state.polyak_tau))
             target_q_params = tuple(new_target_q_list)
-            target_policy_params = delay_target_update(policy_params, target_policy_params, self.tau)
+            target_policy_params = delay_target_update(policy_params, target_policy_params, state.polyak_tau)
 
             new_running_mean = running_mean + 0.001 * (q_mean - running_mean)
             new_running_std = running_std + 0.001 * (q_std - running_std)
@@ -1543,7 +1868,30 @@ class DPMD(Algorithm):
             adv_second_moment_log = jnp.float32(0.0)
             
             if self.critic_normalization != "none" and state.value_params is not None:
-                if self.on_policy_ema and self.critic_normalization == "ema" and not self.use_reward_critic:
+                if self.td_value_training and self.critic_normalization == "ema" and q_target_for_v is not None:
+                    v_target = jax.lax.stop_gradient(q_target_for_v)
+                    delta_v = state.q_td_huber_width * state.reward_scale
+                    use_huber_v = jnp.isfinite(delta_v)
+                    delta_v_safe = jnp.where(use_huber_v, delta_v, jnp.float32(1.0))
+
+                    def value_loss_fn(v_params):
+                        v_pred = self._value_net.apply(v_params, next_obs_for_v)
+                        err = v_pred - v_target
+                        abs_err = jnp.abs(err)
+                        quad = jnp.minimum(abs_err, delta_v_safe)
+                        huber = jnp.float32(0.5) * quad * quad + delta_v_safe * (abs_err - quad)
+                        per_elem = jnp.where(use_huber_v, huber, err * err)
+                        return jnp.mean(per_elem)
+
+                    v_loss, v_grads = jax.value_and_grad(value_loss_fn)(state.value_params)
+                    v_updates, value_opt_state_updated = self.optim.update(v_grads, state.opt_state.value, state.value_params)
+                    if self._q_lr_runtime:
+                        v_updates = jax.tree.map(lambda u: -state.lr_q * u, v_updates)
+                    value_params_updated = optax.apply_updates(state.value_params, v_updates)
+                    value_loss_log = v_loss
+                    adv_second_moment_log = state.advantage_second_moment_ema
+
+                elif self.on_policy_ema and self.critic_normalization == "ema" and not self.use_reward_critic:
                     # KL-budget mode: train V(s') with on-policy targets Q(s', a').
                     # q_target_per_q/q_target_var_per_q are already computed at
                     # (next_obs, next_action) where a' ~ π_current.  Reuse them.
@@ -1555,6 +1903,8 @@ class DPMD(Algorithm):
 
                     v_loss, v_grads = jax.value_and_grad(value_loss_fn)(state.value_params)
                     v_updates, value_opt_state_updated = self.optim.update(v_grads, state.opt_state.value, state.value_params)
+                    if self._q_lr_runtime:
+                        v_updates = jax.tree.map(lambda u: -state.lr_q * u, v_updates)
                     value_params_updated = optax.apply_updates(state.value_params, v_updates)
                     value_loss_log = v_loss
 
@@ -1565,7 +1915,7 @@ class DPMD(Algorithm):
                     q_means_for_v, q_vars_for_v = eval_all_q(q_params, obs, action)
                     q_for_v = aggregate_q_n(q_means_for_v, q_vars_for_v)
                     if self.use_reward_critic:
-                        q_for_v = q_for_v * (jnp.float32(1.0) / jnp.float32(1.0 - self.gamma))
+                        q_for_v = q_for_v * (jnp.float32(1.0) / jnp.float32(1.0 - state.gamma))
 
                     if self.critic_normalization == "ema":
                         def value_loss_fn(v_params):
@@ -1574,6 +1924,8 @@ class DPMD(Algorithm):
 
                         v_loss, v_grads = jax.value_and_grad(value_loss_fn)(state.value_params)
                         v_updates, value_opt_state_updated = self.optim.update(v_grads, state.opt_state.value, state.value_params)
+                        if self._q_lr_runtime:
+                            v_updates = jax.tree.map(lambda u: -state.lr_q * u, v_updates)
                         value_params_updated = optax.apply_updates(state.value_params, v_updates)
                         value_loss_log = v_loss
 
@@ -1581,7 +1933,7 @@ class DPMD(Algorithm):
                         v_current = self._value_net.apply(state.value_params, obs)
                         advantage_squared = (q_for_v - v_current) ** 2
                         adv_second_moment_batch = jnp.mean(advantage_squared)
-                        adv_ema_tau = jnp.float32(self.advantage_ema_tau)
+                        adv_ema_tau = state.adv_ema_tau
                         new_adv_second_moment_ema = state.advantage_second_moment_ema + adv_ema_tau * (adv_second_moment_batch - state.advantage_second_moment_ema)
                         adv_second_moment_log = adv_second_moment_batch
                     else:  # distributional
@@ -1593,11 +1945,17 @@ class DPMD(Algorithm):
 
                         v_loss, v_grads = jax.value_and_grad(value_loss_fn)(state.value_params)
                         v_updates, value_opt_state_updated = self.optim.update(v_grads, state.opt_state.value, state.value_params)
+                        if self._q_lr_runtime:
+                            v_updates = jax.tree.map(lambda u: -state.lr_q * u, v_updates)
                         value_params_updated = optax.apply_updates(state.value_params, v_updates)
                         value_loss_log = v_loss
 
                         v_mean_current, v_log_var_current = self._value_net.apply(state.value_params, obs)
                         adv_second_moment_log = jnp.mean(jnp.exp(v_log_var_current))
+
+            target_value_params_updated = state.target_value_params
+            if self.td_value_training and state.target_value_params is not None:
+                target_value_params_updated = delay_target_update(value_params_updated, state.target_value_params, state.polyak_tau)
 
             state = Diffv2TrainState(
                 params=Diffv2Params(q_params, target_q_params, policy_params, target_policy_params, log_alpha),
@@ -1611,20 +1969,39 @@ class DPMD(Algorithm):
                 dsac_omega_ema=new_dsac_omega_ema,
                 dsac_b_ema=new_dsac_b_ema,
                 value_params=value_params_updated,
+                target_value_params=target_value_params_updated,
                 advantage_second_moment_ema=new_adv_second_moment_ema,
                 advantage_third_moment_ema=state.advantage_third_moment_ema,
                 dist_shift_covariance_ema=state.dist_shift_covariance_ema,
                 dist_shift_shape_ema=state.dist_shift_shape_ema,
+                dist_shift_coeff_ema=state.dist_shift_coeff_ema,
+                dist_shift_shape3_ema=state.dist_shift_shape3_ema,
                 frozen_q=state.frozen_q,
                 train_policy=state.train_policy,
+                gamma=state.gamma,
+                polyak_tau=state.polyak_tau,
+                lr_q=state.lr_q,
+                lr_policy=state.lr_policy,
+                guidance_mult=state.guidance_mult,
+                adv_ema_tau=state.adv_ema_tau,
+                shape_ema_tau=state.shape_ema_tau,
+                kl_budget_val=state.kl_budget_val,
+                reward_scale=state.reward_scale,
+                x0_hat_clip_radius=state.x0_hat_clip_radius,
+                mala_adapt_rate=state.mala_adapt_rate,
+                q_td_huber_width=state.q_td_huber_width,
+                shape3_ema_tau=state.shape3_ema_tau,
+                q_critic_agg_idx=state.q_critic_agg_idx,
             )
 
             # --- Losses ---
             # Q_MSE: average loss across ensemble members
             q_mse = jnp.mean(all_q_losses) if not self.use_reward_critic else jnp.float32(0.0)
 
+            policy_eps_mse_per_dim = total_loss / jnp.float32(self.agent.act_dim) if self.policy_loss_reduction == "sum" else total_loss
+
             info = {
-                self.policy_loss_key: total_loss,
+                self.policy_loss_key: policy_eps_mse_per_dim,
                 "losses/Q_MSE": q_mse,
             }
 
@@ -1656,7 +2033,10 @@ class DPMD(Algorithm):
 
             # --- Q section ---
             if self.critic_normalization == "ema":
-                info["Critic/inv_sqrt(E(Var(Q))_ema)"] = jnp.float32(1.0) / jnp.sqrt(jnp.maximum(new_adv_second_moment_ema, jnp.float32(1e-6)))
+                _q_ema_key = "Critic/inv_sqrt(E(Var(Q_η))_ema)" if _use_entropic_q else "Critic/inv_sqrt(E(Var(Q))_ema)"
+                info[_q_ema_key] = jnp.float32(1.0) / jnp.sqrt(jnp.maximum(new_adv_second_moment_ema, jnp.float32(1e-6)))
+            if self.agent.distributional_critic:
+                info["Critic/target_variance"] = q_target_var_mean
             return state, info
 
         @jax.jit
@@ -1670,6 +2050,7 @@ class DPMD(Algorithm):
             target_q_params_s = state.params.target_q
             policy_params = state.params.policy
             target_policy_params = state.params.target_policy
+            td_policy_params = target_policy_params if self.td_use_target_policy else policy_params
             log_alpha = state.params.log_alpha
             q_opt_states_s = state.opt_state.q
             policy_opt_state = state.opt_state.policy
@@ -1679,19 +2060,28 @@ class DPMD(Algorithm):
             running_std = state.running_std
             log_eta_scales = state.log_eta_scales
             tfg_eta_current = state.tfg_eta
+            _entropic_eta_ref[0] = tfg_eta_current
             num_q_s = len(q_params_s)
 
             next_eval_key, diffusion_time_key, diffusion_noise_key, q_agg_key = jax.random.split(key, 4)
 
+            # Build a per-slot aggregator when in vmap_mean_min mode so the
+            # policy-side Q signal (reweighting / tilting) blends mean and min
+            # using state.q_critic_agg_idx for this vmap slot.
+            get_min_q_agg = (
+                make_aggregate_q_fn(state.q_critic_agg_idx)
+                if q_critic_agg == "vmap_mean_min"
+                else aggregate_q_fn_outer
+            )
             def get_min_q(s, a):
                 q_means, q_vars = [], []
                 for qp in q_params_s:
                     m, v = self.agent.q(qp, s, a)
                     q_means.append(m)
                     q_vars.append(v)
-                q = aggregate_q_fn_outer(q_means, q_vars)
+                q = get_min_q_agg(q_means, q_vars)
                 if self.use_reward_critic:
-                    q = q * (jnp.float32(1.0) / jnp.float32(1.0 - self.gamma))
+                    q = q * (jnp.float32(1.0) / jnp.float32(1.0 - state.gamma))
                 return q
 
             if self.pure_bc_training:
@@ -1703,7 +2093,7 @@ class DPMD(Algorithm):
                 base_q_weights = jnp.ones_like(q_min)
                 loss_weights = jnp.ones_like(q_min)
             else:
-                td_params = (policy_params, log_alpha, q_params_s, log_eta_scales, tfg_eta_current, state.value_params, state.advantage_second_moment_ema)
+                td_params = (td_policy_params, log_alpha, q_params_s, log_eta_scales, tfg_eta_current, state.value_params, state.advantage_second_moment_ema, state.target_value_params, state.reward_scale, state.x0_hat_clip_radius, state.mala_adapt_rate, state.guidance_mult, state.gamma, state.q_critic_agg_idx)
                 next_action, _q, _ = sample_action_with_agg(next_eval_key, td_params, next_obs, hard_min_q_n)
                 cond_obs = next_obs
                 target_action = next_action
@@ -1736,26 +2126,30 @@ class DPMD(Algorithm):
                     denoiser,
                     t,
                     jax.lax.stop_gradient(target_action),
+                    reduction=self.policy_loss_reduction,
                 )
 
                 return loss, (base_q_weights, scaled_q, q_mean, q_std)
 
             (total_loss, (q_weights, scaled_q, q_mean, q_std)), policy_grads = jax.value_and_grad(policy_loss_fn, has_aux=True)(policy_params)
 
-            def param_update(optim, params, grads, opt_state):
+            def param_update(optim, params, grads, opt_state, lr_value=None):
                 update, new_opt_state = optim.update(grads, opt_state, params=params)
+                if lr_value is not None:
+                    update = jax.tree.map(lambda u: -lr_value * u, update)
                 new_params = optax.apply_updates(params, update)
                 return new_params, new_opt_state
 
-            def delay_param_update(optim, params, grads, opt_state):
+            def delay_param_update(optim, params, grads, opt_state, lr_value=None):
                 return jax.lax.cond(
                     step % self.delay_update == 0,
-                    lambda params, opt_state: param_update(optim, params, grads, opt_state),
-                    lambda params, opt_state: (params, opt_state),
-                    params, opt_state
+                    lambda po: param_update(optim, po[0], grads, po[1], lr_value),
+                    lambda po: po,
+                    (params, opt_state)
                 )
 
-            policy_params, policy_opt_state = delay_param_update(self.policy_optim, policy_params, policy_grads, policy_opt_state)
+            policy_lr = self._policy_lr_at_step(state.lr_policy, self._optimizer_count(policy_opt_state))
+            policy_params, policy_opt_state = delay_param_update(self.policy_optim, policy_params, policy_grads, policy_opt_state, lr_value=policy_lr)
 
             state = Diffv2TrainState(
                 params=Diffv2Params(q_params_s, target_q_params_s, policy_params, target_policy_params, log_alpha),
@@ -1767,12 +2161,29 @@ class DPMD(Algorithm):
                 log_eta_scales=log_eta_scales,
                 tfg_eta=tfg_eta_current,
                 value_params=state.value_params,
+                target_value_params=state.target_value_params,
                 advantage_second_moment_ema=state.advantage_second_moment_ema,
                 advantage_third_moment_ema=state.advantage_third_moment_ema,
                 dist_shift_covariance_ema=state.dist_shift_covariance_ema,
                 dist_shift_shape_ema=state.dist_shift_shape_ema,
+                dist_shift_coeff_ema=state.dist_shift_coeff_ema,
+                dist_shift_shape3_ema=state.dist_shift_shape3_ema,
                 frozen_q=state.frozen_q,
                 train_policy=state.train_policy,
+                gamma=state.gamma,
+                polyak_tau=state.polyak_tau,
+                lr_q=state.lr_q,
+                lr_policy=state.lr_policy,
+                guidance_mult=state.guidance_mult,
+                adv_ema_tau=state.adv_ema_tau,
+                shape_ema_tau=state.shape_ema_tau,
+                kl_budget_val=state.kl_budget_val,
+                reward_scale=state.reward_scale,
+                x0_hat_clip_radius=state.x0_hat_clip_radius,
+                mala_adapt_rate=state.mala_adapt_rate,
+                q_td_huber_width=state.q_td_huber_width,
+                shape3_ema_tau=state.shape3_ema_tau,
+                q_critic_agg_idx=state.q_critic_agg_idx,
             )
 
             info = {
@@ -1806,7 +2217,7 @@ class DPMD(Algorithm):
             aggregate_q_fn,
             randomize_q: bool = False,
         ) -> jax.Array:
-            policy_params, log_alpha, q_params_tuple, log_eta_scales_in, tfg_eta_current, value_params, adv_second_moment_ema = params
+            policy_params, log_alpha, q_params_tuple, log_eta_scales_in, tfg_eta_current, value_params, adv_second_moment_ema, target_value_params, reward_scale_hp, x0_hat_clip_radius_hp, mala_adapt_rate_hp, guidance_mult_hp, gamma_hp, q_critic_agg_idx_hp = params
 
             single = obs.ndim == 1
             if single:
@@ -1842,7 +2253,7 @@ class DPMD(Algorithm):
                         x_in * B.sqrt_recip_alphas_cumprod[t_idx]
                         - noise_pred * B.sqrt_recipm1_alphas_cumprod[t_idx]
                     )
-                    x0_hat = jnp.clip(x0_hat, -self.x0_hat_clip_radius, self.x0_hat_clip_radius)
+                    x0_hat = jnp.clip(x0_hat, -x0_hat_clip_radius_hp, x0_hat_clip_radius_hp)
                     q_means, q_vars = [], []
                     for qp in q_params_tuple:
                         m, v = self.agent.q(qp, obs_batch, x0_hat)
@@ -1850,21 +2261,25 @@ class DPMD(Algorithm):
                         q_vars.append(v)
                     q = aggregate_q_local(q_means, q_vars)
                     if self.use_reward_critic:
-                        q = q * (jnp.float32(1.0) / jnp.float32(1.0 - self.gamma))
-                    
+                        q = q * (jnp.float32(1.0) / jnp.float32(1.0 - gamma_hp))
+
+                    agg_fn = jnp.sum if self.batch_independent_guidance else jnp.mean
+                    mult = guidance_mult_hp
+
                     # Critic normalization: use (Q - V) / std instead of Q
                     if self.critic_normalization == "ema" and value_params is not None:
-                        v = self._value_net.apply(value_params, obs_batch)
+                        v_params_for_adv = target_value_params if self.td_value_training and target_value_params is not None else value_params
+                        v = self._value_net.apply(v_params_for_adv, obs_batch)
                         advantage = q - v
                         adv_std = jnp.sqrt(jnp.maximum(adv_second_moment_ema, jnp.float32(1e-6)))
-                        return jnp.mean(advantage / adv_std)
+                        return mult * agg_fn(advantage / adv_std)
                     elif self.critic_normalization == "distributional" and value_params is not None:
                         v_mean, v_log_var = self._value_net.apply(value_params, obs_batch)
                         advantage = q - v_mean
                         adv_std = jnp.sqrt(jnp.maximum(jnp.exp(v_log_var), jnp.float32(1e-6)))
-                        return jnp.mean(advantage / adv_std)
-                    
-                    return jnp.mean(q)
+                        return mult * agg_fn(advantage / adv_std)
+
+                    return mult * agg_fn(q)
 
                 def grad_guidance(x_in, t_idx):
                     # Use Q-gradient guidance only if lambda_for_step(t_idx) > 0; otherwise no guidance
@@ -1940,7 +2355,7 @@ class DPMD(Algorithm):
                     q_vars_f.append(v)
                 q = aggregate_q_local(q_means_f, q_vars_f)
                 if self.use_reward_critic:
-                    q = q * (jnp.float32(1.0) / jnp.float32(1.0 - self.gamma))
+                    q = q * (jnp.float32(1.0) / jnp.float32(1.0 - gamma_hp))
                 return act_final, q
 
             def single_sampler(single_key: jax.Array):
@@ -1960,7 +2375,7 @@ class DPMD(Algorithm):
             randomize_q: bool = False,
             return_details: bool = False,
         ):
-            policy_params, log_alpha, q_params_tuple, log_eta_scales_in, tfg_eta_current, value_params, adv_second_moment_ema = params
+            policy_params, log_alpha, q_params_tuple, log_eta_scales_in, tfg_eta_current, value_params, adv_second_moment_ema, target_value_params, reward_scale_hp, x0_hat_clip_radius_hp, mala_adapt_rate_hp, guidance_mult_hp, gamma_hp, q_critic_agg_idx_hp = params
 
             single = obs.ndim == 1
             if single:
@@ -2005,24 +2420,28 @@ class DPMD(Algorithm):
                         x_in * B.sqrt_recip_alphas_cumprod[t_idx]
                         - noise_pred * B.sqrt_recipm1_alphas_cumprod[t_idx]
                     )
-                    x0_hat = jnp.clip(x0_hat, -self.x0_hat_clip_radius, self.x0_hat_clip_radius)
+                    x0_hat = jnp.clip(x0_hat, -x0_hat_clip_radius_hp, x0_hat_clip_radius_hp)
                     q = q_min_from_x0(x0_hat)
                     if self.use_reward_critic:
-                        q = q * (jnp.float32(1.0) / jnp.float32(1.0 - self.gamma))
-                    
+                        q = q * (jnp.float32(1.0) / jnp.float32(1.0 - gamma_hp))
+
+                    agg_fn = jnp.sum if self.batch_independent_guidance else jnp.mean
+                    mult = guidance_mult_hp
+
                     # Critic normalization: use (Q - V) / std instead of Q
                     if self.critic_normalization == "ema" and value_params is not None:
-                        v = self._value_net.apply(value_params, obs_batch)
+                        v_params_for_adv = target_value_params if self.td_value_training and target_value_params is not None else value_params
+                        v = self._value_net.apply(v_params_for_adv, obs_batch)
                         advantage = q - v
                         adv_std = jnp.sqrt(jnp.maximum(adv_second_moment_ema, jnp.float32(1e-6)))
-                        return jnp.mean(advantage / adv_std)
+                        return mult * agg_fn(advantage / adv_std)
                     elif self.critic_normalization == "distributional" and value_params is not None:
                         v_mean, v_log_var = self._value_net.apply(value_params, obs_batch)
                         advantage = q - v_mean
                         adv_std = jnp.sqrt(jnp.maximum(jnp.exp(v_log_var), jnp.float32(1e-6)))
-                        return jnp.mean(advantage / adv_std)
-                    
-                    return jnp.mean(q)
+                        return mult * agg_fn(advantage / adv_std)
+
+                    return mult * agg_fn(q)
 
                 def grad_guidance(x_in, t_idx):
                     def guided(x):
@@ -2045,8 +2464,8 @@ class DPMD(Algorithm):
                             x_in * B.sqrt_recip_alphas_cumprod[t]
                             - noise_pred * B.sqrt_recipm1_alphas_cumprod[t]
                         )
-                        clip_frac = jnp.mean((jnp.abs(x0_hat) > self.x0_hat_clip_radius).astype(jnp.float32))
-                        x0_hat_clipped = jnp.clip(x0_hat, -self.x0_hat_clip_radius, self.x0_hat_clip_radius)
+                        clip_frac = jnp.mean((jnp.abs(x0_hat) > x0_hat_clip_radius_hp).astype(jnp.float32))
+                        x0_hat_clipped = jnp.clip(x0_hat, -x0_hat_clip_radius_hp, x0_hat_clip_radius_hp)
                         q_min = q_min_from_x0(x0_hat_clipped)
                         lambda_t = lambda_for_step(t, tfg_eta_current)
                         return E_mod - lambda_t * q_min, clip_frac
@@ -2141,7 +2560,7 @@ class DPMD(Algorithm):
 
                                 acc_rate = jnp.mean(accept.astype(jnp.float32).reshape(-1))
                                 target = jnp.float32(0.574)
-                                adapt_rate = jnp.float32(self.mala_adapt_rate)
+                                adapt_rate = mala_adapt_rate_hp
                                 log_eta_scale = log_eta_scale + adapt_rate * (acc_rate - target)
                                 log_eta_scale = jnp.clip(log_eta_scale, log_eta_min, log_eta_max)
 
@@ -2273,7 +2692,7 @@ class DPMD(Algorithm):
 
                                 acc_rate = jnp.mean(accept.astype(jnp.float32).reshape(-1))
                                 target = jnp.float32(0.574)
-                                adapt_rate = jnp.float32(self.mala_adapt_rate)
+                                adapt_rate = mala_adapt_rate_hp
                                 log_eta_scale = log_eta_scale + adapt_rate * (acc_rate - target)
                                 log_eta_scale = jnp.clip(log_eta_scale, log_eta_min, log_eta_max)
 
@@ -2364,7 +2783,7 @@ class DPMD(Algorithm):
                     q_vars_f.append(v)
                 q = aggregate_q_fn(q_means_f, q_vars_f)
                 if self.use_reward_critic:
-                    q = q * (jnp.float32(1.0) / jnp.float32(1.0 - self.gamma))
+                    q = q * (jnp.float32(1.0) / jnp.float32(1.0 - gamma_hp))
                 return act_final, q, log_eta_scales_out, mala_acc_rate, mala_eta_scale, per_level_acc_out, per_level_clip_frac_out
 
             def single_sampler(single_key: jax.Array, log_eta_scales_local: jax.Array):
@@ -2479,7 +2898,7 @@ class DPMD(Algorithm):
             aggregate_q_fn,
             randomize_q: bool = False,
         ):
-            policy_params, log_alpha, q_params_tuple, log_eta_scales_in, _tfg_eta_current, _value_params, _adv_second_moment_ema = params
+            policy_params, log_alpha, q_params_tuple, log_eta_scales_in, _tfg_eta_current, _value_params, _adv_second_moment_ema, _target_value_params, _reward_scale_hp, _x0_hat_clip_radius_hp, _mala_adapt_rate_hp, _guidance_mult_hp, gamma_hp, _q_critic_agg_idx_hp = params
             if self.agent.energy_mode and self.agent.mala_steps > 0:
                 act, _q, log_eta_scales_out, mala_acc_rate, mala_eta_scale, pl_acc, pl_clip = stateless_get_action_mala_full(
                     key,
@@ -2526,7 +2945,7 @@ class DPMD(Algorithm):
             aggregate_q_fn,
             randomize_q: bool = False,
         ) -> jax.Array:
-            policy_params, log_alpha, q_params_tuple, log_eta_scales_in, _tfg_eta_current, _value_params, _adv_second_moment_ema = params
+            policy_params, log_alpha, q_params_tuple, log_eta_scales_in, _tfg_eta_current, _value_params, _adv_second_moment_ema, _target_value_params, _reward_scale_hp, _x0_hat_clip_radius_hp, _mala_adapt_rate_hp, _guidance_mult_hp, gamma_hp, _q_critic_agg_idx_hp = params
 
             single = obs.ndim == 1
             if single:
@@ -2574,7 +2993,7 @@ class DPMD(Algorithm):
                     q_vars.append(v)
                 q = aggregate_q_local(q_means, q_vars)
                 if self.use_reward_critic:
-                    q = q * (jnp.float32(1.0) / jnp.float32(1.0 - self.gamma))
+                    q = q * (jnp.float32(1.0) / jnp.float32(1.0 - gamma_hp))
                 return act, q
 
             def single_sampler(single_key: jax.Array, log_eta_scales_local: jax.Array):
@@ -2610,7 +3029,14 @@ class DPMD(Algorithm):
             n_samples: int = 16,
         ) -> jax.Array:
             """Estimate KL(π_tilt || π_0) for a batch of observations."""
-            policy_params, log_alpha, q_params_tuple, log_eta_scales_in, tfg_eta_current, value_params, adv_second_moment_ema = params
+            policy_params, log_alpha, q_params_tuple, log_eta_scales_in, tfg_eta_current, value_params, adv_second_moment_ema, target_value_params, reward_scale_hp, x0_hat_clip_radius_hp, mala_adapt_rate_hp, guidance_mult_hp, gamma_hp, q_critic_agg_idx_hp = params
+            # Per-slot aggregate under vmap_mean_min; otherwise use the
+            # string-branching aggregate_q_fn_outer unchanged.
+            aggregate_q_fn_here = (
+                make_aggregate_q_fn(q_critic_agg_idx_hp)
+                if q_critic_agg == "vmap_mean_min"
+                else aggregate_q_fn_outer
+            )
 
             single = obs.ndim == 1
             if single:
@@ -2633,7 +3059,7 @@ class DPMD(Algorithm):
                     m, v = self.agent.q(qp, obs_batch, act)
                     q_means.append(m)
                     q_vars.append(v)
-                return aggregate_q_fn_outer(q_means, q_vars)
+                return aggregate_q_fn_here(q_means, q_vars)
 
             # Sample from base policy π_0 (unguided) and evaluate Q
             def sample_base_with_q(sample_key: jax.Array):
@@ -2649,7 +3075,7 @@ class DPMD(Algorithm):
                 act = act if self.latent_action_space else jnp.clip(act, -1.0, 1.0)
                 q = eval_q_agg(act)
                 if self.use_reward_critic:
-                    q = q * (jnp.float32(1.0) / jnp.float32(1.0 - self.gamma))
+                    q = q * (jnp.float32(1.0) / jnp.float32(1.0 - gamma_hp))
                 return q  # [batch_size]
 
             # Sample from tilted policy π_tilt (guided) and evaluate Q
@@ -2659,13 +3085,13 @@ class DPMD(Algorithm):
                     sample_key,
                     params,
                     obs_batch,
-                    aggregate_q_fn_outer,
+                    aggregate_q_fn_here,
                     randomize_q=False,
                 )
                 # Evaluate Q on the tilted sample
                 q = eval_q_agg(act)
                 if self.use_reward_critic:
-                    q = q * (jnp.float32(1.0) / jnp.float32(1.0 - self.gamma))
+                    q = q * (jnp.float32(1.0) / jnp.float32(1.0 - gamma_hp))
                 return q  # [batch_size]
 
             key_base, key_tilted = jax.random.split(key)
@@ -2704,6 +3130,13 @@ class DPMD(Algorithm):
             self.state.tfg_eta,
             self.state.value_params,
             self.state.advantage_second_moment_ema,
+            self.state.target_value_params,
+            self.state.reward_scale,
+            self.state.x0_hat_clip_radius,
+            self.state.mala_adapt_rate,
+            self.state.guidance_mult,
+            self.state.gamma,
+            self.state.q_critic_agg_idx,
         )
 
     def get_policy_params_to_save(self):
@@ -2715,6 +3148,13 @@ class DPMD(Algorithm):
             self.state.tfg_eta,
             self.state.value_params,
             self.state.advantage_second_moment_ema,
+            self.state.target_value_params,
+            self.state.reward_scale,
+            self.state.x0_hat_clip_radius,
+            self.state.mala_adapt_rate,
+            self.state.guidance_mult,
+            self.state.gamma,
+            self.state.q_critic_agg_idx,
         )
 
     def load(self, path: str) -> None:
@@ -2757,9 +3197,24 @@ class DPMD(Algorithm):
                 log_eta_scales=jnp.full((timesteps,), init_log_eta_scale, dtype=jnp.float32),
                 tfg_eta=jnp.float32(self.tfg_eta),
                 value_params=getattr(state, 'value_params', None),
+                target_value_params=getattr(state, 'target_value_params', getattr(state, 'value_params', None)),
                 advantage_second_moment_ema=getattr(state, 'advantage_second_moment_ema', jnp.float32(1.0)),
                 frozen_q=frozen_q,
                 train_policy=train_policy,
+                gamma=getattr(state, 'gamma', jnp.float32(self.gamma)),
+                polyak_tau=getattr(state, 'polyak_tau', jnp.float32(self.tau)),
+                lr_q=getattr(state, 'lr_q', jnp.float32(self.lr_q)),
+                lr_policy=getattr(state, 'lr_policy', jnp.float32(self.lr_policy)),
+                guidance_mult=getattr(state, 'guidance_mult', jnp.float32(self.guidance_strength_multiplier)),
+                adv_ema_tau=getattr(state, 'adv_ema_tau', jnp.float32(self.advantage_ema_tau)),
+                shape_ema_tau=getattr(state, 'shape_ema_tau', jnp.float32(self.shape_ema_tau)),
+                kl_budget_val=getattr(state, 'kl_budget_val', jnp.float32(self.kl_budget if self.kl_budget is not None else 1.0)),
+                reward_scale=getattr(state, 'reward_scale', jnp.float32(self.reward_scale)),
+                x0_hat_clip_radius=getattr(state, 'x0_hat_clip_radius', jnp.float32(self.x0_hat_clip_radius)),
+                mala_adapt_rate=getattr(state, 'mala_adapt_rate', jnp.float32(self.mala_adapt_rate)),
+                q_td_huber_width=getattr(state, 'q_td_huber_width', jnp.float32(self.q_td_huber_width)),
+                shape3_ema_tau=getattr(state, 'shape3_ema_tau', jnp.float32(self.shape3_ema_tau)),
+                q_critic_agg_idx=getattr(state, 'q_critic_agg_idx', jnp.float32(self.q_critic_agg_idx)),
             )
         elif not hasattr(state, "tfg_eta"):
             state = Diffv2TrainState(
@@ -2772,9 +3227,24 @@ class DPMD(Algorithm):
                 log_eta_scales=state.log_eta_scales,
                 tfg_eta=jnp.float32(self.tfg_eta),
                 value_params=getattr(state, 'value_params', None),
+                target_value_params=getattr(state, 'target_value_params', getattr(state, 'value_params', None)),
                 advantage_second_moment_ema=getattr(state, 'advantage_second_moment_ema', jnp.float32(1.0)),
                 frozen_q=frozen_q,
                 train_policy=train_policy,
+                gamma=getattr(state, 'gamma', jnp.float32(self.gamma)),
+                polyak_tau=getattr(state, 'polyak_tau', jnp.float32(self.tau)),
+                lr_q=getattr(state, 'lr_q', jnp.float32(self.lr_q)),
+                lr_policy=getattr(state, 'lr_policy', jnp.float32(self.lr_policy)),
+                guidance_mult=getattr(state, 'guidance_mult', jnp.float32(self.guidance_strength_multiplier)),
+                adv_ema_tau=getattr(state, 'adv_ema_tau', jnp.float32(self.advantage_ema_tau)),
+                shape_ema_tau=getattr(state, 'shape_ema_tau', jnp.float32(self.shape_ema_tau)),
+                kl_budget_val=getattr(state, 'kl_budget_val', jnp.float32(self.kl_budget if self.kl_budget is not None else 1.0)),
+                reward_scale=getattr(state, 'reward_scale', jnp.float32(self.reward_scale)),
+                x0_hat_clip_radius=getattr(state, 'x0_hat_clip_radius', jnp.float32(self.x0_hat_clip_radius)),
+                mala_adapt_rate=getattr(state, 'mala_adapt_rate', jnp.float32(self.mala_adapt_rate)),
+                q_td_huber_width=getattr(state, 'q_td_huber_width', jnp.float32(self.q_td_huber_width)),
+                shape3_ema_tau=getattr(state, 'shape3_ema_tau', jnp.float32(self.shape3_ema_tau)),
+                q_critic_agg_idx=getattr(state, 'q_critic_agg_idx', jnp.float32(self.q_critic_agg_idx)),
             )
         elif (not self.mala_per_level_eta) and hasattr(state, "log_eta_scales"):
             # Enforce shared eta-scale invariant when running in shared mode.
@@ -2790,9 +3260,24 @@ class DPMD(Algorithm):
                 log_eta_scales=jnp.full((timesteps,), shared, dtype=jnp.float32),
                 tfg_eta=state.tfg_eta if hasattr(state, "tfg_eta") else jnp.float32(self.tfg_eta),
                 value_params=getattr(state, 'value_params', None),
-                advantage_second_moment_ema=getattr(state, 'advantage_second_moment_ema', jnp.float32(1.0)),
+                target_value_params=getattr(state, 'target_value_params', getattr(state, 'value_params', None)),
+                advantage_second_moment_ema=getattr(state, 'advantage_second_moment_ema', jnp.float32(self.initial_advantage_second_moment_ema)),
                 frozen_q=frozen_q,
                 train_policy=train_policy,
+                gamma=getattr(state, 'gamma', jnp.float32(self.gamma)),
+                polyak_tau=getattr(state, 'polyak_tau', jnp.float32(self.tau)),
+                lr_q=getattr(state, 'lr_q', jnp.float32(self.lr_q)),
+                lr_policy=getattr(state, 'lr_policy', jnp.float32(self.lr_policy)),
+                guidance_mult=getattr(state, 'guidance_mult', jnp.float32(self.guidance_strength_multiplier)),
+                adv_ema_tau=getattr(state, 'adv_ema_tau', jnp.float32(self.advantage_ema_tau)),
+                shape_ema_tau=getattr(state, 'shape_ema_tau', jnp.float32(self.shape_ema_tau)),
+                kl_budget_val=getattr(state, 'kl_budget_val', jnp.float32(self.kl_budget if self.kl_budget is not None else 1.0)),
+                reward_scale=getattr(state, 'reward_scale', jnp.float32(self.reward_scale)),
+                x0_hat_clip_radius=getattr(state, 'x0_hat_clip_radius', jnp.float32(self.x0_hat_clip_radius)),
+                mala_adapt_rate=getattr(state, 'mala_adapt_rate', jnp.float32(self.mala_adapt_rate)),
+                q_td_huber_width=getattr(state, 'q_td_huber_width', jnp.float32(self.q_td_huber_width)),
+                shape3_ema_tau=getattr(state, 'shape3_ema_tau', jnp.float32(self.shape3_ema_tau)),
+                q_critic_agg_idx=getattr(state, 'q_critic_agg_idx', jnp.float32(self.q_critic_agg_idx)),
             )
         else:
             # Already has all fields; just ensure tuple format and new fields
@@ -2808,12 +3293,29 @@ class DPMD(Algorithm):
                 dsac_omega_ema=getattr(state, 'dsac_omega_ema', jnp.float32(1.0)),
                 dsac_b_ema=getattr(state, 'dsac_b_ema', jnp.float32(1.0)),
                 value_params=getattr(state, 'value_params', None),
-                advantage_second_moment_ema=getattr(state, 'advantage_second_moment_ema', jnp.float32(1.0)),
+                target_value_params=getattr(state, 'target_value_params', getattr(state, 'value_params', None)),
+                advantage_second_moment_ema=getattr(state, 'advantage_second_moment_ema', jnp.float32(self.initial_advantage_second_moment_ema)),
                 advantage_third_moment_ema=getattr(state, 'advantage_third_moment_ema', jnp.float32(0.0)),
                 dist_shift_covariance_ema=getattr(state, 'dist_shift_covariance_ema', jnp.float32(0.0)),
-                dist_shift_shape_ema=getattr(state, 'dist_shift_shape_ema', jnp.float32(-1.0)),
+                dist_shift_shape_ema=getattr(state, 'dist_shift_shape_ema', jnp.float32(self.initial_dist_shift_shape_ema)),
+                dist_shift_coeff_ema=getattr(state, 'dist_shift_coeff_ema', jnp.float32(self.initial_dist_shift_coeff_ema)),
+                dist_shift_shape3_ema=getattr(state, 'dist_shift_shape3_ema', jnp.float32(0.0)),
                 frozen_q=frozen_q,
                 train_policy=train_policy,
+                gamma=getattr(state, 'gamma', jnp.float32(self.gamma)),
+                polyak_tau=getattr(state, 'polyak_tau', jnp.float32(self.tau)),
+                lr_q=getattr(state, 'lr_q', jnp.float32(self.lr_q)),
+                lr_policy=getattr(state, 'lr_policy', jnp.float32(self.lr_policy)),
+                guidance_mult=getattr(state, 'guidance_mult', jnp.float32(self.guidance_strength_multiplier)),
+                adv_ema_tau=getattr(state, 'adv_ema_tau', jnp.float32(self.advantage_ema_tau)),
+                shape_ema_tau=getattr(state, 'shape_ema_tau', jnp.float32(self.shape_ema_tau)),
+                kl_budget_val=getattr(state, 'kl_budget_val', jnp.float32(self.kl_budget if self.kl_budget is not None else 1.0)),
+                reward_scale=getattr(state, 'reward_scale', jnp.float32(self.reward_scale)),
+                x0_hat_clip_radius=getattr(state, 'x0_hat_clip_radius', jnp.float32(self.x0_hat_clip_radius)),
+                mala_adapt_rate=getattr(state, 'mala_adapt_rate', jnp.float32(self.mala_adapt_rate)),
+                q_td_huber_width=getattr(state, 'q_td_huber_width', jnp.float32(self.q_td_huber_width)),
+                shape3_ema_tau=getattr(state, 'shape3_ema_tau', jnp.float32(self.shape3_ema_tau)),
+                q_critic_agg_idx=getattr(state, 'q_critic_agg_idx', jnp.float32(self.q_critic_agg_idx)),
             )
         self.state = jax.device_put(state)
 
@@ -2850,6 +3352,123 @@ class DPMD(Algorithm):
         q_frozen = sum(q_frozen_means) / len(q_frozen_means)
         return np.asarray(q_live), np.asarray(q_frozen)
 
+    def _build_initial_state(self, params, value_params_init, value_opt_state_init):
+        """Construct a fresh Diffv2TrainState from a given set of network params.
+
+        Factored out of __init__ so vmap-mode setup can call it N times with
+        different init seeds and stack the results along a leading seed axis.
+        """
+        frozen_q_init = tuple(jax.tree.map(lambda x: x, qp) for qp in params.q) if self.soft_pi_mode else None
+        return Diffv2TrainState(
+            params=params,
+            opt_state=Diffv2OptStates(
+                q=tuple(self.optim.init(qp) for qp in params.q),
+                policy=self.policy_optim.init(params.policy),
+                log_alpha=self.alpha_optim.init(params.log_alpha),
+                value=value_opt_state_init,
+            ),
+            step=jnp.int32(0),
+            entropy=jnp.float32(0.0),
+            running_mean=jnp.float32(0.0),
+            running_std=jnp.float32(1.0),
+            log_eta_scales=jnp.full((self._timesteps,), self._init_log_eta_scale, dtype=jnp.float32),
+            tfg_eta=jnp.float32(self._init_tfg_eta),
+            value_params=value_params_init,
+            target_value_params=value_params_init if self._td_value_training else None,
+            advantage_second_moment_ema=jnp.float32(self.initial_advantage_second_moment_ema),
+            advantage_third_moment_ema=jnp.float32(0.0),
+            dist_shift_covariance_ema=jnp.float32(0.0),
+            dist_shift_shape_ema=jnp.float32(self.initial_dist_shift_shape_ema),
+            dist_shift_coeff_ema=jnp.float32(self.initial_dist_shift_coeff_ema),
+            dist_shift_shape3_ema=jnp.float32(0.0),
+            frozen_q=frozen_q_init,
+            train_policy=jnp.float32(1.0),
+            gamma=jnp.float32(self.gamma),
+            polyak_tau=jnp.float32(self.tau),
+            lr_q=jnp.float32(self.lr_q),
+            lr_policy=jnp.float32(self.lr_policy),
+            guidance_mult=jnp.float32(self.guidance_strength_multiplier),
+            adv_ema_tau=jnp.float32(self.advantage_ema_tau),
+            shape_ema_tau=jnp.float32(self.shape_ema_tau),
+            kl_budget_val=jnp.float32(self.kl_budget if self.kl_budget is not None else 1.0),
+            reward_scale=jnp.float32(self.reward_scale),
+            x0_hat_clip_radius=jnp.float32(self.x0_hat_clip_radius),
+            mala_adapt_rate=jnp.float32(self.mala_adapt_rate),
+            q_td_huber_width=jnp.float32(self.q_td_huber_width),
+            shape3_ema_tau=jnp.float32(self.shape3_ema_tau),
+            q_critic_agg_idx=jnp.float32(self.q_critic_agg_idx),
+        )
+
+    def make_vmapped_state(self, params_list, value_init_keys=None):
+        """Build a vmapped train-state by stacking N independent initial states.
+
+        params_list: list of N Diffv2Params (one per seed).
+        value_init_keys: optional list of N jax.random keys for value-net init.
+                        Ignored when no V-network is used.
+        Returns a Diffv2TrainState with a leading [N] axis on every leaf.
+        """
+        N = len(params_list)
+        if self._value_net is not None:
+            if value_init_keys is None:
+                # Derive deterministic per-seed keys from the standard init seed.
+                value_init_keys = [jax.random.PRNGKey(42) for _ in range(N)]
+            sample_obs = jnp.zeros((1, self._obs_dim))
+            vparams_list = [self._value_net.init(k, sample_obs) for k in value_init_keys]
+            vopt_list = [self.optim.init(vp) for vp in vparams_list]
+        else:
+            vparams_list = [None] * N
+            vopt_list = [None] * N
+        states = [
+            self._build_initial_state(p, vp, vo)
+            for p, vp, vo in zip(params_list, vparams_list, vopt_list)
+        ]
+        return jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *states)
+
+    def get_action_vmap(self, key: jax.Array, obs: np.ndarray):
+        """Vmapped counterpart of get_action. Requires on_policy_ema mode.
+
+        obs: numpy array of shape [N, num_envs, obs_dim].
+        Returns (action [N, num_envs, act_dim], q_per_env [N, num_envs],
+        v_per_env [N, num_envs]).
+        """
+        if not self.on_policy_ema:
+            raise NotImplementedError(
+                "VmapOffPolicyTrainer currently requires on_policy_ema mode (use --kl_budget)."
+            )
+        self._ensure_vmap_compiled()
+        params = self.get_policy_params_to_save()
+        out = self._get_action_vmap_fn(key, params, obs)
+        if not (isinstance(out, tuple) and len(out) == 3):
+            raise RuntimeError(
+                f"Vmap get_action: expected (action, q, log_eta_scales); got {type(out)}"
+            )
+        action, q, log_eta_scales = out
+        # log_eta_scales: shape [N, timesteps] — matches stacked state layout.
+        self.state = self.state._replace(log_eta_scales=log_eta_scales)
+        action_np = np.asarray(action)
+        q_per_env = np.asarray(q)  # [N, num_envs]
+
+        if getattr(self, "_value_net_apply_vmap", None) is None:
+            v_net_apply = self._value_net.apply
+            @jax.jit
+            def _v_apply_vmap(vp, ob):
+                def single(vp_i, ob_i):
+                    v = v_net_apply(vp_i, ob_i)
+                    if isinstance(v, tuple):
+                        v = v[0]
+                    return v
+                return jax.vmap(single)(vp, ob)
+            self._value_net_apply_vmap = _v_apply_vmap
+        v_params = (
+            self.state.target_value_params
+            if self.td_value_training and self.state.target_value_params is not None
+            else self.state.value_params
+        )
+        obs_j = jnp.asarray(obs)
+        v = self._value_net_apply_vmap(v_params, obs_j)
+        v_per_env = np.asarray(v)  # [N, num_envs]
+        return action_np, q_per_env, v_per_env
+
     def get_effective_hparams(self) -> dict:
         return {
             "lr_policy_effective": float(self.lr_policy),
@@ -2875,7 +3494,8 @@ class DPMD(Algorithm):
                 obs_j = jnp.asarray(obs)
                 if obs_j.ndim == 1:
                     obs_j = obs_j[None, :]
-                v = self._value_net.apply(self.state.value_params, obs_j)
+                v_params = self.state.target_value_params if self.td_value_training and self.state.target_value_params is not None else self.state.value_params
+                v = self._value_net.apply(v_params, obs_j)
                 if isinstance(v, tuple):
                     v = v[0]
                 v_per_env = np.asarray(v)  # [num_envs]
@@ -2898,11 +3518,28 @@ class DPMD(Algorithm):
         if obs_j.ndim == 1:
             obs_j = obs_j[None, :]
             act_j = act_j[None, :]
-        q_means = [self.agent.q(qp, obs_j, act_j)[0] for qp in self.state.params.q]
-        if len(q_means) < 2:
+        if len(self.state.params.q) < 2:
             return 0.0
-        stacked = jnp.stack(q_means, axis=0)  # [num_q, batch]
-        return float(jnp.mean(jnp.var(stacked, axis=0)))
+        if getattr(self, "_q_ensemble_var_jit", None) is None:
+            q_fn = self.agent.q
+            u_mode = self._entropic_u_mode
+            w_mode = self._entropic_w_mode
+            w_eps = getattr(self, "_entropic_w_eps", 1e-8)
+
+            @jax.jit
+            def _fn(q_params_tuple, s, a, tfg_eta):
+                means = [q_fn(qp, s, a)[0] for qp in q_params_tuple]
+                stacked = jnp.stack(means, axis=0)
+                if u_mode:
+                    stacked = stacked / tfg_eta
+                elif w_mode:
+                    stacked = jnp.log(jnp.maximum(stacked, w_eps)) / tfg_eta
+                return jnp.mean(jnp.var(stacked, axis=0))
+
+            self._q_ensemble_var_jit = _fn
+        return float(self._q_ensemble_var_jit(
+            tuple(self.state.params.q), obs_j, act_j, self.state.tfg_eta
+        ))
 
     def evaluate_value(self, obs: np.ndarray) -> "float | None":
         """Return mean V(obs) under current value params, or None if no V network."""
@@ -2930,7 +3567,6 @@ class DPMD(Algorithm):
         return np.asarray(d_mean)
 
     def update_supervised(self, key: jax.Array, data: Experience) -> Metric:
+        from relax.algorithm.base import _split_info
         self.state, info = self._update_supervised(key, self.state, data)
-        scalar_info = {k: float(v) for k, v in info.items() if jnp.ndim(v) == 0}
-        array_info = {k: np.asarray(v) for k, v in info.items() if jnp.ndim(v) > 0}
-        return scalar_info, array_info
+        return _split_info(info)

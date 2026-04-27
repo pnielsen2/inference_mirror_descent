@@ -1,4 +1,5 @@
 import argparse
+import json
 import os.path
 from pathlib import Path
 import time
@@ -39,7 +40,7 @@ from relax.utils.random_utils import seeding
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--alg", type=str, default="sdac")
-    parser.add_argument("--env", type=str, default="HalfCheetah-v4")
+    parser.add_argument("--env", type=str, default="HalfCheetah-v3")
     parser.add_argument("--backend", type=str, default="gymnasium", choices=["gymnasium", "mjx"], help="Physics backend: 'gymnasium' (standard MuJoCo C) or 'mjx' (JAX-based MuJoCo via Brax, differentiable).")
     parser.add_argument("--suffix", type=str, default="")
     parser.add_argument(
@@ -59,6 +60,11 @@ if __name__ == "__main__":
         help="Penalty coefficient alpha for the dummy action L2 penalty.",
     )
     parser.add_argument("--num_vec_envs", type=int, default=5)
+    parser.add_argument("--parallel_seeds", type=int, default=1, help="If > 1, train N independent seeds in parallel on a single device via jax.vmap. Requires --alg dpmd with --kl_budget or --kl_budget_per_dim. Env layout uses a single VectorEnv of size parallel_seeds * num_vec_envs.")
+    parser.add_argument("--hp_pack", type=str, default=None, help="Path to a JSON file with per-seed hyperparameter overrides. Each key is an argparse attribute name of this script (e.g. 'tau', 'advantage_ema_tau', 'guidance_strength_multiplier', 'kl_budget', 'shape_ema_tau', 'seed') mapped to a list of length parallel_seeds. Applied after vmap state construction; internally translated to Diffv2TrainState field names via _CLI_TO_FIELD.")
+    parser.add_argument("--hp_pack_inline", type=str, default=None, help="Inline JSON equivalent of --hp_pack. Same schema (key -> list of length parallel_seeds). Preferred over --hp_pack: keeps the pack fully self-contained in the CLI string (useful when the slurm command is surfaced by wandb) instead of embedding a path to a scratch file. When both are set, --hp_pack_inline wins.")
+    parser.add_argument("--sweep_id", type=int, default=None, help="Launcher-assigned integer identifying this sweep. When set, every wandb run from this invocation is placed in wandb group 'sweep_<sweep_id>', and each per-vmap-slot run's config includes a 'config_tag' field built from sweep_id + the per-slot hyperparameters (excluding seed/env) so a single tag value filters wandb to all runs across envs/seeds that share this hp configuration.")
+    parser.add_argument("--config_tag_keys", type=str, default=None, help="Comma-separated list of argparse attribute names whose values should be included in the per-slot config_tag. Typically set automatically by scripts/launch.py to the union of all --ablate hard+easy flags (minus env and seed). Values come from the hp_pack (per-slot) when the key is a pack key, else from this script's CLI args (shared across all vmap slots within the job).")
     parser.add_argument("--hidden_num", type=int, default=3)
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--diffusion_steps", type=int, default=20)
@@ -97,16 +103,27 @@ if __name__ == "__main__":
     parser.add_argument("--tfg_eta_end", type=float, default=None, help="Final value of tfg_eta at end of training. If set, tfg_eta interpolates log-linearly from tfg_eta to tfg_eta_end over training. Default None uses constant tfg_eta.")
     parser.add_argument("--log_md_kl_every", type=int, default=int(1e9), help="Log KL(π_tilt || π_0) every N steps. Default 1e9 (effectively disabled). Requires sampling from base policy, so adds overhead when enabled.")
     parser.add_argument("--critic_normalization", type=str, default="none", choices=["none", "ema", "distributional"], help="Normalization mode for Q guidance. 'none': use raw Q. 'ema': train V(s) to predict E[Q], normalize (Q-V) by sqrt(EMA[A^2]). 'distributional': train distributional V(s) outputting (mean, var), normalize by per-state std.")
-    parser.add_argument("--kl_budget", type=float, default=None, help="KL divergence budget δ for guidance. Sets η = sqrt(2δ), enables V network and on-policy advantage EMA. Replaces --critic_normalization ema --tfg_eta. Default None (disabled). Use 32 to match tfg_eta=8.")
-    parser.add_argument("--dist_shift_eta", action="store_true", default=False, help="Adaptive η from distribution-shift second-order expansion. Trains D_ψ head on Q networks, maintains on-policy EMAs for m2, m3, covariance. Computes η* = -m2^(3/2)/(2γc + m3), capped by KL budget. Requires --kl_budget (uses default 32 if not set).")
-    parser.add_argument("--one_step_dist_shift_eta", action="store_true", default=False, help="Adaptive η from second-order expansion using one-step Monte Carlo covariance estimate. No D_ψ head; estimates c from consecutive (A_t, A_{t+1}) pairs. Same η* formula as --dist_shift_eta but simpler. Requires --kl_budget (uses default 32 if not set).")
+    parser.add_argument("--kl_budget", type=float, default=None, help="Total KL divergence budget δ for guidance. Per-dimension budget is δ / act_dim. Sets η = sqrt(2δ), enables V network and on-policy advantage EMA. Replaces --critic_normalization ema --tfg_eta. Default None (disabled).")
+    parser.add_argument("--kl_budget_per_dim", type=float, default=None, help="Per-dimension KL divergence budget δ_d for guidance. Total budget δ = δ_d * act_dim. Sets η = sqrt(2δ), enables V network and on-policy advantage EMA. Replaces --critic_normalization ema --tfg_eta. Default None (disabled).")
+    parser.add_argument("--dist_shift_eta", action="store_true", default=False, help="Adaptive η from distribution-shift second-order expansion. Trains D_ψ head on Q networks, maintains on-policy EMAs for m2, m3, covariance. Computes η* = -m2^(3/2)/(2γc + m3), capped by KL budget. Requires --kl_budget or --kl_budget_per_dim (defaults to --kl_budget_per_dim=5.33 if neither set).")
+    parser.add_argument("--one_step_dist_shift_eta", action="store_true", default=False, help="Adaptive η from second-order expansion using one-step Monte Carlo covariance estimate. No D_ψ head; estimates c from consecutive (A_t, A_{t+1}) pairs. Same η* formula as --dist_shift_eta but simpler. Requires --kl_budget or --kl_budget_per_dim (defaults to --kl_budget_per_dim=5.33 if neither set).")
+    parser.add_argument("--two_step_dist_shift_eta", action="store_true", default=False, help="Adaptive η from third-order expansion using two-step MC estimates. Cubic surrogate for expected improvement; solves 1+2s₂x+3s₃x²=0 for optimal x=η√v. Falls back to quadratic (one-step) then KL ceiling. Requires --kl_budget or --kl_budget_per_dim (defaults to --kl_budget_per_dim=5.33 if neither set).")
+    parser.add_argument("--direct_eta_coeff_ema", action="store_true", default=False, help="Alternative EMA parameterization for adaptive η: track B = EMA(2γc + κ₃) (the η²-coefficient) directly, instead of the dimensionless shape S = EMA((2γc+κ₃)/v^(3/2)). Quadratic step becomes η* = -V/B. Only affects the one-step quadratic path; ignored when --two_step_dist_shift_eta is on.")
+    parser.add_argument("--equal_episode_weighting", action="store_true", default=False, help="Weight episodes equally in TD learning (sample episode then transition within) and update on-policy EMAs with episode-averaged quantities at episode boundaries instead of per-step.")
+    parser.add_argument("--advantage_ema_tau", type=float, default=0.0005, help="Per-step EMA rate for advantage second/third moments. With --equal_episode_weighting, converted to per-episode rate via 1-(1-tau)^1000.")
+    parser.add_argument("--shape_ema_tau", type=float, default=0.0001, help="Per-step EMA rate for dimensionless shape s2. With --equal_episode_weighting, converted to per-episode rate via 1-(1-tau)^1000.")
+    parser.add_argument("--initial_advantage_second_moment_ema", type=float, default=1.0, help="Initial value for the advantage second moment EMA E[A^2].")
+    parser.add_argument("--initial_dist_shift_shape_ema", type=float, default=-1.0, help="Initial value for the dimensionless distribution-shift shape EMA s2 = (2γc + κ₃) / v^(3/2).")
+    parser.add_argument("--shape3_ema_tau", type=float, default=0.00005, help="Per-step EMA rate for third-order shape s3. With --equal_episode_weighting, converted to per-episode rate via 1-(1-tau)^1000.")
     parser.add_argument("--td_actions", type=int, default=1, help="Number of denoised next-actions to sample for TD target computation (mean Q over td_actions). Default 1.")
+    parser.add_argument("--td_value_training", action="store_true", default=False, help="Train V(s) with the same TD backup target as Q instead of soft regression on E[Q]. Adds a target V network with Polyak averaging (same tau as Q). Advantages use V_target: A = Q - V_target.")
     parser.add_argument("--tfg_patience", type=float, default=float("inf"), help="If finite, reduce tfg_eta when the logged episode_return has failed to improve for tfg_patience consecutive logged points at the current tfg_eta. Default inf disables the scheduler.")
     parser.add_argument("--tfg_reduction_factor", type=float, default=1.0, help="Multiplicative factor applied to tfg_eta when plateau patience is exceeded. Default 1.0 is a no-op.")
-    parser.add_argument("--x0_hat_clip_radius", type=float, default=float("inf"), help="Clipping radius r for Tweedie clean-action estimates x0_hat used inside guidance/Q evaluation. x0_hat is clipped to [-r, r] before being passed into Q / model-based objectives. Default 1.0 matches normalized action bounds.")
+    parser.add_argument("--x0_hat_clip_radius", type=float, default=float("inf"), help="Clipping radius r for Tweedie clean-action estimates x0_hat used inside guidance/Q evaluation. x0_hat is clipped to [-r, r] before being passed into Q / model-based objectives. Default inf (no clip); in non-latent mode the network-side denoising clip is separately hardcoded to 1.0 to match normalized action bounds.")
     parser.add_argument("--tfg_eta_schedule", type=str, default="constant", help="Schedule for guidance lambda vs noise level. 'constant': lambda_t=lambda. 'linear': linearly from lambda at t=0 to 0 at t=T. 'snr': lambda_t=lambda*alpha_bar_t (SNR-proportional), gives bounded c_t=lambda*(1-alpha_bar_t) and ~constant Hessian-term loss.")
     parser.add_argument("--fix_q_norm_bug", action="store_true", default=False, help="If set, use the corrected normalization (q_min - running_mean) / (running_std + eps) instead of the original buggy form.")
-    parser.add_argument("--q_critic_agg", type=str, default="min", help="Aggregation for twin Qs when used as a signal (tilting, reweighting): 'min', 'mean', 'max', 'random', 'entropic', or 'precision'. 'entropic' uses log(mean(exp(Q))), a soft-max. 'precision' uses inverse-variance-weighted mean (for distributional critics). TD targets always use 'min'.")
+    parser.add_argument("--q_critic_agg", type=str, default="min", help="Aggregation for twin Qs when used as a signal (tilting, reweighting): 'min', 'mean', 'max', 'random', 'entropic', 'precision', or 'vmap_mean_min'. 'entropic' uses log(mean(exp(Q))), a soft-max. 'precision' uses inverse-variance-weighted mean (for distributional critics). TD targets always use 'min'. 'vmap_mean_min' makes both the training-time Q signal and the sampling-time aggregator a per-slot blend (1-idx)*mean + idx*min selected by --q_critic_agg_idx / hp_pack 'q_critic_agg_idx'; idx=0 exactly matches 'mean' and idx=1 exactly matches 'min'.")
+    parser.add_argument("--q_critic_agg_idx", type=float, default=0.0, help="Per-slot vmappable selector active only when --q_critic_agg vmap_mean_min. 0.0 => Q-aggregation is mean everywhere it matters (training signal + sampling-time tilting + env-rollout action selection); 1.0 => min. Linear blend in between. Supplied per vmap slot via hp_pack['q_critic_agg_idx'].")
     parser.add_argument("--entropic_risk_beta", type=float, default=1.0, help="Temperature for entropic risk aggregation (only used with --q_critic_agg entropic). Aggregation is (1/beta)*log(mean(exp(beta*Q))). beta>0: risk-seeking/optimistic (beta->inf gives max). beta->0: risk-neutral (mean). beta<0: risk-averse/pessimistic (beta->-inf gives min). Default 1.0.")
     parser.add_argument("--particle_selection_lambda", type=float, default=float("inf"), help="Temperature for selecting an action among multiple particles using exp(particle_selection_lambda * Q(a)). Default inf reproduces argmax over Q.")
     parser.add_argument("--dpmd_recurrence_steps", type=int, default=0, help="Number of recurrence-style TFG inner steps per diffusion level for dpmd (0 disables recurrence).")
@@ -141,7 +158,11 @@ if __name__ == "__main__":
     parser.add_argument("--decorrelated_q_batches", action="store_true", default=False, help="If set, Q1 and Q2 see shuffled versions of the same batch, decorrelating their training data to maintain disagreement at large batch sizes.")
     parser.add_argument("--q_bootstrap_agg", type=str, default="min", choices=["min", "independent", "mean", "mixture", "pick_min"], help="Aggregation mode for Q TD targets. 'min' (default): both Qs bootstrap from min(Q1_target, Q2_target). 'independent': Q1 bootstraps from Q1_target, Q2 from Q2_target. 'mean': both Qs bootstrap from mean(Q1_target, Q2_target). 'mixture': both Qs bootstrap from mixture distribution of Q1 and Q2. 'pick_min': pick (mean,var) from whichever target critic has lower mean (DSAC-T style).")
     parser.add_argument("--langevin_q_noise", action="store_true", default=False, help="If set, add SGLD noise to Q gradients: grad += sqrt(2*lr_q/batch_size)*noise. This approximates posterior sampling over Q-functions (LSAC-style).")
+    parser.add_argument("--td_use_target_policy", action="store_true", default=False, help="If set, sample next-actions for TD backups from the target policy (Polyak-updated with --tau), matching the target-Q treatment. Default: online policy.")
+    parser.add_argument("--batch_independent_guidance", action="store_true", default=False, help="If set, use jnp.sum instead of jnp.mean inside the guided predictor's q_mean_from_x, so the per-sample Q gradient is independent of batch size (fixes the 1/B attenuation).")
+    parser.add_argument("--guidance_strength_multiplier", type=float, default=1.0, help="Constant multiplier applied to the guided-predictor Q scalar before jax.grad. Composes with --batch_independent_guidance.")
     parser.add_argument("--distributional_critic", action="store_true", default=False, help="If set, use a distributional Q critic that outputs (mean, variance) and is trained with cross-entropy loss instead of MSE.")
+    parser.add_argument("--entropic_critic_param", type=str, default="none", choices=["none", "u", "w"], help="Entropic/exponential-moment critic parameterization. 'none' (default): standard Q critic. 'u': network outputs u=eta*Q_eta, trained with pseudo-loss exp(t-u)-(t-u)-1; Bellman target t=eta*r+(1-d)*gamma*u_target. 'w': network outputs W directly, trained with MSE; Bellman target y=exp(eta*r)*clip(w_next,eps)^gamma. Both modes approximate discounted entropic-risk RL (not exact for gamma<1).")
     parser.add_argument("--critic_grad_modifier", type=str, default="none", choices=["none", "variance_scaled", "natgrad"], help="Distributional critic gradient modifier. 'none' (default): standard CE gradients. 'variance_scaled': multiply CE by stop_gradient(var) (legacy/halfway). 'natgrad': full natural gradient in (mean,var) coordinates. Only effective with --distributional_critic.")
     parser.add_argument("--natural_gradient_critic", action="store_true", default=False, help="Deprecated alias for --critic_grad_modifier natgrad. If set and --critic_grad_modifier is left at default, enables natgrad. Only effective with --distributional_critic.")
     # DSAC-T refinements (Distributional SAC with Three Refinements, arxiv.org/abs/2310.05858)
@@ -154,6 +175,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_q_mc_samples", type=int, default=8)
     parser.add_argument("--energy_multiplier", type=float, default=1.0, help="Multiplier for base energy/score during sampling. Values < 1 temper (flatten) the base distribution, increasing entropy. Guidance signal is NOT scaled. Default 1.0 (no tempering).")
     parser.add_argument("--policy_loss_type", type=str, default="eps_mse", choices=["eps_mse", "ula_kl", "guided_ula_kl", "e2e_guided_ula_kl"], help="Policy diffusion loss type. 'eps_mse': standard MSE on epsilon. 'ula_kl': ULA-step KL (eta_t/(1-abar) weighted epsilon MSE). 'guided_ula_kl': Hessian-weighted score MSE via M_t = I + c_t*H_Q where c_t = lambda*(1-abar)/abar. 'e2e_guided_ula_kl': end-to-end guided drift MSE (Q gradient flows through Tweedie estimate). All guided losses treat Q params and MALA step size as fixed.")
+    parser.add_argument("--policy_loss_reduction", type=str, default="mean", choices=["mean", "sum"], help="How to reduce the policy loss across action dimensions. 'mean': average over both batch and action dims (default). 'sum': sum over action dims, then mean over batch. 'sum' keeps loss scale proportional to act_dim and matches the VLB decomposition.")
 
     # Soft policy iteration
     parser.add_argument("--soft_pi_mode", action="store_true", default=False, help="Enable soft policy iteration: outer loop over policy improvement steps, each running iterations_per_pi_step iterations with frozen Q for guidance.")
@@ -340,16 +362,13 @@ if __name__ == "__main__":
     if args.alg == 'dpmd' and args.mala_steps > 0 and args.dpmd_recurrence_steps > 0:
         raise ValueError("For dpmd, --mala_steps and --dpmd_recurrence_steps cannot both be > 0.")
 
-    # --dist_shift_eta / --one_step_dist_shift_eta implies --kl_budget (default 32)
-    if args.dist_shift_eta and args.kl_budget is None:
-        args.kl_budget = 32.0
-    if args.one_step_dist_shift_eta and args.kl_budget is None:
-        args.kl_budget = 32.0
-
-    # --kl_budget implies EMA critic normalization and overrides tfg_eta
-    if args.kl_budget is not None:
-        args.critic_normalization = "ema"
-        args.tfg_eta = float((2.0 * args.kl_budget) ** 0.5)
+    # --dist_shift_eta / --one_step_dist_shift_eta implies a KL budget (default 5.33 per dim)
+    if args.dist_shift_eta and args.kl_budget is None and args.kl_budget_per_dim is None:
+        args.kl_budget_per_dim = 5.33
+    if args.one_step_dist_shift_eta and args.kl_budget is None and args.kl_budget_per_dim is None:
+        args.kl_budget_per_dim = 5.33
+    if args.two_step_dist_shift_eta and args.kl_budget is None and args.kl_budget_per_dim is None:
+        args.kl_budget_per_dim = 5.33
 
     # Hypergradient-based tuning currently relies on a held-out validation
     # split. Require validation to be enabled when hypergrad is requested.
@@ -374,25 +393,82 @@ if __name__ == "__main__":
         from jax import config
         config.update("jax_disable_jit", True)
 
+    def _derive_seeds(master: int):
+        """Map a master int seed to the tuple (env_seed, env_action_seed,
+        eval_env_seed, buffer_seed, init_network_seed, train_seed) that a
+        standalone run with --seed=master would use."""
+        rng, _ = seeding(int(master))
+        return tuple(int(x) for x in rng.integers(0, 2**32 - 1, 6))
+
     master_seed = args.seed
-    master_rng, _ = seeding(master_seed)
-    env_seed, env_action_seed, eval_env_seed, buffer_seed, init_network_seed, train_seed = map(
-        int, master_rng.integers(0, 2**32 - 1, 6)
-    )
+    env_seed, env_action_seed, eval_env_seed, buffer_seed, init_network_seed, train_seed = _derive_seeds(master_seed)
     init_network_key = jax.random.key(init_network_seed)
     train_key = jax.random.key(train_seed)
     del init_network_seed, train_seed
 
+    N_seeds = int(args.parallel_seeds)
+    if N_seeds > 1:
+        if args.alg != "dpmd":
+            raise ValueError("--parallel_seeds > 1 currently only supports --alg dpmd.")
+        if args.num_vec_envs <= 0:
+            raise ValueError("--parallel_seeds > 1 requires --num_vec_envs > 0.")
+
+    # Load the hp_pack once from whichever source is set; inline wins if both.
+    # Empty dict if neither is set (equivalent to no pack). Used below for
+    # per-entry master seeds AND the later _replace overrides on the vmap state.
+    def _load_hp_pack(a):
+        if a.hp_pack_inline is not None:
+            return json.loads(a.hp_pack_inline)
+        if a.hp_pack is not None:
+            with open(a.hp_pack) as f:
+                return json.load(f)
+        return None
+    _hp_loaded = _load_hp_pack(args)
+
+    # Optional per-vmap-entry master seeds from hp_pack["seed"]. When present,
+    # every seed site (buffer RNG, network init, env RNG, action-sample RNG) is
+    # derived from its entry's master, so the pack behaves exactly like running
+    # each --seed S_i standalone on its own GPU.
+    per_entry_masters = None
+    if N_seeds > 1 and _hp_loaded is not None:
+        _hp_peek = _hp_loaded
+        if "seed" in _hp_peek:
+            per_entry_masters = [int(s) for s in _hp_peek["seed"]]
+            if len(per_entry_masters) != N_seeds:
+                raise ValueError(
+                    f"--hp_pack 'seed' has length {len(per_entry_masters)}; "
+                    f"expected {N_seeds} (= --parallel_seeds)"
+                )
+    if per_entry_masters is not None:
+        _per_entry_derived = [_derive_seeds(m) for m in per_entry_masters]
+        per_entry_env_seeds = [t[0] for t in _per_entry_derived]
+        per_entry_action_seeds = [t[1] for t in _per_entry_derived]
+        per_entry_eval_env_seeds = [t[2] for t in _per_entry_derived]
+        per_entry_buffer_seeds = [t[3] for t in _per_entry_derived]
+        per_entry_init_network_seeds = [t[4] for t in _per_entry_derived]
+        per_entry_train_seeds = [t[5] for t in _per_entry_derived]
+    else:
+        per_entry_env_seeds = None
+        per_entry_action_seeds = None
+        per_entry_eval_env_seeds = None
+        per_entry_buffer_seeds = None
+        per_entry_init_network_seeds = None
+        per_entry_train_seeds = None
+
+    total_envs = args.num_vec_envs * max(1, N_seeds)
+
     if args.num_vec_envs > 0:
         env, obs_dim, act_dim = create_vector_env(
             args.env,
-            args.num_vec_envs,
+            total_envs,
             env_seed,
             env_action_seed,
             mode="futex",
             backend=args.backend,
             dummy_action_dim=args.dummy_action_dim,
             dummy_action_alpha=args.dummy_action_alpha,
+            per_entry_env_seeds=per_entry_env_seeds,
+            per_entry_action_seeds=per_entry_action_seeds,
         )
     else:
         env, obs_dim, act_dim = create_env(
@@ -405,12 +481,48 @@ if __name__ == "__main__":
         )
     eval_env = None
 
+    # Resolve KL budget: --kl_budget sets the total directly;
+    # --kl_budget_per_dim sets it as per_dim * act_dim.
+    if args.kl_budget is not None and args.kl_budget_per_dim is not None:
+        parser.error("--kl_budget and --kl_budget_per_dim are mutually exclusive")
+    if args.kl_budget_per_dim is not None:
+        args.kl_budget = args.kl_budget_per_dim * act_dim
+    if args.kl_budget is not None:
+        args.critic_normalization = "ema"
+        args.tfg_eta = float((2.0 * args.kl_budget) ** 0.5)
+
     hidden_sizes = [args.hidden_dim] * args.hidden_num
     diffusion_hidden_sizes = [args.diffusion_hidden_dim] * args.hidden_num
 
     # Use SARSA-style buffer (with next_action) when dpmd_off_policy_td is enabled
     include_next_action = getattr(args, 'dpmd_off_policy_td', False)
-    buffer = TreeBuffer.from_experience(obs_dim, act_dim, size=args.buffer_size, seed=buffer_seed, include_next_action=include_next_action)
+    if N_seeds > 1 and per_entry_buffer_seeds is not None:
+        # Per-entry master seeds override: buffer s uses the standalone
+        # buffer_seed that would come from hp_pack["seed"][s].
+        buffer = TreeBuffer.from_experience(obs_dim, act_dim, size=args.buffer_size,
+                                            seed=per_entry_buffer_seeds[0],
+                                            include_next_action=include_next_action)
+        buffers_list = [buffer] + [
+            TreeBuffer.from_experience(
+                obs_dim, act_dim, size=args.buffer_size,
+                seed=per_entry_buffer_seeds[s + 1], include_next_action=include_next_action,
+            )
+            for s in range(N_seeds - 1)
+        ]
+    else:
+        buffer = TreeBuffer.from_experience(obs_dim, act_dim, size=args.buffer_size,
+                                            seed=buffer_seed,
+                                            include_next_action=include_next_action)
+        if N_seeds > 1:
+            buffers_list = [buffer] + [
+                TreeBuffer.from_experience(
+                    obs_dim, act_dim, size=args.buffer_size,
+                    seed=buffer_seed + s + 1, include_next_action=include_next_action,
+                )
+                for s in range(N_seeds - 1)
+            ]
+        else:
+            buffers_list = None
 
     # Optional dedicated validation environment and buffer. When enabled via
     # use_validation and validation_ratio>0, we create an extra vector env for
@@ -431,6 +543,12 @@ if __name__ == "__main__":
         else:
             val_envs = max(1, int(round(train_envs * r / max(1e-8, 1.0 - r))))
 
+        if per_entry_env_seeds is not None:
+            _val_per_entry_env_seeds = [s + 1 for s in per_entry_env_seeds]
+            _val_per_entry_action_seeds = [s + 1 for s in per_entry_action_seeds]
+        else:
+            _val_per_entry_env_seeds = None
+            _val_per_entry_action_seeds = None
         val_env, _val_obs_dim, _val_act_dim = create_vector_env(
             args.env,
             val_envs,
@@ -438,6 +556,8 @@ if __name__ == "__main__":
             env_action_seed + 1,
             mode="futex",
             backend=args.backend,
+            per_entry_env_seeds=_val_per_entry_env_seeds,
+            per_entry_action_seeds=_val_per_entry_action_seeds,
         )
 
         val_buffer_size = max(1, int(args.buffer_size * r))
@@ -473,29 +593,45 @@ if __name__ == "__main__":
         def mish(x: jax.Array):
             return x * jnp.tanh(jax.nn.softplus(x))
 
-        agent, params = create_diffv2_net(
-            init_network_key,
-            obs_dim,
-            act_dim,
-            hidden_sizes,
-            diffusion_hidden_sizes,
-            mish,
-            num_timesteps=args.diffusion_steps,
-            num_particles=args.num_particles,
-            noise_scale=args.noise_scale,
-            beta_schedule_scale=args.beta_schedule_scale,
-            beta_schedule_type=args.beta_schedule_type,
-            energy_param=args.energy_param,
-            mala_steps=args.mala_steps,
-            single_q_network=args.single_q_network,
-            num_q_networks=args.num_q_networks,
-            x_recon_clip_radius=args.x0_hat_clip_radius if args.latent_action_space else 1.0,
-            gaussian_prior_baseline=args.gaussian_prior_baseline,
-            distributional_critic=args.distributional_critic,
-            snr_max=args.snr_max,
-            zero_init_q=args.zero_init_q,
-            dist_shift_eta=args.dist_shift_eta,
-        )
+        def _make_diffv2(net_key):
+            return create_diffv2_net(
+                net_key,
+                obs_dim,
+                act_dim,
+                hidden_sizes,
+                diffusion_hidden_sizes,
+                mish,
+                num_timesteps=args.diffusion_steps,
+                num_particles=args.num_particles,
+                noise_scale=args.noise_scale,
+                beta_schedule_scale=args.beta_schedule_scale,
+                beta_schedule_type=args.beta_schedule_type,
+                energy_param=args.energy_param,
+                mala_steps=args.mala_steps,
+                single_q_network=args.single_q_network,
+                num_q_networks=args.num_q_networks,
+                x_recon_clip_radius=args.x0_hat_clip_radius if args.latent_action_space else 1.0,
+                gaussian_prior_baseline=args.gaussian_prior_baseline,
+                distributional_critic=args.distributional_critic,
+                snr_max=args.snr_max,
+                zero_init_q=args.zero_init_q,
+                dist_shift_eta=args.dist_shift_eta,
+            )
+
+        if N_seeds > 1:
+            if per_entry_init_network_seeds is not None:
+                seed_init_keys = jnp.stack([
+                    jax.random.key(s) for s in per_entry_init_network_seeds
+                ])
+            else:
+                seed_init_keys = jax.random.split(init_network_key, N_seeds)
+            _pairs = [_make_diffv2(k) for k in seed_init_keys]
+            agent = _pairs[0][0]
+            dpmd_params_list = [p for (_a, p) in _pairs]
+            params = dpmd_params_list[0]
+        else:
+            agent, params = _make_diffv2(init_network_key)
+            dpmd_params_list = None
 
         algorithm = DPMD(
             agent,
@@ -517,6 +653,7 @@ if __name__ == "__main__":
             off_policy_td=args.dpmd_off_policy_td,
             no_entropy_tuning=args.dpmd_no_entropy_tuning,
             q_critic_agg=args.q_critic_agg,
+            q_critic_agg_idx=args.q_critic_agg_idx,
             fix_q_norm_bug=args.fix_q_norm_bug,
             tfg_eta=args.tfg_eta,
             tfg_eta_schedule=args.tfg_eta_schedule,
@@ -540,6 +677,9 @@ if __name__ == "__main__":
             q_bootstrap_agg=args.q_bootstrap_agg,
             entropic_risk_beta=args.entropic_risk_beta,
             langevin_q_noise=args.langevin_q_noise,
+            td_use_target_policy=args.td_use_target_policy,
+            batch_independent_guidance=args.batch_independent_guidance,
+            guidance_strength_multiplier=args.guidance_strength_multiplier,
             critic_grad_modifier=args.critic_grad_modifier,
             natural_gradient_critic=args.natural_gradient_critic,
             dsac_expected_value_sub=args.dsac_expected_value_sub,
@@ -549,6 +689,7 @@ if __name__ == "__main__":
             energy_multiplier=args.energy_multiplier,
             critic_normalization=args.critic_normalization,
             policy_loss_type=args.policy_loss_type,
+            policy_loss_reduction=args.policy_loss_reduction,
             soft_pi_mode=getattr(args, 'soft_pi_mode', False),
             optimizer_type=args.optimizer,
             weight_decay=args.weight_decay,
@@ -558,7 +699,76 @@ if __name__ == "__main__":
             kl_budget=args.kl_budget,
             dist_shift_eta=args.dist_shift_eta,
             one_step_dist_shift_eta=args.one_step_dist_shift_eta,
+            two_step_dist_shift_eta=args.two_step_dist_shift_eta,
+            direct_eta_coeff_ema=args.direct_eta_coeff_ema,
+            entropic_critic_param=args.entropic_critic_param,
+            advantage_ema_tau=args.advantage_ema_tau,
+            shape_ema_tau=args.shape_ema_tau,
+            initial_advantage_second_moment_ema=args.initial_advantage_second_moment_ema,
+            initial_dist_shift_shape_ema=args.initial_dist_shift_shape_ema,
+            td_value_training=args.td_value_training,
         )
+
+        if N_seeds > 1:
+            algorithm.state = algorithm.make_vmapped_state(dpmd_params_list)
+            if _hp_loaded is not None:
+                _hp = _hp_loaded
+                # Pack keys are argparse attribute names (what users see on the
+                # CLI). Translate the four keys whose Diffv2TrainState field
+                # names differ before calling state._replace.
+                _CLI_TO_FIELD = {
+                    "tau": "polyak_tau",
+                    "advantage_ema_tau": "adv_ema_tau",
+                    "guidance_strength_multiplier": "guidance_mult",
+                    "kl_budget": "kl_budget_val",
+                    "initial_advantage_second_moment_ema": "advantage_second_moment_ema",
+                    "initial_dist_shift_shape_ema": "dist_shift_shape_ema",
+                }
+                _allowed = {"lr_q", "lr_policy", "gamma", "tau", "advantage_ema_tau",
+                            "guidance_strength_multiplier", "shape_ema_tau", "kl_budget",
+                            "initial_advantage_second_moment_ema", "initial_dist_shift_shape_ema",
+                            "reward_scale", "x0_hat_clip_radius", "mala_adapt_rate",
+                            "q_td_huber_width", "shape3_ema_tau", "q_critic_agg_idx",
+                            "seed"}
+                _overrides = {}
+                for k, v in _hp.items():
+                    if k not in _allowed:
+                        raise ValueError(f"--hp_pack key '{k}' is not a per-seed vmappable hp. Allowed: {sorted(_allowed)}")
+                    if k == "seed":
+                        # Already consumed above to drive per-entry buffer and
+                        # network-init seeds; not a TrainState field.
+                        continue
+                    arr = jnp.asarray(v, dtype=jnp.float32)
+                    if arr.shape != (N_seeds,):
+                        raise ValueError(f"--hp_pack '{k}' has shape {arr.shape}; expected ({N_seeds},)")
+                    _overrides[_CLI_TO_FIELD.get(k, k)] = arr
+                if (
+                    "advantage_second_moment_ema" in _overrides
+                    or "dist_shift_shape_ema" in _overrides
+                ):
+                    adv2 = _overrides.get(
+                        "advantage_second_moment_ema",
+                        jnp.asarray(algorithm.state.advantage_second_moment_ema, dtype=jnp.float32),
+                    )
+                    shape = _overrides.get(
+                        "dist_shift_shape_ema",
+                        jnp.asarray(algorithm.state.dist_shift_shape_ema, dtype=jnp.float32),
+                    )
+                    _overrides["dist_shift_coeff_ema"] = shape * jnp.power(
+                        jnp.maximum(adv2, jnp.float32(0.0)),
+                        jnp.float32(1.5),
+                    )
+                if _overrides:
+                    algorithm.state = algorithm.state._replace(**_overrides)
+                    if "kl_budget_val" in _overrides:
+                        kl_budget_v = jnp.asarray(algorithm.state.kl_budget_val, dtype=jnp.float32)
+                        algorithm.state = algorithm.state._replace(
+                            tfg_eta=jnp.sqrt(jnp.maximum(jnp.float32(0.0), jnp.float32(2.0) * kl_budget_v))
+                        )
+                    print(f"[hp_pack] applied per-seed overrides: {list(_overrides.keys())}")
+                if per_entry_masters is not None:
+                    print(f"[hp_pack] applied per-entry master seeds "
+                          f"(buffers + init networks + train keys): {per_entry_masters}")
 
     elif args.alg == 'dpmd_bc':
         # DPMD variant with diffusion policy trained by plain behavior cloning
@@ -826,47 +1036,73 @@ if __name__ == "__main__":
     if hasattr(algorithm, "get_effective_hparams"):
         args_dict.update(algorithm.get_effective_hparams())
 
-    # Scale batch size for decorrelated Q batches: each Q should see batch_size transitions
-    effective_batch_size = args.batch_size * 2 if getattr(args, 'decorrelated_q_batches', False) else args.batch_size
+    if N_seeds > 1 and per_entry_train_seeds is not None:
+        train_key_vmap = jnp.stack([jax.random.key(s) for s in per_entry_train_seeds])
+    else:
+        train_key_vmap = train_key
 
-    trainer = OffPolicyTrainer(
-        env=env,
-        algorithm=algorithm,
-        buffer=buffer,
-        log_path=exp_dir,
-        batch_size=effective_batch_size,
-        val_batch_size=args.val_batch_size,
-        start_step=args.start_step,
-        total_step=args.total_step,
-        sample_per_iteration=1,
-        update_per_iteration=args.update_per_iteration,
-        evaluate_env=eval_env,
-        save_policy_every=int(args.total_step / 20),
-        save_value=save_value,
-        update_log_n_env_steps=5 if args.debug else 5000,
-        debug=args.debug,
-        timing_log_every=args.timing_log_every,
-        warmup_with="random",
-        hparams=args_dict,
-        use_validation=args.use_validation,
-        validation_size=args.validation_size,
-        use_hypergrad=args.use_hypergrad,
-        hypergrad_period=args.hypergrad_period,
-        val_env=val_env,
-        val_buffer=val_buffer,
-        validation_ratio=args.validation_ratio,
-        track_next_action=include_next_action,  # Enable SARSA-style buffer for off-policy TD
-        latent_action_space=args.latent_action_space,
-        latent_action_eps=args.latent_action_eps,
-        tfg_patience=args.tfg_patience,
-        tfg_reduction_factor=args.tfg_reduction_factor,
-        tfg_eta_start=args.tfg_eta,
-        tfg_eta_end=args.tfg_eta_end,
-        log_md_kl_every=args.log_md_kl_every,
-        soft_pi_mode=getattr(args, 'soft_pi_mode', False),
-        iterations_per_pi_step=getattr(args, 'iterations_per_pi_step', 100000),
-        num_pi_steps=getattr(args, 'num_pi_steps', 10),
-    )
+    if N_seeds > 1:
+        from relax.trainer.vmap_off_policy import VmapOffPolicyTrainer
+        trainer = VmapOffPolicyTrainer(
+            env=env,
+            algorithm=algorithm,
+            buffers=buffers_list,
+            log_path=exp_dir,
+            parallel_seeds=N_seeds,
+            per_seed_envs=args.num_vec_envs,
+            batch_size=args.batch_size,
+            start_step=args.start_step,
+            total_step=args.total_step,
+            update_per_iteration=args.update_per_iteration,
+            update_log_n_env_steps=5 if args.debug else 5000,
+            hparams=args_dict,
+            hp_pack_path=args.hp_pack,
+            hp_pack_dict=_hp_loaded,
+            sweep_id=args.sweep_id,
+            config_tag_keys=args.config_tag_keys,
+        )
+        trainer.setup(Experience.create_example(obs_dim, act_dim, trainer.batch_size, include_next_action=include_next_action))
+        trainer.run(train_key_vmap)
+    else:
+        trainer = OffPolicyTrainer(
+            env=env,
+            algorithm=algorithm,
+            buffer=buffer,
+            log_path=exp_dir,
+            batch_size=args.batch_size,
+            val_batch_size=args.val_batch_size,
+            start_step=args.start_step,
+            total_step=args.total_step,
+            sample_per_iteration=1,
+            update_per_iteration=args.update_per_iteration,
+            evaluate_env=eval_env,
+            save_policy_every=int(args.total_step / 20),
+            save_value=save_value,
+            update_log_n_env_steps=5 if args.debug else 5000,
+            debug=args.debug,
+            timing_log_every=args.timing_log_every,
+            warmup_with="random",
+            hparams=args_dict,
+            use_validation=args.use_validation,
+            validation_size=args.validation_size,
+            use_hypergrad=args.use_hypergrad,
+            hypergrad_period=args.hypergrad_period,
+            val_env=val_env,
+            val_buffer=val_buffer,
+            validation_ratio=args.validation_ratio,
+            track_next_action=include_next_action,  # Enable SARSA-style buffer for off-policy TD
+            latent_action_space=args.latent_action_space,
+            latent_action_eps=args.latent_action_eps,
+            tfg_patience=args.tfg_patience,
+            tfg_reduction_factor=args.tfg_reduction_factor,
+            tfg_eta_start=args.tfg_eta,
+            tfg_eta_end=args.tfg_eta_end,
+            log_md_kl_every=args.log_md_kl_every,
+            soft_pi_mode=getattr(args, 'soft_pi_mode', False),
+            iterations_per_pi_step=getattr(args, 'iterations_per_pi_step', 100000),
+            num_pi_steps=getattr(args, 'num_pi_steps', 10),
+            equal_episode_weighting=args.equal_episode_weighting,
+        )
 
-    trainer.setup(Experience.create_example(obs_dim, act_dim, trainer.batch_size, include_next_action=include_next_action))
-    trainer.run(train_key)
+        trainer.setup(Experience.create_example(obs_dim, act_dim, trainer.batch_size, include_next_action=include_next_action))
+        trainer.run(train_key)

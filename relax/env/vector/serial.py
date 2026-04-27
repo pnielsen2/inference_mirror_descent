@@ -7,7 +7,8 @@ from relax.env.vector.base import VectorEnv
 
 
 class SerialVectorEnv(VectorEnv):
-    def __init__(self, name: str, num_envs: int, seed: int):
+    def __init__(self, name: str, num_envs: int, seed: int,
+                 *, seeds_override: Optional[list] = None):
         assert num_envs > 0
 
         self.num_envs = num_envs
@@ -46,7 +47,11 @@ class SerialVectorEnv(VectorEnv):
         self._termination = np.zeros((self.num_envs,), dtype=np.bool_)
         self._truncation = np.zeros((self.num_envs,), dtype=np.bool_)
 
-        if num_envs > 1:
+        if seeds_override is not None:
+            assert len(seeds_override) == num_envs, \
+                f"seeds_override length {len(seeds_override)} != num_envs {num_envs}"
+            seeds = [int(s) for s in seeds_override]
+        elif num_envs > 1:
             rng = np.random.default_rng(seed)
             seeds = rng.integers(0, 2**32 - 1, self.num_envs).tolist()
         else:
