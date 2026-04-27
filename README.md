@@ -1,4 +1,4 @@
-# Efficient Online Reinforcement Learning for Diffusion Policies
+# MALA-Guided Mirror Descent
 
 This repository contains the current JAX/Haiku training code for our diffusion-policy RL experiments.
 
