@@ -15,7 +15,6 @@ TARGET_ARGS = {
     "alg": "dpmd",
     "env": "HalfCheetah-v4",
     "dpmd_constant_weight": True,
-    "num_particles": 1,
     "mala_steps": 2,
     "q_critic_agg": "mean",
     "beta_schedule_type": "cosine",

@@ -1,1 +1,1 @@
-from relax.trainer.off_policy import OffPolicyTrainer as OffPolicyTrainer
+from relax.trainer.vmap_off_policy import VmapOffPolicyTrainer as VmapOffPolicyTrainer

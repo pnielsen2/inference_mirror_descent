@@ -81,3 +81,8 @@ paper/icml2026-official/
 # - paper/WORKFLOW.md (AI agent instructions)
 # - paper/SUBMISSION_CHECKLIST.md (compliance tracking)
 # - paper/icml2026-official/ (reference only, do not edit)
+
+# Heavy untracked data (added during reorg)
+runs/
+sweeps/
+figures/

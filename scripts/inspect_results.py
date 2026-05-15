@@ -112,8 +112,6 @@ def load_best_results(pattern, env_name, show_df=False,
 if __name__ == "__main__":
     # patterns_dict = {
     #     'sampling_ema': r".*diffv2.*01.*diffv2_sampling_with_ema$",
-    #     # 'qsm': r".*qsm.*01.*atp1$",
-    #     # 'sac': r".*sac.*01.*atp1$"
     # }
     # plot_mean(patterns_dict, 'Ant-v4')
     pass

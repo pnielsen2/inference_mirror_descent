@@ -109,8 +109,8 @@ class ThompsonState:
     min_seeds_for_promotion: int = 4
     
     # SLURM settings
-    partition: str = "kempner_h100"
-    gpu_type: str = "nvidia_h100"
+    partition: str = "seas_gpu"
+    gpu_type: str = "nvidia_h200"
     num_gpus: int = 1
     cpus: int = 2
     mem: str = "32G"
@@ -1244,8 +1244,10 @@ def main():
                         help="Check status of a sweep")
     
     # SLURM options
-    parser.add_argument("--partition", "-p", type=str, default="kempner_h100")
-    parser.add_argument("--gpu-type", type=str, default="nvidia_h100")
+    parser.add_argument("--kempner", action="store_true",
+                        help="Use Kempner cluster (kempner_h100 partition, H100 GPUs)")
+    parser.add_argument("--partition", "-p", type=str, default=None)
+    parser.add_argument("--gpu-type", type=str, default=None)
     parser.add_argument("--num-gpus", type=int, default=1)
     parser.add_argument("--cpus", "-c", type=int, default=2)
     parser.add_argument("--mem", type=str, default="32G")
@@ -1256,7 +1258,13 @@ def main():
                         help="Don't use W&B for result extraction")
     
     args = parser.parse_args()
-    
+    if args.kempner:
+        args.partition = args.partition or "kempner_h100"
+        args.gpu_type = args.gpu_type or "nvidia_h100"
+    else:
+        args.partition = args.partition or "seas_gpu"
+        args.gpu_type = args.gpu_type or "nvidia_h200"
+
     # Register signal handler for Ctrl+C
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)

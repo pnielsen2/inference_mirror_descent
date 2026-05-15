@@ -22,16 +22,9 @@ CONFIGS = {
         "alg": "dpmd",
         "dpmd_constant_weight": True,
         "dpmd_no_entropy_tuning": True,
-        "num_particles": 1,
         "tfg_eta": 16.0,
         "mala_steps": 2,
         "buffer_size": 200000,
-    },
-    "Best-of-N BC (128 particles)": {
-        "alg": "dpmd",
-        "dpmd_constant_weight": True,
-        "num_particles": 128,
-        "particle_selection_lambda": 64,
     },
     "MB-PC (determ. dyn)": {
         "alg": "dpmd_mb_pc",
@@ -83,16 +76,10 @@ def identify_config(run_config: dict) -> str:
             return "DPMD baseline (long LR)"
         
         if (run_config.get("dpmd_constant_weight") and 
-            run_config.get("num_particles") == 1 and
             run_config.get("dpmd_no_entropy_tuning") and
             abs(run_config.get("tfg_eta", 0) - 16.0) < 0.1 and
             run_config.get("mala_steps") == 2):
             return "MALA-guided (const. weight)"
-        
-        if (run_config.get("dpmd_constant_weight") and 
-            run_config.get("num_particles") == 128 and
-            run_config.get("particle_selection_lambda") == 64):
-            return "Boltzmann selection (N=128)"
     
     elif alg == "dpmd_mb_pc":
         pc_det = run_config.get("pc_deterministic_dyn", False)
