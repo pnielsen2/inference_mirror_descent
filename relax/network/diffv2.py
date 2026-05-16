@@ -23,7 +23,6 @@ class Diffv2Net:
     beta_schedule_type: str = 'linear'
     x_recon_clip_radius: Optional[float] = 1.0
     snr_max: float = 124.0
-    energy_mode: bool = True
     energy_fn: Optional[Callable[[hk.Params, jax.Array, jax.Array, jax.Array], jax.Array]] = None
     mala_steps: int = 1
 
@@ -53,11 +52,6 @@ def create_diffv2_net(
 ) -> Tuple[Diffv2Net, Diffv2Params]:
     q_net = hk.without_apply_rng(hk.transform(lambda obs, act: QNet(hidden_sizes, activation)(obs, act)))
 
-    def q_apply(params, obs, act):
-        return q_net.apply(params, obs, act)
-
-    q = q_net
-
     policy = hk.without_apply_rng(
         hk.transform(
             lambda obs, act, t, h: EnergyPolicyNet(diffusion_hidden_sizes, activation)(
@@ -84,7 +78,7 @@ def create_diffv2_net(
         policy_key = keys[-1]
         q_params_list = []
         for i in range(num_q):
-            q_params_list.append(q.init(keys[i], obs, act))
+            q_params_list.append(q_net.init(keys[i], obs, act))
         q_params = tuple(q_params_list)
         target_q_params = tuple(jax.tree.map(lambda x: x, qp) for qp in q_params)
         policy_params = policy.init(policy_key, obs, act, 0, jnp.zeros((1,), dtype=jnp.float32))
@@ -95,7 +89,7 @@ def create_diffv2_net(
     params = init(key, sample_obs, sample_act)
 
     net = Diffv2Net(
-        q=q_apply,
+        q=q_net.apply,
         policy=policy_apply,
         num_timesteps=num_timesteps,
         act_dim=act_dim,
@@ -103,7 +97,6 @@ def create_diffv2_net(
         beta_schedule_type=beta_schedule_type,
         x_recon_clip_radius=x_recon_clip_radius,
         snr_max=snr_max,
-        energy_mode=True,
         energy_fn=energy_apply,
         mala_steps=mala_steps,
     )

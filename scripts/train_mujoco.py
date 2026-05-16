@@ -48,7 +48,7 @@ if __name__ == "__main__":
     params = dpmd_params_list[0]
 
     cfg = DPMDConfig.from_args(args)
-    algorithm = DPMD(agent, params, cfg)
+    algorithm = DPMD(agent, params, cfg, obs_dim=obs_dim, hidden_dim=args.hidden_dim)
 
     algorithm.state = algorithm.make_vmapped_state(dpmd_params_list)
     if _hp_loaded is not None:

@@ -108,7 +108,6 @@ class DPMDConfig:
     batch_independent_guidance: bool = False
     guidance_strength_multiplier: float = 1.0
     energy_multiplier: float = 1.0
-    critic_normalization: str = "none"
     advantage_ema_tau: float = 0.0005
     shape_ema_tau: float = 0.0001
     initial_advantage_second_moment_ema: float = 1.0
@@ -142,7 +141,6 @@ class DPMDConfig:
             batch_independent_guidance=args.batch_independent_guidance,
             guidance_strength_multiplier=args.guidance_strength_multiplier,
             energy_multiplier=args.energy_multiplier,
-            critic_normalization=args.critic_normalization,
             advantage_ema_tau=args.advantage_ema_tau,
             shape_ema_tau=args.shape_ema_tau,
             initial_advantage_second_moment_ema=args.initial_advantage_second_moment_ema,

@@ -1,7 +1,6 @@
-"""V(s) network used by ``critic_normalization='ema'`` / KL-budget mode.
+"""V(s) network used in KL-budget / on-policy-EMA mode.
 
-Owns the haiku-transformed value network, the inferred ``obs_dim`` (sniffed
-from the Q net's first linear weight), and three small utilities used by
+Owns the haiku-transformed value network and three small utilities used by
 DPMD:
 
 * ``init_params(key)`` / ``init_opt_state(params)`` for vmap-mode setup.
@@ -27,26 +26,6 @@ import optax
 from relax.network.blocks import ValueNet
 
 
-def _sniff_obs_and_hidden(q_params_first, act_dim: int):
-    """Infer (obs_dim, hidden_dim) from the first Q-net linear weight.
-
-    Haiku FlatMaps use slash-separated keys like 'q_net/linear',
-    'q_net/linear_1', ...; we match exactly the one ending in '/linear' (the
-    input layer). Falls back to a MuJoCo-ish (17, 256) when the layout is
-    unrecognized so that initialization never crashes.
-    """
-    first_w = None
-    for k, v in q_params_first.items():
-        if k.endswith('/linear') and isinstance(v, dict) and 'w' in v:
-            w = v['w']
-            if hasattr(w, 'shape'):
-                first_w = w
-                break
-    if first_w is not None:
-        return first_w.shape[0] - act_dim, first_w.shape[1]
-    return 17, 256
-
-
 @dataclass
 class ValueHead:
     obs_dim: int
@@ -55,8 +34,7 @@ class ValueHead:
     _apply_vmap_jit: Optional[object] = None  # set lazily
 
     @classmethod
-    def from_q_params(cls, q_params_first, act_dim: int) -> "ValueHead":
-        obs_dim, hidden_dim = _sniff_obs_and_hidden(q_params_first, act_dim)
+    def create(cls, obs_dim: int, hidden_dim: int) -> "ValueHead":
         value_net = hk.without_apply_rng(
             hk.transform(lambda obs: ValueNet(
                 hidden_sizes=(hidden_dim, hidden_dim, hidden_dim),

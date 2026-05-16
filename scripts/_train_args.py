@@ -43,9 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--snr_max", type=float, default=124.0, help="Maximum SNR (at cleanest noise level). Controls alpha_bar_0 = snr_max/(1+snr_max). Default 124.0 matches the cosine schedule with s=0.008 offset at T=20. All schedule types use this to set the same clean endpoint, so you can switch between cosine/constant_kl/linear while keeping the noise range comparable.")
     parser.add_argument("--reward_scale", type=float, default=0.2, help="Scale factor applied to rewards before Q/value learning. Default 0.2 matches original DPMD. Set to 1.0 for clarity when using inference-time guidance (adjust tfg_eta accordingly).")
     parser.add_argument("--tfg_eta", type=float, default=0.0, help="Guidance strength lambda for dpmd training-free Q-guidance. If 0, no Q-guidance is applied.")
-    parser.add_argument("--critic_normalization", type=str, default="none", choices=["none", "ema"], help="Normalization mode for Q guidance. 'none': use raw Q. 'ema': train V(s) to predict E[Q], normalize (Q-V) by sqrt(EMA[A^2]).")
-    parser.add_argument("--kl_budget", type=float, default=None, help="Total KL divergence budget δ for guidance. Per-dimension budget is δ / act_dim. Sets η = sqrt(2δ), enables V network and on-policy advantage EMA. Replaces --critic_normalization ema --tfg_eta. Default None (disabled).")
-    parser.add_argument("--kl_budget_per_dim", type=float, default=None, help="Per-dimension KL divergence budget δ_d for guidance. Total budget δ = δ_d * act_dim. Sets η = sqrt(2δ), enables V network and on-policy advantage EMA. Replaces --critic_normalization ema --tfg_eta. Default None (disabled).")
+    parser.add_argument("--kl_budget", type=float, default=None, help="Total KL divergence budget δ for guidance. Per-dimension budget is δ / act_dim. Sets η = sqrt(2δ), enables V network and on-policy advantage EMA. Default None (disabled).")
+    parser.add_argument("--kl_budget_per_dim", type=float, default=None, help="Per-dimension KL divergence budget δ_d for guidance. Total budget δ = δ_d * act_dim. Sets η = sqrt(2δ), enables V network and on-policy advantage EMA. Default None (disabled).")
     parser.add_argument("--one_step_dist_shift_eta", action="store_true", default=False, help="Adaptive η from second-order expansion using one-step Monte Carlo covariance estimate. No D_ψ head; estimates c from consecutive (A_t, A_{t+1}) pairs. Requires --kl_budget or --kl_budget_per_dim (defaults to --kl_budget_per_dim=5.33 if neither set).")
     parser.add_argument("--advantage_ema_tau", type=float, default=0.0005, help="Per-step EMA rate for advantage second/third moments.")
     parser.add_argument("--shape_ema_tau", type=float, default=0.0001, help="Per-step EMA rate for dimensionless shape s2.")
@@ -103,15 +102,4 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
         parser.error(
             "simplify_walkthrough requires --mala_steps > 0; the non-MALA "
             "sampling branches have been removed."
-        )
-    # ``--critic_normalization ema`` only makes sense paired with a KL budget;
-    # the legacy off-policy V branch (V trained on Q(s, a_replay)) is gone.
-    # Note: train_mujoco.py auto-promotes ``--kl_budget`` (or
-    # ``--kl_budget_per_dim``) to ``--critic_normalization ema``, so this
-    # check fires only when the user passes ``--critic_normalization ema``
-    # explicitly without a budget.
-    if args.critic_normalization == "ema" and args.kl_budget is None and args.kl_budget_per_dim is None:
-        parser.error(
-            "--critic_normalization ema requires --kl_budget or "
-            "--kl_budget_per_dim in simplify_walkthrough."
         )

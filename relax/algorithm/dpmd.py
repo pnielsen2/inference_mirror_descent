@@ -30,9 +30,12 @@ from relax.utils.typing_utils import Metric
 
 class DPMD(Algorithm):
 
-    def __init__(self, agent: Diffv2Net, params: Diffv2Params, cfg: DPMDConfig):
+    def __init__(self, agent: Diffv2Net, params: Diffv2Params, cfg: DPMDConfig,
+                 *, obs_dim: int, hidden_dim: int):
         self.agent = agent
         self.cfg = cfg
+        self._obs_dim = int(obs_dim)
+        self._hidden_dim = int(hidden_dim)
         # Expose every cfg field as a direct attribute on self so existing
         # ``self.X`` / ``algorithm.X`` references keep working.
         for _f in fields(DPMDConfig):
@@ -44,7 +47,7 @@ class DPMD(Algorithm):
         self.optim = optax.scale_by_adam()
         self.policy_optim = optax.scale_by_adam()
 
-        # --- Optional V(s) network for normalized-advantage guidance (critic_normalization='ema'). ---
+        # --- Optional V(s) network for normalized-advantage guidance (KL-budget / on-policy-EMA mode). ---
         value_params_init, value_opt_state_init = self._setup_value_network(params)
 
         self._timesteps = int(self.agent.num_timesteps)
@@ -63,7 +66,12 @@ class DPMD(Algorithm):
         # Bit-identical to the legacy in-line nested closures.
         sampler = self._build_mala_sampler()
         updater = self._build_update_step(sampler)
-        env_sampler = self._build_env_sampler(sampler)
+        # Rollout sampler: bind the configured ``--q_critic_agg`` aggregation
+        # and let the JIT'd entry return the full ``MalaSampleResult``; the
+        # host-side ``get_action_vmap`` then accesses ``.action`` / ``.q`` /
+        # ``.log_eta_scales`` on the resulting namedtuple.
+        agg_critic = lambda qm: _aggregate_q(qm, self.q_critic_agg)
+        env_sampler = lambda key, state, obs: sampler(key, state, obs, agg_critic)
         self._implement_common_behavior(updater, env_sampler)
 
     def _build_update_step(self, sampler):
@@ -184,18 +192,16 @@ class DPMD(Algorithm):
             }
 
             # V_MSE: only when V network exists
-            if self.critic_normalization != "none" and state.value_params is not None:
+            if self.on_policy_ema and state.value_params is not None:
                 info["losses/V_MSE"] = value_loss_log
 
             # --- MALA per-level arrays (logged as wandb.Table line plots) ---
-            # Only include when MALA sampling actually runs (otherwise arrays are NaN)
-            if self.agent.energy_mode and self.agent.mala_steps > 0:
-                info["MALA/acceptance_rate"] = mala_result.per_level_acc
-                info["MALA/clip_frac"] = mala_result.per_level_clip
-                info["MALA/eta_scale"] = jnp.exp(log_eta_scales)
+            info["MALA/acceptance_rate"] = mala_result.per_level_acc
+            info["MALA/clip_frac"] = mala_result.per_level_clip
+            info["MALA/eta_scale"] = jnp.exp(log_eta_scales)
 
             # --- Q section ---
-            if self.critic_normalization == "ema":
+            if self.on_policy_ema:
                 info["Critic/inv_sqrt(E(Var(Q))_ema)"] = jnp.float32(1.0) / jnp.sqrt(jnp.maximum(new_adv_second_moment_ema, jnp.float32(1e-6)))
             return state, info
 
@@ -280,49 +286,25 @@ class DPMD(Algorithm):
             timesteps=self._timesteps,
             energy_multiplier=self.energy_multiplier,
             batch_independent_guidance=self.batch_independent_guidance,
-            critic_normalization=self.critic_normalization,
             mala_guided_predictor=self.mala_guided_predictor,
             mala_no_predictor=self.mala_no_predictor,
         )
 
-    def _build_env_sampler(self, sampler):
-        """Return the ``stateless_get_action_env(key, state, obs)`` closure
-        used by the rollout path. Wraps ``sampler`` with the configured
-        ``--q_critic_agg`` aggregation and unpacks ``MalaSampleResult`` to
-        the ``(action, q, log_eta_scales)`` triple expected by
-        ``Algorithm._get_action_vmap_fn``.
-        """
-        agg_critic = lambda qm: _aggregate_q(qm, self.q_critic_agg)
-
-        def stateless_get_action_env(
-            key: jax.Array,
-            state: Diffv2TrainState,
-            obs: jax.Array,
-        ):
-            r = sampler(key, state, obs, agg_critic)
-            return r.action, r.q, r.log_eta_scales
-
-        return stateless_get_action_env
-
     def get_action_vmap(self, key: jax.Array, obs: np.ndarray):
-        """Vmapped counterpart of get_action. 
+        """Vmapped counterpart of get_action.
 
         obs: numpy array of shape [N, num_envs, obs_dim].
         Returns (action [N, num_envs, act_dim], q_per_env [N, num_envs],
         v_per_env [N, num_envs]).
         """
         self._ensure_vmap_compiled()
-        params = self.get_rollout_params()
-        out = self._get_action_vmap_fn(key, params, obs)
-        if not (isinstance(out, tuple) and len(out) == 3):
-            raise RuntimeError(
-                f"Vmap get_action: expected (action, q, log_eta_scales); got {type(out)}"
-            )
-        action, q, log_eta_scales = out
+        # ``stateless_*`` sampler/update fns take the full Diffv2TrainState;
+        # JAX prunes unused leaves at trace time.
+        result = self._get_action_vmap_fn(key, self.state, obs)
         # log_eta_scales: shape [N, timesteps] — matches stacked state layout.
-        self.state = self.state._replace(log_eta_scales=log_eta_scales)
-        action_np = np.asarray(action)
-        q_per_env = np.asarray(q)  # [N, num_envs]
+        self.state = self.state._replace(log_eta_scales=result.log_eta_scales)
+        action_np = np.asarray(result.action)
+        q_per_env = np.asarray(result.q)  # [N, num_envs]
 
         if not self.on_policy_ema:
             return action_np, q_per_env, None
@@ -331,25 +313,20 @@ class DPMD(Algorithm):
         v_per_env = np.asarray(v)  # [N, num_envs]
         return action_np, q_per_env, v_per_env
 
-    def get_rollout_params(self):
-        # All stateless_* sampler/update functions take the full Diffv2TrainState;
-        # JAX prunes unused leaves at trace time.
-        return self.state
-
     def _setup_value_network(self, params):
-        """Construct the V(s) network used by critic_normalization='ema'
-        (KL-budget / on-policy-EMA mode). Returns (value_params, value_opt_state)
-        or (None, None) when V is not used.
+        """Construct the V(s) network used by KL-budget / on-policy-EMA mode.
+        Returns (value_params, value_opt_state) or (None, None) when V is not
+        used.
 
-        The actual V-net plumbing (obs-dim sniff, init, apply, vmap-apply,
-        TD update step) lives in :class:`relax.algorithm.value_head.ValueHead`;
-        we just construct it here.
+        The actual V-net plumbing (init, apply, vmap-apply, TD update step)
+        lives in :class:`relax.algorithm.value_head.ValueHead`; we just
+        construct it here.
         """
-        if self.critic_normalization != "ema":
+        if not self.on_policy_ema:
             self.value_head = None
             return None, None
 
-        self.value_head = ValueHead.from_q_params(params.q[0], self.agent.act_dim)
+        self.value_head = ValueHead.create(self._obs_dim, self._hidden_dim)
         value_params_init = self.value_head.init_params(jax.random.PRNGKey(42))
         value_opt_state_init = self.value_head.init_opt_state(value_params_init, self.optim)
         return value_params_init, value_opt_state_init

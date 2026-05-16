@@ -14,7 +14,7 @@ Layout (Option B):
   * Each seed has its own wandb run and its own SampleLog.
 """
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import jax
 import jax.numpy as jnp
@@ -30,24 +30,6 @@ from relax.trainer.accumulator import Interval, SampleLog, UpdateLog
 from relax.trainer.sample_metrics import SampleMetricsRecorder
 from relax.trainer.wandb_logging import WandbMultiSeedLogger, build_config_tag  # noqa: F401  (build_config_tag re-exported for analysis scripts)
 from relax.utils.experience import Experience
-
-
-def _detect_env_can_terminate(env_name: str) -> bool:
-    try:
-        import gymnasium
-        probe = gymnasium.make(env_name)
-        inner = probe.unwrapped
-        can = getattr(inner, "_terminate_when_unhealthy", None)
-        probe.close()
-        if can is not None:
-            return bool(can)
-        import inspect
-        src = inspect.getsource(inner.step)
-        if "return observation, reward, False, False" in src:
-            return False
-        return True
-    except Exception:
-        return True
 
 
 class VmapOffPolicyTrainer:
@@ -121,6 +103,24 @@ class VmapOffPolicyTrainer:
         if _gamma.ndim == 0:
             _gamma = np.broadcast_to(_gamma, (self.N,)).astype(np.float64)
         _q_label = "Q"
+
+        def _detect_env_can_terminate(env_name: str) -> bool:
+            try:
+                import gymnasium
+                probe = gymnasium.make(env_name)
+                inner = probe.unwrapped
+                can = getattr(inner, "_terminate_when_unhealthy", None)
+                probe.close()
+                if can is not None:
+                    return bool(can)
+                import inspect
+                src = inspect.getsource(inner.step)
+                if "return observation, reward, False, False" in src:
+                    return False
+                return True
+            except Exception:
+                return True
+
         _can_terminate = _detect_env_can_terminate(self.env_name)
         self.sample_logs = [
             SampleLog(
@@ -167,11 +167,6 @@ class VmapOffPolicyTrainer:
             self._on_policy_ema_update = self._ema_update_one_step
         else:
             self._on_policy_ema_update = self._ema_update_kl_only
-
-    def _iter_keys(self, key: jax.Array, step: int) -> Tuple[jax.Array, jax.Array]:
-        seed_keys = jax.vmap(lambda k: jax.random.fold_in(k, step))(key)
-        split_keys = jax.vmap(lambda k: jax.random.split(k, 2))(seed_keys)
-        return split_keys[:, 0], split_keys[:, 1]
 
     # ------------------------------------------------------------------
     # Setup
@@ -338,7 +333,10 @@ class VmapOffPolicyTrainer:
 
     def _train_standard(self, key: jax.Array, obs):
         while self.sample_logs[0].sample_step <= self.total_step:
-            sample_key, update_key = self._iter_keys(key, self.sample_logs[0].sample_step)
+            step = self.sample_logs[0].sample_step
+            seed_keys = jax.vmap(lambda k: jax.random.fold_in(k, step))(key)
+            split_keys = jax.vmap(lambda k: jax.random.split(k, 2))(seed_keys)
+            sample_key, update_key = split_keys[:, 0], split_keys[:, 1]
             obs = self.sample(sample_key, obs)
             if self.update_per_iteration > 1:
                 update_keys = jax.vmap(

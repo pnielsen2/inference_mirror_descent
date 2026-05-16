@@ -6,7 +6,7 @@ One full pass of the sampler:
     1. ``mala_steps`` MALA correction steps targeting
        ``E_total(t, x) = energy_multiplier * E_θ(s, x, t) - tfg_eta * Q_agg(s, x_0_hat)``.
        (Q_agg is omitted when ``tfg_eta == 0`` so the eta-sweep
-       ``critic_normalization='none'`` runs are unbiased.)
+       no-budget runs are unbiased.)
     2. A deterministic DDIM-style predictor step (``--ddim_predictor`` is
        hardcoded on; the original stochastic-DDPM noise term was removed
        because MALA already injects noise). Skipped when
@@ -31,11 +31,10 @@ from relax.network.diffv2 import Diffv2Net
 def build_mala_sampler(
     *,
     agent: Diffv2Net,
-    value_head,                    # ValueHead | None — used iff critic_normalization == "ema"
+    value_head,                    # ValueHead | None — supplied iff on-policy-EMA / KL-budget mode
     timesteps: int,
     energy_multiplier: float,
     batch_independent_guidance: bool,
-    critic_normalization: str,
     mala_guided_predictor: bool,
     mala_no_predictor: bool,
 ) -> Callable:
@@ -97,8 +96,8 @@ def build_mala_sampler(
             agg_fn = jnp.sum if batch_independent_guidance else jnp.mean
             mult = guidance_mult_hp
 
-            # Critic normalization: use (Q - V) / std instead of Q
-            if critic_normalization == "ema" and value_params is not None:
+            # On-policy-EMA / KL-budget mode: normalize advantage (Q - V) / std.
+            if value_head is not None and value_params is not None:
                 v = value_head.apply(value_params, obs_batch)
                 advantage = q - v
                 adv_std = jnp.sqrt(jnp.maximum(adv_second_moment_ema, jnp.float32(1e-6)))
@@ -106,6 +105,13 @@ def build_mala_sampler(
             return mult * agg_fn(q)
 
         def grad_guidance(x_in, t_idx):
+            # NOTE: keep the ``lax.cond(tfg_eta_current > 0.0, ...)`` wrapper.
+            # When ``tfg_eta_current == 0`` the unguided branch is a constant
+            # zero, but with ``tfg_eta_current > 0`` (the case for all current
+            # KL-budget / eta-sweep runs) the cond is still load-bearing for
+            # bit-exactness: removing it lets XLA fuse ``jax.grad(q_mean_from_x)``
+            # into the surrounding region differently, which flips the last
+            # ULPs of MALA-energy reductions and breaks the bit-exact baseline.
             def guided(_):
                 return jax.grad(lambda xx: q_mean_from_x(xx, t_idx))(x_in)
 
@@ -115,6 +121,12 @@ def build_mala_sampler(
             return jax.lax.cond(tfg_eta_current > 0.0, guided, unguided, operand=None)
 
         def energy_total(t, x, sample_key):
+            # NOTE: keep the ``lax.cond(tfg_eta_current > 0.0, ...)`` wrapper
+            # for the same XLA-fusion / bit-exactness reason as ``grad_guidance``
+            # above. Both branches are mathematically equivalent when
+            # ``tfg_eta_current > 0`` (the only regime exercised today), but
+            # collapsing the cond perturbs floating-point reduction order in
+            # the surrounding fused region.
             def only_model(x_in):
                 return energy_model(t, x_in), jnp.float32(0.0)
 

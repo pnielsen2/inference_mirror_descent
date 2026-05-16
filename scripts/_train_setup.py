@@ -19,9 +19,9 @@ def resolve_kl_budget(args, act_dim: int) -> None:
 
     * ``--kl_budget_per_dim`` is converted to a total ``args.kl_budget``
       (multiplied by ``act_dim``).
-    * When a KL budget is set (either flag), ``critic_normalization`` is
-      forced to ``'ema'`` (V-network is trained) and ``tfg_eta`` is
-      derived as ``sqrt(2 * δ)``.
+    * When a KL budget is set (either flag), ``tfg_eta`` is derived as
+      ``sqrt(2 * δ)`` and the V-network / on-policy advantage EMA path is
+      enabled downstream (DPMD reads ``cfg.kl_budget is not None``).
 
     The mutual-exclusion check between ``--kl_budget`` and
     ``--kl_budget_per_dim`` is enforced upstream in
@@ -30,7 +30,6 @@ def resolve_kl_budget(args, act_dim: int) -> None:
     if args.kl_budget_per_dim is not None:
         args.kl_budget = args.kl_budget_per_dim * act_dim
     if args.kl_budget is not None:
-        args.critic_normalization = "ema"
         args.tfg_eta = float((2.0 * args.kl_budget) ** 0.5)
 
 
