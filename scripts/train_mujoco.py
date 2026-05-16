@@ -2,17 +2,14 @@ import json
 from pathlib import Path
 import time
 
-import jax, jax.numpy as jnp
-
 from relax.algorithm.dpmd import DPMD, DPMDConfig
-from relax.buffer import TreeBuffer
-from relax.network.diffv2 import create_diffv2_net
 from relax.env import create_vector_env
 from relax.utils.experience import Experience
 from relax.utils.fs import PROJECT_ROOT
 from relax.utils.seeding import derive_seed_bundle
 
 from _train_args import build_parser, validate_args
+from _train_setup import resolve_kl_budget, build_per_seed_state
 
 
 if __name__ == "__main__":
@@ -32,95 +29,25 @@ if __name__ == "__main__":
 
     seeds = derive_seed_bundle(args.seed, N_seeds, _hp_loaded)
 
-    total_envs = args.num_vec_envs * N_seeds
-
     env, obs_dim, act_dim = create_vector_env(
         args.env,
-        total_envs,
+        args.num_vec_envs * N_seeds,
         seeds.env_seed,
         seeds.env_action_seed,
         per_entry_env_seeds=seeds.per_entry_env_seeds,
         per_entry_action_seeds=seeds.per_entry_action_seeds,
     )
 
-    # Resolve KL budget: --kl_budget sets the total directly;
-    # --kl_budget_per_dim sets it as per_dim * act_dim.
-    if args.kl_budget is not None and args.kl_budget_per_dim is not None:
-        parser.error("--kl_budget and --kl_budget_per_dim are mutually exclusive")
-    if args.kl_budget_per_dim is not None:
-        args.kl_budget = args.kl_budget_per_dim * act_dim
-    if args.kl_budget is not None:
-        args.critic_normalization = "ema"
-        args.tfg_eta = float((2.0 * args.kl_budget) ** 0.5)
-
-    hidden_sizes = [args.hidden_dim] * args.hidden_num
-    diffusion_hidden_sizes = [args.diffusion_hidden_dim] * args.hidden_num
-
-    buffers_list = [
-        TreeBuffer.from_experience(
-            obs_dim, act_dim, size=args.buffer_size,
-            seed=seeds.buffer_seeds[i],
-        )
-        for i in range(N_seeds)
-    ]
+    # Apply --kl_budget / --kl_budget_per_dim promotion to tfg_eta + V-net.
+    resolve_kl_budget(args, act_dim)
 
     print(f"Algorithm: {args.alg}")
-
-    def mish(x: jax.Array):
-        return x * jnp.tanh(jax.nn.softplus(x))
-
-    def _make_diffv2(net_key):
-        return create_diffv2_net(
-            net_key,
-            obs_dim,
-            act_dim,
-            hidden_sizes,
-            diffusion_hidden_sizes,
-            mish,
-            num_timesteps=args.diffusion_steps,
-            beta_schedule_scale=args.beta_schedule_scale,
-            beta_schedule_type=args.beta_schedule_type,
-            mala_steps=args.mala_steps,
-            num_q_networks=args.num_q_networks,
-            x_recon_clip_radius=1.0,
-            snr_max=args.snr_max,
-        )
-
-    _pairs = [_make_diffv2(k) for k in seeds.init_keys]
-    agent = _pairs[0][0]
-    dpmd_params_list = [p for (_a, p) in _pairs]
+    agent, dpmd_params_list, buffers_list = build_per_seed_state(
+        args, seeds, obs_dim, act_dim,
+    )
     params = dpmd_params_list[0]
 
-    # Resolve the lr -> lr_{q,policy} fallback once, then pack every DPMD
-    # hyperparameter into a single frozen ``DPMDConfig``.
-    lr_policy = args.lr if args.lr_policy is None else args.lr_policy
-    lr_q = args.lr if args.lr_q is None else args.lr_q
-    cfg = DPMDConfig(
-        gamma=args.gamma,
-        tau=args.tau,
-        lr_policy=float(lr_policy),
-        lr_q=float(lr_q),
-        delay_update=args.delay_update,
-        reward_scale=args.reward_scale,
-        q_critic_agg=args.q_critic_agg,
-        tfg_eta=args.tfg_eta,
-        x0_hat_clip_radius=args.x0_hat_clip_radius,
-        mala_adapt_rate=args.mala_adapt_rate,
-        mala_guided_predictor=args.mala_guided_predictor,
-        mala_no_predictor=args.mala_no_predictor,
-        ddim_predictor=args.ddim_predictor,
-        q_td_huber_width=args.q_td_huber_width,
-        batch_independent_guidance=args.batch_independent_guidance,
-        guidance_strength_multiplier=args.guidance_strength_multiplier,
-        energy_multiplier=args.energy_multiplier,
-        critic_normalization=args.critic_normalization,
-        advantage_ema_tau=args.advantage_ema_tau,
-        shape_ema_tau=args.shape_ema_tau,
-        initial_advantage_second_moment_ema=args.initial_advantage_second_moment_ema,
-        initial_dist_shift_shape_ema=args.initial_dist_shift_shape_ema,
-        kl_budget=args.kl_budget,
-        one_step_dist_shift_eta=args.one_step_dist_shift_eta,
-    )
+    cfg = DPMDConfig.from_args(args)
     algorithm = DPMD(agent, params, cfg)
 
     algorithm.state = algorithm.make_vmapped_state(dpmd_params_list)

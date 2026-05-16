@@ -104,7 +104,6 @@ class DPMDConfig:
     mala_adapt_rate: float = 0.05
     mala_guided_predictor: bool = False
     mala_no_predictor: bool = False
-    ddim_predictor: bool = False
     q_td_huber_width: float = float("inf")
     batch_independent_guidance: bool = False
     guidance_strength_multiplier: float = 1.0
@@ -116,6 +115,41 @@ class DPMDConfig:
     initial_dist_shift_shape_ema: float = -1.0
     kl_budget: Optional[float] = None
     one_step_dist_shift_eta: bool = False
+
+    @classmethod
+    def from_args(cls, args) -> "DPMDConfig":
+        """Build a frozen DPMDConfig from the argparse ``Namespace`` produced
+        by :mod:`scripts._train_args`. Handles the ``--lr`` → ``--lr_q`` /
+        ``--lr_policy`` fallback so the single source of truth for the
+        config-from-CLI mapping lives here, not in ``train_mujoco.py``.
+        """
+        lr_policy = args.lr if args.lr_policy is None else args.lr_policy
+        lr_q = args.lr if args.lr_q is None else args.lr_q
+        return cls(
+            gamma=args.gamma,
+            tau=args.tau,
+            lr_policy=float(lr_policy),
+            lr_q=float(lr_q),
+            delay_update=args.delay_update,
+            reward_scale=args.reward_scale,
+            q_critic_agg=args.q_critic_agg,
+            tfg_eta=args.tfg_eta,
+            x0_hat_clip_radius=args.x0_hat_clip_radius,
+            mala_adapt_rate=args.mala_adapt_rate,
+            mala_guided_predictor=args.mala_guided_predictor,
+            mala_no_predictor=args.mala_no_predictor,
+            q_td_huber_width=args.q_td_huber_width,
+            batch_independent_guidance=args.batch_independent_guidance,
+            guidance_strength_multiplier=args.guidance_strength_multiplier,
+            energy_multiplier=args.energy_multiplier,
+            critic_normalization=args.critic_normalization,
+            advantage_ema_tau=args.advantage_ema_tau,
+            shape_ema_tau=args.shape_ema_tau,
+            initial_advantage_second_moment_ema=args.initial_advantage_second_moment_ema,
+            initial_dist_shift_shape_ema=args.initial_dist_shift_shape_ema,
+            kl_budget=args.kl_budget,
+            one_step_dist_shift_eta=args.one_step_dist_shift_eta,
+        )
 
 
 # Map DPMDConfig field names to the corresponding ``Diffv2TrainState`` field

@@ -79,12 +79,17 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
     if (args.num_particles != 1
             or not args.dpmd_no_entropy_tuning
             or not args.dpmd_constant_weight
-            or not args.mala_per_level_eta):
+            or not args.mala_per_level_eta
+            or not args.ddim_predictor):
         parser.error(
             "simplify_walkthrough requires: --num_particles 1, "
             "--dpmd_no_entropy_tuning, --dpmd_constant_weight, "
-            "--mala_per_level_eta (the legacy alternatives have been removed)."
+            "--mala_per_level_eta, --ddim_predictor "
+            "(the legacy alternatives have been removed)."
         )
+
+    if args.kl_budget is not None and args.kl_budget_per_dim is not None:
+        parser.error("--kl_budget and --kl_budget_per_dim are mutually exclusive")
 
     # --one_step_dist_shift_eta implies a KL budget (default 5.33 per dim)
     if args.one_step_dist_shift_eta and args.kl_budget is None and args.kl_budget_per_dim is None:
