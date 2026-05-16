@@ -103,7 +103,6 @@ if __name__ == "__main__":
         delay_update=args.delay_update,
         reward_scale=args.reward_scale,
         q_critic_agg=args.q_critic_agg,
-        q_bootstrap_agg=args.q_bootstrap_agg,
         tfg_eta=args.tfg_eta,
         x0_hat_clip_radius=args.x0_hat_clip_radius,
         mala_adapt_rate=args.mala_adapt_rate,

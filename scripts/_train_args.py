@@ -52,8 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--initial_advantage_second_moment_ema", type=float, default=1.0, help="Initial value for the advantage second moment EMA E[A^2].")
     parser.add_argument("--initial_dist_shift_shape_ema", type=float, default=-1.0, help="Initial value for the dimensionless distribution-shift shape EMA s2 = (2γc + κ₃) / v^(3/2).")
     parser.add_argument("--x0_hat_clip_radius", type=float, default=float("inf"), help="Clipping radius r for Tweedie clean-action estimates x0_hat used inside guidance/Q evaluation. x0_hat is clipped to [-r, r] before being passed into Q / model-based objectives. Default inf (no clip); in non-latent mode the network-side denoising clip is separately hardcoded to 1.0 to match normalized action bounds.")
-    parser.add_argument("--q_critic_agg", type=str, default="min", choices=["min", "mean"], help="Aggregation for the Q signal used in tilting and reweighting. TD-target aggregation is controlled separately by --q_bootstrap_agg.")
-    parser.add_argument("--q_bootstrap_agg", type=str, default="min", choices=["min", "mean"], help="Aggregation mode for Q TD targets. 'min' (default): both Qs bootstrap from min(Q1_target, Q2_target) (clipped double Q-learning). 'mean': both Qs bootstrap from mean of all target networks.")
+    parser.add_argument("--q_critic_agg", type=str, default="min", choices=["min", "mean"], help="Aggregation for the Q signal used in tilting and reweighting. The TD-bootstrap path is hardcoded to 'min' (clipped double-Q).")
     parser.add_argument("--dpmd_constant_weight", action="store_true", default=False, help="If set for dpmd, disable Q-based reweighting in the diffusion score-matching loss and use constant weights.")
     parser.add_argument("--num_q_networks", type=int, default=2, help="Number of Q critic networks to train (default 2, i.e. twin Q).")
     parser.add_argument("--dpmd_no_entropy_tuning", action="store_true", default=False, help="If set for dpmd, disable action noise and alpha/entropy tuning.")
@@ -95,3 +94,19 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
         parser.error("--parallel_seeds must be >= 1.")
     if args.num_vec_envs <= 0:
         parser.error("--num_vec_envs must be > 0 in simplify_walkthrough (vectorized/vmapped path only).")
+    if args.mala_steps <= 0:
+        parser.error(
+            "simplify_walkthrough requires --mala_steps > 0; the non-MALA "
+            "sampling branches have been removed."
+        )
+    # ``--critic_normalization ema`` only makes sense paired with a KL budget;
+    # the legacy off-policy V branch (V trained on Q(s, a_replay)) is gone.
+    # Note: train_mujoco.py auto-promotes ``--kl_budget`` (or
+    # ``--kl_budget_per_dim``) to ``--critic_normalization ema``, so this
+    # check fires only when the user passes ``--critic_normalization ema``
+    # explicitly without a budget.
+    if args.critic_normalization == "ema" and args.kl_budget is None and args.kl_budget_per_dim is None:
+        parser.error(
+            "--critic_normalization ema requires --kl_budget or "
+            "--kl_budget_per_dim in simplify_walkthrough."
+        )
