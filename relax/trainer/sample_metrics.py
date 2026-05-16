@@ -164,7 +164,7 @@ class SampleMetricsRecorder:
             log(s, "Global_EMAs/tfg_eta", tfg_eta, step=sstep)
             if getattr(alg, "on_policy_ema", False):
                 m2 = float(np.asarray(state.advantage_second_moment_ema)[s])
-                kl_budget = float(np.asarray(state.kl_budget_val)[s])
+                kl_budget = float(np.asarray(state.hp.kl_budget_val)[s])
                 m3 = float(np.asarray(state.advantage_third_moment_ema)[s])
                 cov = float(np.asarray(state.dist_shift_covariance_ema)[s])
                 shape = float(np.asarray(state.dist_shift_shape_ema)[s])

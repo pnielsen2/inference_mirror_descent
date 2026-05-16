@@ -115,7 +115,9 @@ class VmapOffPolicyTrainer:
             )
 
         self.env_name = env.spec.id if env.spec is not None else "env"
-        _gamma = np.asarray(getattr(self.algorithm.state, "gamma", getattr(self.algorithm, "gamma", 0.99)), dtype=np.float64)
+        _hp = getattr(self.algorithm.state, "hp", None)
+        _gamma_src = getattr(_hp, "gamma", None) if _hp is not None else getattr(self.algorithm, "gamma", 0.99)
+        _gamma = np.asarray(_gamma_src, dtype=np.float64)
         if _gamma.ndim == 0:
             _gamma = np.broadcast_to(_gamma, (self.N,)).astype(np.float64)
         _q_label = "Q"

@@ -1,11 +1,11 @@
-from typing import NamedTuple, Tuple
- 
+from dataclasses import dataclass, fields
+from typing import NamedTuple, Optional, Tuple
+
 import jax, jax.numpy as jnp
 import numpy as np
 import optax
 import haiku as hk
- 
-from relax.algorithm import hp_pack as _hp_pack_module
+
 from relax.algorithm.base import Algorithm
 from relax.algorithm.value_head import ValueHead
 from relax.network.diffv2 import Diffv2Net, Diffv2Params
@@ -61,6 +61,16 @@ def _aggregate_q(q_means, mode: str):
     raise ValueError(f"_aggregate_q: unknown mode {mode!r}")
 
 
+def _stack_trees(trees):
+    """Stack a list of pytrees of identical structure along a new leading axis."""
+    return jax.tree.map(lambda *xs: jnp.stack(xs), *trees)
+
+
+def _unstack_tree(stacked, n: int):
+    """Inverse of ``_stack_trees``: split a stacked pytree back into a list of N."""
+    return tuple(jax.tree.map(lambda x: x[i], stacked) for i in range(n))
+
+
 class Diffv2OptStates(NamedTuple):
     q: tuple  # tuple of N optax.OptState, one per Q network
     policy: optax.OptState
@@ -82,21 +92,14 @@ class MalaSampleResult(NamedTuple):
     per_level_clip: jax.Array
 
 
-class Diffv2TrainState(NamedTuple):
-    params: Diffv2Params
-    opt_state: Diffv2OptStates
-    step: int
-    log_eta_scales: jax.Array
-    tfg_eta: jax.Array
-    # Normalized advantage guidance state
-    value_params: hk.Params = None  # V(s) network params (optional)
-    advantage_second_moment_ema: float = 1.0  # EMA of E[A^2] where A = Q - V
-    advantage_third_moment_ema: float = 0.0
-    dist_shift_covariance_ema: float = 0.0
-    dist_shift_shape_ema: float = -1.0        # EMA of s₂ = (2γc + κ₃) / v^(3/2), dimensionless shape
-    # Per-seed vmappable hyperparameters. Scalars in single-seed mode; under
-    # VmapOffPolicyTrainer each field becomes a [N]-shaped array so vmap maps
-    # one scalar value to each seed.
+class HParams(NamedTuple):
+    """Per-seed vmappable hyperparameter scalars.
+
+    Scalars in single-seed mode; under :class:`VmapOffPolicyTrainer` each
+    field becomes a ``[N]``-shaped array so vmap maps one scalar value to
+    each seed. Lives as ``Diffv2TrainState.hp`` so the algorithmic state
+    fields above stay visually separate from the frozen-per-seed hp block.
+    """
     gamma: jax.Array = 0.99            # discount factor
     polyak_tau: jax.Array = 0.005       # target net soft-update rate
     lr_q: jax.Array = 1e-4              # Q optimizer LR (applied as -lr*update)
@@ -111,72 +114,84 @@ class Diffv2TrainState(NamedTuple):
     q_td_huber_width: jax.Array = float("inf")  # Q TD huber loss width (in reward units)
 
 
+class Diffv2TrainState(NamedTuple):
+    params: Diffv2Params
+    opt_state: Diffv2OptStates
+    step: int
+    log_eta_scales: jax.Array
+    tfg_eta: jax.Array
+    # Normalized advantage guidance state
+    value_params: hk.Params = None  # V(s) network params (optional)
+    advantage_second_moment_ema: float = 1.0  # EMA of E[A^2] where A = Q - V
+    advantage_third_moment_ema: float = 0.0
+    dist_shift_covariance_ema: float = 0.0
+    dist_shift_shape_ema: float = -1.0        # EMA of s₂ = (2γc + κ₃) / v^(3/2), dimensionless shape
+    hp: HParams = HParams()
+
+
+@dataclass(frozen=True)
+class DPMDConfig:
+    """All scalar hyperparameters of the DPMD algorithm, frozen at construction.
+
+    Constructed once in ``scripts/train_mujoco.py`` from CLI args and handed
+    to :class:`DPMD`. Field names match argparse attribute names so the
+    walkthrough has a single source of truth for what each knob controls.
+    """
+    gamma: float = 0.99
+    tau: float = 0.005
+    lr_policy: float = 1e-4
+    lr_q: float = 1e-4
+    delay_update: int = 2
+    reward_scale: float = 0.2
+    q_critic_agg: str = "min"
+    q_bootstrap_agg: str = "min"
+    tfg_eta: float = 0.0
+    x0_hat_clip_radius: float = 1.0
+    mala_adapt_rate: float = 0.05
+    mala_guided_predictor: bool = False
+    mala_no_predictor: bool = False
+    ddim_predictor: bool = False
+    q_td_huber_width: float = float("inf")
+    batch_independent_guidance: bool = False
+    guidance_strength_multiplier: float = 1.0
+    energy_multiplier: float = 1.0
+    critic_normalization: str = "none"
+    advantage_ema_tau: float = 0.0005
+    shape_ema_tau: float = 0.0001
+    initial_advantage_second_moment_ema: float = 1.0
+    initial_dist_shift_shape_ema: float = -1.0
+    kl_budget: Optional[float] = None
+    one_step_dist_shift_eta: bool = False
+
+
+# Map DPMDConfig field names to the corresponding ``Diffv2TrainState`` field
+# names for the per-seed-vmappable hp scalars. Renames are explicit; identity
+# mappings (``lr_q``, ``reward_scale``, ...) are auto-inferred from set diff.
+_HP_CFG_TO_STATE = {
+    "tau": "polyak_tau",
+    "guidance_strength_multiplier": "guidance_mult",
+    "advantage_ema_tau": "adv_ema_tau",
+    "kl_budget": "kl_budget_val",  # None → 1.0 sentinel handled in _build_initial_state
+}
+# Cfg fields packed into Diffv2TrainState's per-seed hp block (in the order
+# they appear on the state namedtuple).
+_HP_CFG_FIELDS = (
+    "gamma", "tau", "lr_q", "lr_policy", "guidance_strength_multiplier",
+    "advantage_ema_tau", "shape_ema_tau", "kl_budget", "reward_scale",
+    "x0_hat_clip_radius", "mala_adapt_rate", "q_td_huber_width",
+)
+
+
 class DPMD(Algorithm):
 
-    def __init__(
-        self,
-        agent: Diffv2Net,
-        params: Diffv2Params,
-        *,
-        gamma: float = 0.99,
-        lr: float = 1e-4,
-        lr_policy: float | None = None,
-        lr_q: float | None = None,
-        tau: float = 0.005,
-        delay_update: int = 2,
-        reward_scale: float = 0.2,
-        q_critic_agg: str = "min",
-        q_bootstrap_agg: str = "min",
-        tfg_eta: float = 0.0,
-        x0_hat_clip_radius: float = 1.0,
-        mala_adapt_rate: float = 0.05,
-        mala_guided_predictor: bool = False,
-        mala_no_predictor: bool = False,
-        ddim_predictor: bool = False,
-        q_td_huber_width: float = float("inf"),
-        batch_independent_guidance: bool = False,
-        guidance_strength_multiplier: float = 1.0,
-        # Energy/score scaling for exploration
-        energy_multiplier: float = 1.0,
-        # Critic normalization for guidance
-        critic_normalization: str = "none",
-        advantage_ema_tau: float = 0.0005,
-        shape_ema_tau: float = 0.0001,  # slower EMA for dimensionless shape s₂ = (2γc+κ₃)/v^(3/2)
-        initial_advantage_second_moment_ema: float = 1.0,
-        initial_dist_shift_shape_ema: float = -1.0,
-        # KL budget and distribution-shift adaptive eta
-        kl_budget: float | None = None,
-        one_step_dist_shift_eta: bool = False,
-    ):
+    def __init__(self, agent: Diffv2Net, params: Diffv2Params, cfg: DPMDConfig):
         self.agent = agent
-
-        # --- Algorithm scalars (each assigned exactly once) ---
-        self.gamma = gamma
-        self.tau = tau
-        self.delay_update = delay_update
-        self.reward_scale = reward_scale
-        self.lr_policy = float(lr if lr_policy is None else lr_policy)
-        self.lr_q = float(lr if lr_q is None else lr_q)
-        self.q_td_huber_width = float(q_td_huber_width)
-        self.batch_independent_guidance = bool(batch_independent_guidance)
-        self.guidance_strength_multiplier = float(guidance_strength_multiplier)
-        self.energy_multiplier = float(energy_multiplier)
-        self.x0_hat_clip_radius = float(x0_hat_clip_radius)
-        self.mala_adapt_rate = float(mala_adapt_rate)
-        self.advantage_ema_tau = float(advantage_ema_tau)
-        self.shape_ema_tau = float(shape_ema_tau)
-        self.initial_advantage_second_moment_ema = float(initial_advantage_second_moment_ema)
-        self.initial_dist_shift_shape_ema = float(initial_dist_shift_shape_ema)
-        self.kl_budget = float(kl_budget) if kl_budget is not None else None
-        self.q_critic_agg = str(q_critic_agg)
-        self.q_bootstrap_agg = str(q_bootstrap_agg)
-        self.critic_normalization = str(critic_normalization)
-        self.mala_guided_predictor = bool(mala_guided_predictor)
-        self.mala_no_predictor = bool(mala_no_predictor)
-        self.ddim_predictor = bool(ddim_predictor)
-        self.tfg_eta = float(tfg_eta)
-        self.one_step_dist_shift_eta = bool(one_step_dist_shift_eta)
-        self.on_policy_ema = (self.kl_budget is not None)
+        self.cfg = cfg
+        # Expose every cfg field as a direct attribute on self so existing
+        # ``self.X`` / ``algorithm.X`` references keep working.
+        for _f in fields(DPMDConfig):
+            object.__setattr__(self, _f.name, getattr(cfg, _f.name))
+        self.on_policy_ema = (cfg.kl_budget is not None)
         self.policy_loss_key = "losses/Policy_epsilon_MSE"
 
         self._validate_invariants()
@@ -240,7 +255,7 @@ class DPMD(Algorithm):
             diffusion_noise_key = key_splits[4]
             q_langevin_keys = key_splits[8:]  # num_q keys
 
-            reward *= state.reward_scale
+            reward *= state.hp.reward_scale
 
             # Sample a single next-action and evaluate target-Q on it (td_actions=1).
             mala_result = sampler(
@@ -253,7 +268,7 @@ class DPMD(Algorithm):
             not_done = (1 - done)
             # Clipped double Q-learning: all Qs bootstrap from min(target_Q_1..N).
             q_target_min_for_backup = _aggregate_q(q_target_per_q, "min")
-            shared_backup = reward + not_done * state.gamma * q_target_min_for_backup
+            shared_backup = reward + not_done * state.hp.gamma * q_target_min_for_backup
             q_backup_per_q = [shared_backup] * num_q
 
             q_params, q_opt_states, all_q_losses = self._train_q_ensemble(
@@ -292,11 +307,11 @@ class DPMD(Algorithm):
             # Policy + target-Q updates, both gated by step % delay_update == 0.
             policy_params, policy_opt_state = _delayed_param_update(
                 self.policy_optim, policy_params, policy_grads, policy_opt_state,
-                state.lr_policy, step, self.delay_update,
+                state.hp.lr_policy, step, self.delay_update,
             )
             target_q_params = tuple(
                 _delayed_target_update(
-                    q_params[qi], target_q_params[qi], state.polyak_tau,
+                    q_params[qi], target_q_params[qi], state.hp.polyak_tau,
                     step, self.delay_update,
                 )
                 for qi in range(num_q)
@@ -370,9 +385,9 @@ class DPMD(Algorithm):
             tfg_eta_current = state.tfg_eta
             value_params = state.value_params
             adv_second_moment_ema = state.advantage_second_moment_ema
-            x0_hat_clip_radius_hp = state.x0_hat_clip_radius
-            mala_adapt_rate_hp = state.mala_adapt_rate
-            guidance_mult_hp = state.guidance_mult
+            x0_hat_clip_radius_hp = state.hp.x0_hat_clip_radius
+            mala_adapt_rate_hp = state.hp.mala_adapt_rate
+            guidance_mult_hp = state.hp.guidance_mult
 
             obs_batch = obs
             shape = (*obs_batch.shape[:-1], self.agent.act_dim)
@@ -444,22 +459,35 @@ class DPMD(Algorithm):
 
                 return jax.lax.cond(tfg_eta_current > 0.0, with_q, only_model, x)
 
-            def predictor_step(t_idx: jax.Array, x_in: jax.Array, k_in: jax.Array):
-                # DDIM-style deterministic predictor (no sampled noise).
-                # The PRNG split is retained -- and the resulting `z_key`
-                # intentionally unused -- to keep `k_out` bit-identical
-                # with the legacy stochastic DDPM predictor path.
-                noise_pred = self.agent.policy(policy_params, obs_batch, x_in, t_idx)
-                noise_pred_scaled = self.energy_multiplier * noise_pred  # tempers base score; guidance is NOT scaled
-                k_out, _z_key = jax.random.split(k_in)
-                if self.mala_guided_predictor:
+            # ---- DDIM-style deterministic predictor (variant chosen at build time) ----
+            # The PRNG split is retained -- and the resulting ``_z_key``
+            # intentionally unused -- to keep ``k_out`` bit-identical with
+            # the legacy stochastic DDPM predictor path.
+            if self.mala_guided_predictor:
+                def predictor_step(t_idx, x_in, k_in):
+                    noise_pred = self.agent.policy(policy_params, obs_batch, x_in, t_idx)
+                    noise_pred_scaled = self.energy_multiplier * noise_pred  # base score; guidance below is NOT scaled
+                    k_out, _z_key = jax.random.split(k_in)
                     grad_q = grad_guidance(x_in, t_idx)
                     sigma_t = B.sqrt_one_minus_alphas_cumprod[t_idx]
                     eps_pred = noise_pred_scaled - tfg_eta_current * sigma_t * grad_q
-                else:
-                    eps_pred = noise_pred_scaled
-                model_mean, _ = self.agent.diffusion.p_mean_variance(t_idx, x_in, eps_pred)
-                return model_mean, k_out
+                    model_mean, _ = self.agent.diffusion.p_mean_variance(t_idx, x_in, eps_pred)
+                    return model_mean, k_out
+            else:
+                def predictor_step(t_idx, x_in, k_in):
+                    noise_pred = self.agent.policy(policy_params, obs_batch, x_in, t_idx)
+                    noise_pred_scaled = self.energy_multiplier * noise_pred
+                    k_out, _z_key = jax.random.split(k_in)
+                    model_mean, _ = self.agent.diffusion.p_mean_variance(t_idx, x_in, noise_pred_scaled)
+                    return model_mean, k_out
+
+            # ---- Post-MALA transition: either DDIM step or skip (build-time choice) ----
+            if self.mala_no_predictor:
+                def after_mala_correction(t_idx, x_curr, k):
+                    return x_curr, k
+            else:
+                def after_mala_correction(t_idx, x_curr, k):
+                    return predictor_step(t_idx, x_curr, k)
 
             # ---- MALA step-size scale clamp range (shared across all levels) -
             eta_base_min = jnp.maximum(jnp.min(B.betas), jnp.float32(1e-8))
@@ -549,9 +577,7 @@ class DPMD(Algorithm):
                     clip_sum_level / jnp.maximum(mala_steps_f, jnp.float32(1.0))
                 )
 
-                if self.mala_no_predictor:
-                    return x_curr, k, log_eta_scales, acc_sum, acc_count, per_level_acc, per_level_clip_frac
-                x_next, k = predictor_step(t, x_curr, k)
+                x_next, k = after_mala_correction(t, x_curr, k)
                 return x_next, k, log_eta_scales, acc_sum, acc_count, per_level_acc, per_level_clip_frac
 
             # ---- Drive the reverse diffusion: T → 0 over the level loop -----
@@ -654,7 +680,7 @@ class DPMD(Algorithm):
         ``(new_q_params_tuple, new_q_opt_states_tuple, all_q_losses)``.
         """
         num_q = len(q_params)
-        delta = state.q_td_huber_width * state.reward_scale
+        delta = state.hp.q_td_huber_width * state.hp.reward_scale
         use_huber = jnp.isfinite(delta)
         delta_safe = jnp.where(use_huber, delta, jnp.float32(1.0))
 
@@ -676,21 +702,21 @@ class DPMD(Algorithm):
 
             (qi_loss, qi_pred), qi_grads = jax.value_and_grad(q_loss_fn, has_aux=True)(qp)
             update, new_opt = self.optim.update(qi_grads, opt_s, params=qp)
-            update = jax.tree.map(lambda u: -state.lr_q * u, update)
+            update = jax.tree.map(lambda u: -state.hp.lr_q * u, update)
             new_qp = optax.apply_updates(qp, update)
             return new_qp, new_opt, qi_loss, qi_pred
 
-        stacked_q_params = jax.tree.map(lambda *ps: jnp.stack(ps), *q_params)
-        stacked_q_opt = jax.tree.map(lambda *ss: jnp.stack(ss), *q_opt_states)
+        # Stack the N (params, opt-state, backup) tuples along a leading axis,
+        # vmap one Adam step over the ensemble, then unstack back to N tuples.
+        stacked_q_params = _stack_trees(q_params)
+        stacked_q_opt = _stack_trees(q_opt_states)
         stacked_backup = jnp.stack(q_backup_per_q)
 
         stacked_new_qp, stacked_new_opt, all_q_losses, _all_q_preds = jax.vmap(
             single_q_train_step
         )(stacked_q_params, stacked_q_opt, stacked_backup)
 
-        new_q_params = tuple(jax.tree.map(lambda x: x[i], stacked_new_qp) for i in range(num_q))
-        new_q_opt_states = tuple(jax.tree.map(lambda x: x[i], stacked_new_opt) for i in range(num_q))
-        return new_q_params, new_q_opt_states, all_q_losses
+        return _unstack_tree(stacked_new_qp, num_q), _unstack_tree(stacked_new_opt, num_q), all_q_losses
 
     def _value_update_step(self, state, q_target_per_q, next_obs):
         """Train V(s') against on-policy Q(s', a') targets (KL-budget mode).
@@ -707,14 +733,25 @@ class DPMD(Algorithm):
             return state.value_params, state.opt_state.value, jnp.float32(0.0)
 
         q_for_v = _aggregate_q(q_target_per_q, self.q_critic_agg)
-        return self.value_head.update_step(state, q_for_v, next_obs, state.lr_q, self.optim)
+        return self.value_head.update_step(state, q_for_v, next_obs, state.hp.lr_q, self.optim)
 
     def _build_initial_state(self, params, value_params_init, value_opt_state_init):
         """Construct a fresh Diffv2TrainState from a given set of network params.
 
         Factored out of __init__ so vmap-mode setup can call it N times with
         different init seeds and stack the results along a leading seed axis.
+        The per-seed-vmappable hp scalars are packed programmatically via
+        ``_HP_CFG_FIELDS`` / ``_HP_CFG_TO_STATE`` so the field list lives in
+        exactly one place.
         """
+        cfg = self.cfg
+        hp_kwargs = {}
+        for cfg_name in _HP_CFG_FIELDS:
+            state_name = _HP_CFG_TO_STATE.get(cfg_name, cfg_name)
+            v = getattr(cfg, cfg_name)
+            if cfg_name == "kl_budget" and v is None:
+                v = 1.0  # in-graph sentinel; host η-cap uses cfg.kl_budget directly
+            hp_kwargs[state_name] = jnp.float32(v)
         return Diffv2TrainState(
             params=params,
             opt_state=Diffv2OptStates(
@@ -724,24 +761,13 @@ class DPMD(Algorithm):
             ),
             step=jnp.int32(0),
             log_eta_scales=jnp.zeros((self._timesteps,), dtype=jnp.float32),
-            tfg_eta=jnp.float32(self.tfg_eta),
+            tfg_eta=jnp.float32(cfg.tfg_eta),
             value_params=value_params_init,
-            advantage_second_moment_ema=jnp.float32(self.initial_advantage_second_moment_ema),
+            advantage_second_moment_ema=jnp.float32(cfg.initial_advantage_second_moment_ema),
             advantage_third_moment_ema=jnp.float32(0.0),
             dist_shift_covariance_ema=jnp.float32(0.0),
-            dist_shift_shape_ema=jnp.float32(self.initial_dist_shift_shape_ema),
-            gamma=jnp.float32(self.gamma),
-            polyak_tau=jnp.float32(self.tau),
-            lr_q=jnp.float32(self.lr_q),
-            lr_policy=jnp.float32(self.lr_policy),
-            guidance_mult=jnp.float32(self.guidance_strength_multiplier),
-            adv_ema_tau=jnp.float32(self.advantage_ema_tau),
-            shape_ema_tau=jnp.float32(self.shape_ema_tau),
-            kl_budget_val=jnp.float32(self.kl_budget if self.kl_budget is not None else 1.0),
-            reward_scale=jnp.float32(self.reward_scale),
-            x0_hat_clip_radius=jnp.float32(self.x0_hat_clip_radius),
-            mala_adapt_rate=jnp.float32(self.mala_adapt_rate),
-            q_td_huber_width=jnp.float32(self.q_td_huber_width),
+            dist_shift_shape_ema=jnp.float32(cfg.initial_dist_shift_shape_ema),
+            hp=HParams(**hp_kwargs),
         )
 
     def make_vmapped_state(self, params_list, value_init_keys=None):
@@ -766,7 +792,7 @@ class DPMD(Algorithm):
             self._build_initial_state(p, vp, vo)
             for p, vp, vo in zip(params_list, vparams_list, vopt_list)
         ]
-        return jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *states)
+        return _stack_trees(states)
 
     def get_action_vmap(self, key: jax.Array, obs: np.ndarray):
         """Vmapped counterpart of get_action. 
@@ -800,12 +826,3 @@ class DPMD(Algorithm):
             "lr_policy_effective": float(self.lr_policy),
             "lr_q_effective": float(self.lr_q),
         }
-
-    def apply_hp_pack(self, hp_pack: dict, N_seeds: int) -> None:
-        """Apply per-seed hyperparameter overrides to ``self.state``.
-
-        Thin forwarder around :func:`relax.algorithm.hp_pack.apply` so the
-        algorithm class itself is free of CLI-attribute plumbing.
-        """
-        self.state = _hp_pack_module.apply(self.state, hp_pack, N_seeds)
-

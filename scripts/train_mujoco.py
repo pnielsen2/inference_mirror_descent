@@ -4,7 +4,7 @@ import time
 
 import jax, jax.numpy as jnp
 
-from relax.algorithm.dpmd import DPMD
+from relax.algorithm.dpmd import DPMD, DPMDConfig
 from relax.buffer import TreeBuffer
 from relax.network.diffv2 import create_diffv2_net
 from relax.env import create_vector_env
@@ -91,14 +91,15 @@ if __name__ == "__main__":
     dpmd_params_list = [p for (_a, p) in _pairs]
     params = dpmd_params_list[0]
 
-    algorithm = DPMD(
-        agent,
-        params,
+    # Resolve the lr -> lr_{q,policy} fallback once, then pack every DPMD
+    # hyperparameter into a single frozen ``DPMDConfig``.
+    lr_policy = args.lr if args.lr_policy is None else args.lr_policy
+    lr_q = args.lr if args.lr_q is None else args.lr_q
+    cfg = DPMDConfig(
         gamma=args.gamma,
-        lr=args.lr,
-        lr_policy=args.lr_policy,
-        lr_q=args.lr_q,
         tau=args.tau,
+        lr_policy=float(lr_policy),
+        lr_q=float(lr_q),
         delay_update=args.delay_update,
         reward_scale=args.reward_scale,
         q_critic_agg=args.q_critic_agg,
@@ -114,17 +115,19 @@ if __name__ == "__main__":
         guidance_strength_multiplier=args.guidance_strength_multiplier,
         energy_multiplier=args.energy_multiplier,
         critic_normalization=args.critic_normalization,
-        kl_budget=args.kl_budget,
-        one_step_dist_shift_eta=args.one_step_dist_shift_eta,
         advantage_ema_tau=args.advantage_ema_tau,
         shape_ema_tau=args.shape_ema_tau,
         initial_advantage_second_moment_ema=args.initial_advantage_second_moment_ema,
         initial_dist_shift_shape_ema=args.initial_dist_shift_shape_ema,
+        kl_budget=args.kl_budget,
+        one_step_dist_shift_eta=args.one_step_dist_shift_eta,
     )
+    algorithm = DPMD(agent, params, cfg)
 
     algorithm.state = algorithm.make_vmapped_state(dpmd_params_list)
     if _hp_loaded is not None:
-        algorithm.apply_hp_pack(_hp_loaded, N_seeds)
+        from relax.algorithm import hp_pack
+        algorithm.state = hp_pack.apply(algorithm.state, _hp_loaded, N_seeds)
         if seeds.per_entry_masters is not None:
             print(f"[hp_pack] applied per-entry master seeds "
                   f"(buffers + init networks + train keys): {seeds.per_entry_masters}")

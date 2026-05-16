@@ -40,11 +40,11 @@ def update_state_kl_only(state, q_per_env: np.ndarray, v_per_env: np.ndarray,
     adv_per_env = q_per_env - v_per_env                # [N, M]
     m2_batch = np.mean(adv_per_env ** 2, axis=1)        # [N]
 
-    tau_v = _broadcast_state_scalar(state.adv_ema_tau, N)
+    tau_v = _broadcast_state_scalar(state.hp.adv_ema_tau, N)
     cur_m2 = np.asarray(state.advantage_second_moment_ema)
     new_m2 = (1 - tau_v) * cur_m2 + tau_v * m2_batch
 
-    kl_budget = _broadcast_state_scalar(state.kl_budget_val, N)
+    kl_budget = _broadcast_state_scalar(state.hp.kl_budget_val, N)
     m2_safe = np.maximum(new_m2, 1e-8)
     sqrt_v = np.sqrt(m2_safe)
     eta_kl_raw = np.sqrt(2.0 * kl_budget / m2_safe)
@@ -67,7 +67,7 @@ def update_state_one_step(state, q_per_env: np.ndarray, v_per_env: np.ndarray,
     m2_batch = np.mean(adv_per_env ** 2, axis=1)        # [N]
     m3_batch = np.mean(adv_per_env ** 3, axis=1)        # [N]
 
-    tau_v = _broadcast_state_scalar(state.adv_ema_tau, N)
+    tau_v = _broadcast_state_scalar(state.hp.adv_ema_tau, N)
     cur_m2 = np.asarray(state.advantage_second_moment_ema)
     cur_m3 = np.asarray(state.advantage_third_moment_ema)
     cur_c = np.asarray(state.dist_shift_covariance_ema)
@@ -92,8 +92,8 @@ def update_state_one_step(state, q_per_env: np.ndarray, v_per_env: np.ndarray,
         new_c_candidate = (1 - tau_v) * cur_c + tau_v * c_batch
         new_c = np.where(c_batch_valid, new_c_candidate, cur_c)
 
-        gamma = _broadcast_state_scalar(state.gamma, N)
-        tau_s = _broadcast_state_scalar(state.shape_ema_tau, N)
+        gamma = _broadcast_state_scalar(state.hp.gamma, N)
+        tau_s = _broadcast_state_scalar(state.hp.shape_ema_tau, N)
         v_raw_safe = np.maximum(m2_batch, 1e-8)
         b_batch = 2.0 * gamma * c_batch + m3_batch
         s_batch = b_batch / v_raw_safe ** 1.5
@@ -101,7 +101,7 @@ def update_state_one_step(state, q_per_env: np.ndarray, v_per_env: np.ndarray,
         new_shape = np.where(c_batch_valid, new_shape_candidate, cur_shape)
 
     # η = min(η_KL, η*); η* is +inf when shape is non-negative.
-    kl_budget = _broadcast_state_scalar(state.kl_budget_val, N)
+    kl_budget = _broadcast_state_scalar(state.hp.kl_budget_val, N)
     m2_safe = np.maximum(new_m2, 1e-8)
     sqrt_v = np.sqrt(m2_safe)
     eta_kl_raw = np.sqrt(2.0 * kl_budget / m2_safe)

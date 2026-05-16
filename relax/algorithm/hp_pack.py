@@ -54,7 +54,11 @@ def apply(state, hp_pack: dict, N_seeds: int):
     automatically rederived as ``sqrt(2 * kl_budget)`` so the two stay
     consistent.
     """
-    overrides = {}
+    # Fields on the top-level ``Diffv2TrainState``; all other override targets
+    # live inside ``state.hp``.
+    _TOPLEVEL_TARGETS = {"tfg_eta", "advantage_second_moment_ema", "dist_shift_shape_ema"}
+    hp_overrides = {}
+    top_overrides = {}
     for k, v in hp_pack.items():
         if k not in ALLOWED_KEYS:
             raise ValueError(
@@ -66,14 +70,19 @@ def apply(state, hp_pack: dict, N_seeds: int):
         arr = jnp.asarray(v, dtype=jnp.float32)
         if arr.shape != (N_seeds,):
             raise ValueError(f"--hp_pack '{k}' has shape {arr.shape}; expected ({N_seeds},)")
-        overrides[CLI_TO_FIELD.get(k, k)] = arr
-    if not overrides:
+        target = CLI_TO_FIELD.get(k, k)
+        (top_overrides if target in _TOPLEVEL_TARGETS else hp_overrides)[target] = arr
+    if not hp_overrides and not top_overrides:
         return state
-    state = state._replace(**overrides)
-    if "kl_budget_val" in overrides:
-        kl_budget_v = jnp.asarray(state.kl_budget_val, dtype=jnp.float32)
+    if hp_overrides:
+        state = state._replace(hp=state.hp._replace(**hp_overrides))
+    if top_overrides:
+        state = state._replace(**top_overrides)
+    if "kl_budget_val" in hp_overrides:
+        kl_budget_v = jnp.asarray(state.hp.kl_budget_val, dtype=jnp.float32)
         state = state._replace(
             tfg_eta=jnp.sqrt(jnp.maximum(jnp.float32(0.0), jnp.float32(2.0) * kl_budget_v))
         )
-    print(f"[hp_pack] applied per-seed overrides: {list(overrides.keys())}")
+    applied = list(hp_overrides.keys()) + list(top_overrides.keys())
+    print(f"[hp_pack] applied per-seed overrides: {applied}")
     return state
