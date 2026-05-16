@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 import time
 
 from relax.algorithm.dpmd import DPMD, DPMDConfig
@@ -55,9 +54,6 @@ if __name__ == "__main__":
         if seeds.per_entry_masters is not None:
             print(f"[hp_pack] applied per-entry master seeds "
                   f"(buffers + init networks + train keys): {seeds.per_entry_masters}")
-
-    if args.cluster:
-        PROJECT_ROOT = Path('/n/netscratch/nali_lab_seas/Lab/haitongma/sdac_logs')
 
     exp_dir = PROJECT_ROOT / "logs" / args.env / (args.alg + '_' + time.strftime("%Y-%m-%d_%H-%M-%S") + f'_s{args.seed}_{args.suffix}')
 

@@ -196,27 +196,30 @@ class VmapOffPolicyTrainer:
     # ------------------------------------------------------------------
     def warmup(self, key: jax.Array):
         train_obs_flat, _ = self.env.reset()
-        # obs_flat: [N*M, obs_dim]
+        # obs_flat: [N*M, obs_dim] where N = parallel seeds, M = envs-per-seed.
         # Each buffer fills to start_step transitions independently.
         # Since we step all N*M envs in sync, per-buffer per-step add is M.
         while any(len(b) < self.start_step for b in self.buffers):
-            action_env = self.env.action_space.sample()  # [N*M, act_dim]
-            next_obs_flat, reward_flat, term_flat, trunc_flat, info = self.env.step(action_env)
+            action = self.env.action_space.sample()  # [N*M, act_dim]
+            next_obs_flat, reward_flat, terminated_flat, truncated_flat, info = self.env.step(action)
 
+            # Reshape [N*M, ...] -> [N, M, ...]. The trailing -1 is the feature
+            # dim: obs_dim for obs/next_obs, act_dim for action; reward/term/
+            # trunc are scalar-per-env, so no feature dim.
             obs_nm = np.asarray(train_obs_flat).reshape(self.N, self.M, -1)
-            action_nm = np.asarray(action_env).reshape(self.N, self.M, -1)
+            action_nm = np.asarray(action).reshape(self.N, self.M, -1)
             nxt_nm = np.asarray(next_obs_flat).reshape(self.N, self.M, -1)
             rew_nm = np.asarray(reward_flat).reshape(self.N, self.M)
-            term_nm = np.asarray(term_flat).reshape(self.N, self.M)
-            trunc_nm = np.asarray(trunc_flat).reshape(self.N, self.M)
+            terminated_nm = np.asarray(terminated_flat).reshape(self.N, self.M)
+            truncated_nm = np.asarray(truncated_flat).reshape(self.N, self.M)
 
             for s in range(self.N):
                 exp_s = Experience.create(
-                    obs_nm[s], action_nm[s], rew_nm[s], term_nm[s], trunc_nm[s], nxt_nm[s], {},
+                    obs_nm[s], action_nm[s], rew_nm[s], terminated_nm[s], truncated_nm[s], nxt_nm[s], {},
                 )
                 self.buffers[s].add_batch(exp_s)
 
-            if np.any(term_flat) or np.any(trunc_flat):
+            if np.any(terminated_flat) or np.any(truncated_flat):
                 train_obs_flat, _ = self.env.reset()
             else:
                 train_obs_flat = next_obs_flat
@@ -333,27 +336,33 @@ class VmapOffPolicyTrainer:
             train_key = split_keys[:, 0]
             warmup_key = split_keys[:, 1]
             obs = self.warmup(warmup_key)
-            self._train_standard(train_key, obs)
+            self._train(train_key, obs)
         except KeyboardInterrupt:
             pass
         finally:
             self.finish()
 
-    def _train_standard(self, key: jax.Array, obs):
+    def _train(self, key: jax.Array, obs):
         while self.sample_logs[0].sample_step <= self.total_step:
             step = self.sample_logs[0].sample_step
+            # fold_in(key, step) deterministically mixes the integer ``step``
+            # into ``key`` to produce a fresh per-step PRNG without having to
+            # thread an updated key through the loop. Same (key, step) -> same
+            # output; different steps -> uncorrelated streams.
             seed_keys = jax.vmap(lambda k: jax.random.fold_in(k, step))(key)
             split_keys = jax.vmap(lambda k: jax.random.split(k, 2))(seed_keys)
             sample_key, update_key = split_keys[:, 0], split_keys[:, 1]
             obs = self.sample(sample_key, obs)
-            if self.update_per_iteration > 1:
-                update_keys = jax.vmap(
-                    lambda k: jax.random.split(k, self.update_per_iteration)
-                )(update_key)
-                for i in range(self.update_per_iteration):
-                    self.update(update_keys[:, i])
-            else:
-                self.update(update_key)
+            # Unified path: split out ``update_per_iteration`` per-seed subkeys
+            # and run one update per subkey. With update_per_iteration == 1
+            # this is NOT bit-identical to ``self.update(update_key)`` (since
+            # jax.random.split(k, 1) != k), but it matches the >1 branch
+            # exactly for any update_per_iteration >= 1.
+            update_keys = jax.vmap(
+                lambda k: jax.random.split(k, self.update_per_iteration)
+            )(update_key)
+            for i in range(self.update_per_iteration):
+                self.update(update_keys[:, i])
             self.progress.n = self.sample_logs[0].sample_step
             self.progress.refresh()
             self.logger.flush_all()

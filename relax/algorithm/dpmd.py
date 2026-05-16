@@ -69,7 +69,7 @@ class DPMD(Algorithm):
         # ``.log_eta_scales`` on the resulting namedtuple.
         agg_critic = lambda qm: _aggregate_q(qm, self.cfg.q_critic_agg)
         env_sampler = lambda key, state, obs: sampler(key, state, obs, agg_critic)
-        self._implement_common_behavior(updater, env_sampler)
+        self._implement_common_behavior(updater, env_sampler)  # inherited from Algorithm
 
     def _build_update_step(self, sampler):
         """Return the jitted ``stateless_update(key, state, data)`` closure.

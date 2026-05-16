@@ -33,6 +33,7 @@ def _split_info_vmap(info):
 class Algorithm:
     # NOTE: a not elegant blanket implementation of the algorithm interface
     def _implement_common_behavior(self, stateless_update, stateless_get_action):
+        """Registers the two stateless fns; base class will wrap them as ``update_vmap`` / ``get_action_vmap``."""
         # Store the un-jitted stateless fns so vmap-wrappers can compose
         # cleanly (jit-of-vmap instead of vmap-of-jit).
         self._stateless_update = stateless_update
