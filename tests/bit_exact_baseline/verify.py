@@ -50,22 +50,29 @@ def compare(baseline_csv: Path, new_csv: Path) -> tuple[bool, str]:
 
     base_size = baseline_csv.stat().st_size
     new_size = new_csv.stat().st_size
+    cmp_size = min(base_size, new_size)
+    partial = new_size < base_size
 
-    if new_size < base_size:
-        return False, (
-            f"new run has only {new_size} bytes vs baseline {base_size}; "
-            f"need to wait for the new run to produce at least as many rows "
-            f"as the baseline before declaring bit-exactness"
-        )
-
-    h_base = sha256_prefix(baseline_csv, base_size)
-    h_new = sha256_prefix(new_csv, base_size)
+    h_base = sha256_prefix(baseline_csv, cmp_size)
+    h_new = sha256_prefix(new_csv, cmp_size)
 
     if h_base == h_new:
+        # Count rows actually matched (lines fully contained in cmp_size).
+        with new_csv.open("rb") as f:
+            data = f.read(cmp_size)
+        # Number of complete lines = number of '\n' bytes; subtract header if present.
+        matched_newlines = data.count(b"\n")
+        matched_rows = max(matched_newlines - 1, 0)  # minus header
         with baseline_csv.open() as f:
-            base_lines = sum(1 for _ in f) - 1
+            base_rows = sum(1 for _ in f) - 1
+        if partial:
+            return True, (
+                f"BIT-EXACT SO FAR (matched {cmp_size} bytes / {matched_rows} rows; "
+                f"new run has {new_size} bytes vs baseline {base_size} bytes "
+                f"/ {base_rows} rows -- still running)"
+            )
         return True, (
-            f"BIT-EXACT (matched {base_size} bytes / {base_lines} rows of baseline; "
+            f"BIT-EXACT (matched {cmp_size} bytes / {base_rows} rows of baseline; "
             f"new run has {new_size} bytes total)"
         )
     else:

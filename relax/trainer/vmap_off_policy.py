@@ -23,6 +23,7 @@ from gymnasium import Env
 from tqdm import tqdm
 
 from relax.algorithm import Algorithm
+from relax.algorithm import ema_eta
 from relax.buffer import TreeBuffer
 from relax.env.vector import VectorEnv
 from relax.trainer.accumulator import Interval, SampleLog, UpdateLog
@@ -102,8 +103,6 @@ class VmapOffPolicyTrainer:
         # override step.
         self._hp_pack = hp_pack_dict
 
-        self._check_supported_config()
-
         if len(buffers) != self.N:
             raise ValueError(f"Expected {self.N} buffers, got {len(buffers)}")
         if not isinstance(env.unwrapped, VectorEnv):
@@ -156,17 +155,6 @@ class VmapOffPolicyTrainer:
             self._on_policy_ema_update = self._ema_update_one_step
         else:
             self._on_policy_ema_update = self._ema_update_kl_only
-
-    def _check_supported_config(self):
-        alg = self.algorithm
-        if getattr(alg, "supervised_steps", 1) > 1:
-            raise NotImplementedError("supervised_steps > 1 is not supported under vmap.")
-
-    def _per_seed_keys(self, key: jax.Array) -> jax.Array:
-        # train_mujoco.py always hands in a batched key (shape [N] of typed
-        # keys or [N, 2] of raw uint32 pairs). The single-master-key fallback
-        # has been removed.
-        return key
 
     def _iter_keys(self, key: jax.Array, step: int) -> Tuple[jax.Array, jax.Array]:
         seed_keys = jax.vmap(lambda k: jax.random.fold_in(k, step))(key)
@@ -236,8 +224,8 @@ class VmapOffPolicyTrainer:
         # obs_flat: [N*M, obs_dim] (from prior env.step)
         obs_nm = np.asarray(obs_flat).reshape(self.N, self.M, -1)
 
-        # One PRNG key per seed.
-        keys = self._per_seed_keys(sample_key)
+        # One PRNG key per seed (sample_key already has leading [N] seed axis).
+        keys = sample_key
 
         # Vmapped policy rollout. Returns (action [N,M,A], q [N,M], v [N,M] or None).
         action_nm, q_per_env, v_per_env = self.algorithm.get_action_vmap(keys, obs_nm)
@@ -320,114 +308,29 @@ class VmapOffPolicyTrainer:
 
     # ------------------------------------------------------------------
     # On-policy EMA + adaptive-η update (host-side, seed-axis-vectorized).
-    # Two single-purpose paths, dispatched once at construction time:
-    #
-    #   * _ema_update_kl_only       -- KL-budget-only η selection.
-    #   * _ema_update_one_step      -- KL ceiling AND one-step distribution-
-    #                                  shift η* (requires --one_step_dist_shift_eta).
-    #
-    # Every reduction that was over [M] per-env is over axis=1 of [N, M]
-    # arrays, yielding [N]-shaped per-seed quantities. State EMA fields are
-    # [N] float32 arrays. The numerical sequence (float64 promotion, the
-    # 1e-8 clamp, the 0.574 acceptance target, etc.) is preserved verbatim
-    # from the legacy combined implementation.
+    # The two pure paths live in ``relax.algorithm.ema_eta``; we just
+    # dispatch and replace the train state.
     # ------------------------------------------------------------------
-    def _broadcast_state_scalar(self, value) -> np.ndarray:
-        """Promote a state scalar/[N] field to a [N] float64 ndarray."""
-        arr = np.asarray(value).astype(np.float64)
-        if arr.ndim == 0:
-            arr = np.broadcast_to(arr, (self.N,)).astype(np.float64)
-        return arr
-
     def _ema_update_kl_only(self, q_per_env: np.ndarray, v_per_env: np.ndarray) -> np.ndarray:
-        """KL-budget-only path: update E[A^2] EMA and set η = sqrt(2δ/E[A^2])."""
-        alg = self.algorithm
-        state = alg.state
-        adv_per_env = q_per_env - v_per_env                # [N, M]
-        m2_batch = np.mean(adv_per_env ** 2, axis=1)        # [N]
-
-        tau_v = self._broadcast_state_scalar(state.adv_ema_tau)
-        cur_m2 = np.asarray(state.advantage_second_moment_ema)
-        new_m2 = (1 - tau_v) * cur_m2 + tau_v * m2_batch
-
-        kl_budget = self._broadcast_state_scalar(state.kl_budget_val)
-        m2_safe = np.maximum(new_m2, 1e-8)
-        sqrt_v = np.sqrt(m2_safe)
-        eta_kl_raw = np.sqrt(2.0 * kl_budget / m2_safe)
-        new_eta = eta_kl_raw * sqrt_v
-
-        alg.state = state._replace(
-            advantage_second_moment_ema=jnp.asarray(new_m2.astype(np.float32)),
-            tfg_eta=jnp.asarray(new_eta.astype(np.float32)),
+        new_state, adv = ema_eta.update_state_kl_only(
+            self.algorithm.state, q_per_env, v_per_env, self.N,
         )
-        return adv_per_env
+        self.algorithm.state = new_state
+        return adv
 
     def _ema_update_one_step(self, q_per_env: np.ndarray, v_per_env: np.ndarray) -> np.ndarray:
-        """One-step distribution-shift path: update {E[A^2], E[A^3], cov, shape}
-        EMAs and pick η = min(η_KL, η*) where η* comes from the second-order
-        expansion using the one-step covariance estimate."""
-        alg = self.algorithm
-        state = alg.state
-        adv_per_env = q_per_env - v_per_env                # [N, M]
-        m2_batch = np.mean(adv_per_env ** 2, axis=1)        # [N]
-        m3_batch = np.mean(adv_per_env ** 3, axis=1)        # [N]
-
-        tau_v = self._broadcast_state_scalar(state.adv_ema_tau)
-        cur_m2 = np.asarray(state.advantage_second_moment_ema)
-        cur_m3 = np.asarray(state.advantage_third_moment_ema)
-        cur_c = np.asarray(state.dist_shift_covariance_ema)
-        cur_shape = np.asarray(state.dist_shift_shape_ema)
-
-        new_m2 = (1 - tau_v) * cur_m2 + tau_v * m2_batch
-        new_m3 = (1 - tau_v) * cur_m3 + tau_v * m3_batch
-        new_c = cur_c
-        new_shape = cur_shape
-
-        # One-step covariance c_batch is only valid for env-steps where the
-        # previous step did not terminate; seeds with no valid samples this
-        # batch keep the prior EMA values unchanged.
-        if self._prev_adv_per_env is not None and self._prev_valid is not None:
-            valid = self._prev_valid                           # [N, M] bool
-            valid_count = np.sum(valid, axis=1)                # [N]
-            prod = valid.astype(np.float64) * (adv_per_env ** 2) * self._prev_adv_per_env
-            sums = np.sum(prod, axis=1)
-            c_batch = np.where(valid_count > 0, sums / np.maximum(valid_count, 1), 0.0)
-            c_batch_valid = valid_count > 0
-
-            new_c_candidate = (1 - tau_v) * cur_c + tau_v * c_batch
-            new_c = np.where(c_batch_valid, new_c_candidate, cur_c)
-
-            gamma = self._broadcast_state_scalar(state.gamma)
-            tau_s = self._broadcast_state_scalar(state.shape_ema_tau)
-            v_raw_safe = np.maximum(m2_batch, 1e-8)
-            b_batch = 2.0 * gamma * c_batch + m3_batch
-            s_batch = b_batch / v_raw_safe ** 1.5
-            new_shape_candidate = (1 - tau_s) * cur_shape + tau_s * s_batch
-            new_shape = np.where(c_batch_valid, new_shape_candidate, cur_shape)
-
-        # η = min(η_KL, η*); η* is +inf when shape is non-negative.
-        kl_budget = self._broadcast_state_scalar(state.kl_budget_val)
-        m2_safe = np.maximum(new_m2, 1e-8)
-        sqrt_v = np.sqrt(m2_safe)
-        eta_kl_raw = np.sqrt(2.0 * kl_budget / m2_safe)
-        eta_star_raw = np.where(new_shape < -1e-8, -1.0 / (sqrt_v * new_shape), np.inf)
-        eta_raw = np.minimum(eta_star_raw, eta_kl_raw)
-        new_eta = eta_raw * sqrt_v
-
-        alg.state = state._replace(
-            advantage_second_moment_ema=jnp.asarray(new_m2.astype(np.float32)),
-            advantage_third_moment_ema=jnp.asarray(new_m3.astype(np.float32)),
-            dist_shift_covariance_ema=jnp.asarray(new_c.astype(np.float32)),
-            dist_shift_shape_ema=jnp.asarray(new_shape.astype(np.float32)),
-            tfg_eta=jnp.asarray(new_eta.astype(np.float32)),
+        new_state, adv = ema_eta.update_state_one_step(
+            self.algorithm.state, q_per_env, v_per_env,
+            self._prev_adv_per_env, self._prev_valid, self.N,
         )
-        return adv_per_env
+        self.algorithm.state = new_state
+        return adv
 
     # ------------------------------------------------------------------
     # Update step
     # ------------------------------------------------------------------
     def update(self, update_key: jax.Array):
-        keys = self._per_seed_keys(update_key)
+        keys = update_key
         batches = [self.buffers[s].sample(self.batch_size) for s in range(self.N)]
 
         def stack_leaves(*xs):
@@ -498,7 +401,7 @@ class VmapOffPolicyTrainer:
     # ------------------------------------------------------------------
     def run(self, key: jax.Array):
         try:
-            # key always has leading [N] seed axis (see _per_seed_keys).
+            # key always has leading [N] seed axis (set by train_mujoco.py).
             split_keys = jax.vmap(lambda k: jax.random.split(k, 2))(key)
             train_key = split_keys[:, 0]
             warmup_key = split_keys[:, 1]
