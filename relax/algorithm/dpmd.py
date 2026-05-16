@@ -157,14 +157,12 @@ class DPMD(Algorithm):
         # --- Optional V(s) network for normalized-advantage guidance (critic_normalization='ema'). ---
         value_params_init, value_opt_state_init = self._setup_value_network(params)
 
-        # --- Cached scalars consumed by _build_initial_state and inner closures ---
-        # `timesteps` is also captured by closures defined further down in __init__
-        # (e.g. stateless_get_action_mala_full's mala_chain), so it must remain a
-        # local in __init__'s scope -- not just an attribute on self.
-        timesteps = self.agent.num_timesteps
+        # --- Cached scalars consumed by _build_initial_state and the
+        # stateless_* closures returned by _build_mala_sampler /
+        # _build_update_step / _build_env_sampler. ---
         self._init_log_eta_scale = jnp.float32(0.0)  # eta_scale = exp(0) = 1.0
         self._init_tfg_eta = self.tfg_eta
-        self._timesteps = int(timesteps)
+        self._timesteps = int(self.agent.num_timesteps)
 
         # --- Initial vmap-stackable train state ---
         self.state = self._build_initial_state(params, value_params_init, value_opt_state_init)
@@ -174,11 +172,24 @@ class DPMD(Algorithm):
         self._alphas_cumprod = np.asarray(B_sched.alphas_cumprod)  # [T]
         self._snr = self._alphas_cumprod / np.maximum(1.0 - self._alphas_cumprod, 1e-8)
 
-        # Q aggregation closures used by the sampler / TD update.
-        # The TD-bootstrap path always uses 'min' (clipped double-Q); the
-        # rollout / guidance path uses the configured --q_critic_agg.
+        # --- Stateless update / sampler closures (jit-able, vmap-able). ---
+        # Each builder returns a single closure; the closures capture
+        # ``self`` so all per-instance scalars / sub-networks are visible.
+        # Bit-identical to the legacy in-line nested closures.
+        sampler = self._build_mala_sampler()
+        updater = self._build_update_step(sampler)
+        env_sampler = self._build_env_sampler(sampler)
+        self._implement_common_behavior(updater, env_sampler)
+
+    def _build_update_step(self, sampler):
+        """Return the jitted ``stateless_update(key, state, data)`` closure.
+
+        ``sampler`` is the ``stateless_get_action_mala_full`` closure built by
+        ``_build_mala_sampler``; it is invoked here to draw the next-state
+        action used as the diffusion-loss target and the TD bootstrap point.
+        """
+        # The TD-bootstrap path always uses 'min' (clipped double-Q).
         agg_min = lambda qm: _aggregate_q(qm, "min")
-        agg_critic = lambda qm: _aggregate_q(qm, self.q_critic_agg)
 
         @jax.jit
         def stateless_update(
@@ -206,7 +217,7 @@ class DPMD(Algorithm):
             reward *= state.reward_scale
 
             # Sample a single next-action and evaluate target-Q on it (td_actions=1).
-            mala_result = stateless_get_action_mala_full(
+            mala_result = sampler(
                 next_eval_key, state, next_obs, agg_min,
             )
             next_action = mala_result.action
@@ -218,45 +229,10 @@ class DPMD(Algorithm):
             q_target_min_for_backup = _aggregate_q(q_target_per_q, "min")
             shared_backup = reward + not_done * state.gamma * q_target_min_for_backup
             q_backup_per_q = [shared_backup] * num_q
-            delta = state.q_td_huber_width * state.reward_scale
-            use_huber = jnp.isfinite(delta)
-            delta_safe = jnp.where(use_huber, delta, jnp.float32(1.0))
 
-            def huber_loss(e):
-                abs_e = jnp.abs(e)
-                quad = jnp.minimum(abs_e, delta_safe)
-                lin = abs_e - quad
-                return jnp.float32(0.5) * quad * quad + delta_safe * lin
-
-            def compute_td_loss(td_err):
-                per_elem = jnp.where(use_huber, huber_loss(td_err), td_err * td_err)
-                return jnp.mean(per_elem)
-
-            # Per-Q TD loss + Adam step. vmapped across the N Q networks so XLA
-            # emits a single batched matmul per layer (and a single batched Adam
-            # update) instead of N independent unrolled ops.
-            def single_q_train_step(qp, opt_s, backup_qi):
-                def q_loss_fn(p):
-                    q_pred_mean = self.agent.q(p, obs, action)
-                    td_err = q_pred_mean - backup_qi
-                    return compute_td_loss(td_err), q_pred_mean
-
-                (qi_loss, qi_pred), qi_grads = jax.value_and_grad(q_loss_fn, has_aux=True)(qp)
-                update, new_opt = self.optim.update(qi_grads, opt_s, params=qp)
-                update = jax.tree.map(lambda u: -state.lr_q * u, update)
-                new_qp = optax.apply_updates(qp, update)
-                return new_qp, new_opt, qi_loss, qi_pred
-
-            stacked_q_params = jax.tree.map(lambda *ps: jnp.stack(ps), *q_params)
-            stacked_q_opt = jax.tree.map(lambda *ss: jnp.stack(ss), *q_opt_states)
-            stacked_backup = jnp.stack(q_backup_per_q)
-
-            stacked_new_qp, stacked_new_opt, all_q_losses, _all_q_preds = jax.vmap(
-                single_q_train_step
-            )(stacked_q_params, stacked_q_opt, stacked_backup)
-
-            q_params = tuple(jax.tree.map(lambda x: x[i], stacked_new_qp) for i in range(num_q))
-            q_opt_states = tuple(jax.tree.map(lambda x: x[i], stacked_new_opt) for i in range(num_q))
+            q_params, q_opt_states, all_q_losses = self._train_q_ensemble(
+                state, obs, action, q_params, q_opt_states, q_backup_per_q
+            )
 
             def policy_loss_fn(policy_params) -> jax.Array:
                 # Constant-weight diffusion score-matching loss against
@@ -319,35 +295,13 @@ class DPMD(Algorithm):
                 new_target_q_list.append(delay_target_update(q_params[qi], target_q_params[qi], state.polyak_tau))
             target_q_params = tuple(new_target_q_list)
 
-            # Normalized advantage guidance: train V(s) and update A² EMA
-            value_params_updated = state.value_params
-            value_opt_state_updated = state.opt_state.value
+            # Normalized advantage guidance: train V(s'). The advantage-EMA
+            # itself is updated outside jit in VmapOffPolicyTrainer.sample()
+            # (on-policy mode), so we pass state.advantage_second_moment_ema
+            # through unchanged here.
+            value_params_updated, value_opt_state_updated, value_loss_log = \
+                self._value_update_step(state, q_target_per_q, next_obs)
             new_adv_second_moment_ema = state.advantage_second_moment_ema
-            value_loss_log = jnp.float32(0.0)
-            adv_second_moment_log = jnp.float32(0.0)
-            
-            if self.critic_normalization == "ema" and state.value_params is not None:
-                # KL-budget / on-policy-EMA mode: train V(s') against
-                # on-policy Q(s', a') targets. q_target_per_q is already
-                # computed at (next_obs, next_action) with a' ~ π_current.
-                # The legacy off-policy V path (critic_normalization='ema'
-                # without kl_budget) was removed; an assertion in __init__
-                # enforces that combo.
-                q_for_v = agg_critic(q_target_per_q)
-
-                def value_loss_fn(v_params):
-                    v_pred = self._value_net.apply(v_params, next_obs)
-                    return jnp.mean((v_pred - jax.lax.stop_gradient(q_for_v)) ** 2)
-
-                v_loss, v_grads = jax.value_and_grad(value_loss_fn)(state.value_params)
-                v_updates, value_opt_state_updated = self.optim.update(v_grads, state.opt_state.value, state.value_params)
-                v_updates = jax.tree.map(lambda u: -state.lr_q * u, v_updates)
-                value_params_updated = optax.apply_updates(state.value_params, v_updates)
-                value_loss_log = v_loss
-
-                # On-policy mode: EMA is updated outside jit in sample();
-                # pass through here.
-                adv_second_moment_log = state.advantage_second_moment_ema
 
             state = state._replace(
                 params=Diffv2Params(q_params, target_q_params, policy_params),
@@ -382,6 +336,20 @@ class DPMD(Algorithm):
             if self.critic_normalization == "ema":
                 info["Critic/inv_sqrt(E(Var(Q))_ema)"] = jnp.float32(1.0) / jnp.sqrt(jnp.maximum(new_adv_second_moment_ema, jnp.float32(1e-6)))
             return state, info
+
+        return stateless_update
+
+    def _build_mala_sampler(self):
+        """Return the ``stateless_get_action_mala_full(key, state, obs, aggregate_q_fn)``
+        closure: one full pass of the MALA-corrected diffusion sampler that
+        produces ``MalaSampleResult(action, q, log_eta_scales, per_level_acc, per_level_clip)``.
+
+        ``aggregate_q_fn`` selects how to reduce the Q-ensemble outputs at the
+        guidance / final-Q evaluation points; the TD-update path passes
+        ``agg_min`` (clipped double-Q), the env rollout path passes
+        ``agg_critic`` (`--q_critic_agg`).
+        """
+        timesteps = self._timesteps
 
         def stateless_get_action_mala_full(
             key: jax.Array,
@@ -582,20 +550,6 @@ class DPMD(Algorithm):
                             clip_sum_level,
                         )
 
-                    if self.mala_no_predictor:
-                        acc_sum_before = acc_sum
-                        acc_count_before = acc_count
-                        x_curr, k, log_eta_scales, acc_sum, acc_count, clip_sum_level = do_mala_level(
-                            (x_curr, k, log_eta_scales, acc_sum, acc_count), t
-                        )
-                        level_acc_sum = acc_sum - acc_sum_before
-                        level_acc_count = acc_count - acc_count_before
-                        level_acc = level_acc_sum / jnp.maximum(level_acc_count, jnp.float32(1.0))
-                        per_level_acc = per_level_acc.at[t].set(level_acc)
-                        mala_steps_f = jnp.float32(self.agent.mala_steps)
-                        per_level_clip_frac = per_level_clip_frac.at[t].set(clip_sum_level / jnp.maximum(mala_steps_f, jnp.float32(1.0)))
-                        return x_curr, k, log_eta_scales, acc_sum, acc_count, per_level_acc, per_level_clip_frac
-
                     acc_sum_before = acc_sum
                     acc_count_before = acc_count
                     x_curr, k, log_eta_scales, acc_sum, acc_count, clip_sum_level = do_mala_level(
@@ -607,6 +561,8 @@ class DPMD(Algorithm):
                     per_level_acc = per_level_acc.at[t].set(level_acc)
                     mala_steps_f = jnp.float32(self.agent.mala_steps)
                     per_level_clip_frac = per_level_clip_frac.at[t].set(clip_sum_level / jnp.maximum(mala_steps_f, jnp.float32(1.0)))
+                    if self.mala_no_predictor:
+                        return x_curr, k, log_eta_scales, acc_sum, acc_count, per_level_acc, per_level_clip_frac
                     x_next, k = predictor_step(t, x_curr, k)
                     return x_next, k, log_eta_scales, acc_sum, acc_count, per_level_acc, per_level_clip_frac
 
@@ -636,15 +592,26 @@ class DPMD(Algorithm):
                 per_level_acc=pl_acc, per_level_clip=pl_clip,
             )
 
+        return stateless_get_action_mala_full
+
+    def _build_env_sampler(self, sampler):
+        """Return the ``stateless_get_action_env(key, state, obs)`` closure
+        used by the rollout path. Wraps ``sampler`` with the configured
+        ``--q_critic_agg`` aggregation and unpacks ``MalaSampleResult`` to
+        the ``(action, q, log_eta_scales)`` triple expected by
+        ``Algorithm._get_action_vmap_fn``.
+        """
+        agg_critic = lambda qm: _aggregate_q(qm, self.q_critic_agg)
+
         def stateless_get_action_env(
             key: jax.Array,
             state: Diffv2TrainState,
             obs: jax.Array,
         ):
-            r = stateless_get_action_mala_full(key, state, obs, agg_critic)
+            r = sampler(key, state, obs, agg_critic)
             return r.action, r.q, r.log_eta_scales
 
-        self._implement_common_behavior(stateless_update, stateless_get_action_env)
+        return stateless_get_action_env
 
     def get_policy_params(self):
         # All stateless_* sampler/update functions take the full Diffv2TrainState;
@@ -736,6 +703,84 @@ class DPMD(Algorithm):
         self._value_net = value_net
         self._obs_dim = obs_dim_inferred
         return value_params_init, value_opt_state_init
+
+    def _train_q_ensemble(self, state, obs, action, q_params, q_opt_states, q_backup_per_q):
+        """One Adam step on each of the N Q critics against its TD target.
+
+        The per-Q TD loss + Adam step is vmapped across the ensemble so XLA
+        emits a single batched matmul per layer (and a single batched Adam
+        update) instead of N independent unrolled ops.
+
+        ``q_backup_per_q`` is a list of N TD targets (under clipped double
+        Q-learning these are all equal to the min over target Qs). Returns
+        ``(new_q_params_tuple, new_q_opt_states_tuple, all_q_losses)``.
+        """
+        num_q = len(q_params)
+        delta = state.q_td_huber_width * state.reward_scale
+        use_huber = jnp.isfinite(delta)
+        delta_safe = jnp.where(use_huber, delta, jnp.float32(1.0))
+
+        def huber_loss(e):
+            abs_e = jnp.abs(e)
+            quad = jnp.minimum(abs_e, delta_safe)
+            lin = abs_e - quad
+            return jnp.float32(0.5) * quad * quad + delta_safe * lin
+
+        def compute_td_loss(td_err):
+            per_elem = jnp.where(use_huber, huber_loss(td_err), td_err * td_err)
+            return jnp.mean(per_elem)
+
+        def single_q_train_step(qp, opt_s, backup_qi):
+            def q_loss_fn(p):
+                q_pred_mean = self.agent.q(p, obs, action)
+                td_err = q_pred_mean - backup_qi
+                return compute_td_loss(td_err), q_pred_mean
+
+            (qi_loss, qi_pred), qi_grads = jax.value_and_grad(q_loss_fn, has_aux=True)(qp)
+            update, new_opt = self.optim.update(qi_grads, opt_s, params=qp)
+            update = jax.tree.map(lambda u: -state.lr_q * u, update)
+            new_qp = optax.apply_updates(qp, update)
+            return new_qp, new_opt, qi_loss, qi_pred
+
+        stacked_q_params = jax.tree.map(lambda *ps: jnp.stack(ps), *q_params)
+        stacked_q_opt = jax.tree.map(lambda *ss: jnp.stack(ss), *q_opt_states)
+        stacked_backup = jnp.stack(q_backup_per_q)
+
+        stacked_new_qp, stacked_new_opt, all_q_losses, _all_q_preds = jax.vmap(
+            single_q_train_step
+        )(stacked_q_params, stacked_q_opt, stacked_backup)
+
+        new_q_params = tuple(jax.tree.map(lambda x: x[i], stacked_new_qp) for i in range(num_q))
+        new_q_opt_states = tuple(jax.tree.map(lambda x: x[i], stacked_new_opt) for i in range(num_q))
+        return new_q_params, new_q_opt_states, all_q_losses
+
+    def _value_update_step(self, state, q_target_per_q, next_obs):
+        """Train V(s') against on-policy Q(s', a') targets (KL-budget mode).
+
+        Returns ``(value_params_updated, value_opt_state_updated, value_loss_log)``.
+        Outside KL-budget / EMA mode this is a pass-through that returns the
+        existing V state unchanged and a zero loss.
+
+        ``q_target_per_q`` is already computed at (next_obs, next_action)
+        with a' ~ π_current. The legacy off-policy V branch (EMA mode without
+        --kl_budget) was removed; ``_validate_invariants`` enforces that combo.
+        """
+        if not (self.critic_normalization == "ema" and state.value_params is not None):
+            return state.value_params, state.opt_state.value, jnp.float32(0.0)
+
+        q_for_v = _aggregate_q(q_target_per_q, self.q_critic_agg)
+
+        def value_loss_fn(v_params):
+            v_pred = self._value_net.apply(v_params, next_obs)
+            return jnp.mean((v_pred - jax.lax.stop_gradient(q_for_v)) ** 2)
+
+        v_loss, v_grads = jax.value_and_grad(value_loss_fn)(state.value_params)
+        v_updates, value_opt_state_updated = self.optim.update(
+            v_grads, state.opt_state.value, state.value_params
+        )
+        v_updates = jax.tree.map(lambda u: -state.lr_q * u, v_updates)
+        value_params_updated = optax.apply_updates(state.value_params, v_updates)
+        return value_params_updated, value_opt_state_updated, v_loss
 
     def _build_initial_state(self, params, value_params_init, value_opt_state_init):
         """Construct a fresh Diffv2TrainState from a given set of network params.
@@ -842,6 +887,60 @@ class DPMD(Algorithm):
             "lr_policy_effective": float(self.lr_policy),
             "lr_q_effective": float(self.lr_q),
         }
+
+    # Map argparse attribute names that the hp_pack uses to the
+    # corresponding Diffv2TrainState field names. Keys not in this map
+    # share their argparse name with the state field (e.g. "lr_q",
+    # "shape_ema_tau", "reward_scale", ...).
+    _HP_PACK_CLI_TO_FIELD = {
+        "tau": "polyak_tau",
+        "advantage_ema_tau": "adv_ema_tau",
+        "guidance_strength_multiplier": "guidance_mult",
+        "kl_budget": "kl_budget_val",
+        "initial_advantage_second_moment_ema": "advantage_second_moment_ema",
+        "initial_dist_shift_shape_ema": "dist_shift_shape_ema",
+        "tfg_eta": "tfg_eta",
+    }
+    _HP_PACK_ALLOWED = {
+        "lr_q", "lr_policy", "gamma", "tau", "advantage_ema_tau",
+        "guidance_strength_multiplier", "shape_ema_tau", "tfg_eta", "kl_budget",
+        "initial_advantage_second_moment_ema", "initial_dist_shift_shape_ema",
+        "reward_scale", "x0_hat_clip_radius", "mala_adapt_rate",
+        "q_td_huber_width",
+        "seed",
+    }
+
+    def apply_hp_pack(self, hp_pack: dict, N_seeds: int) -> None:
+        """Apply per-seed hyperparameter overrides to ``self.state``.
+
+        ``hp_pack`` keys are argparse attribute names; values are length-N
+        lists. The ``"seed"`` key is consumed earlier (in derive_seed_bundle)
+        and skipped here. When ``kl_budget`` is overridden, ``tfg_eta`` is
+        automatically rederived as sqrt(2*kl_budget) so the two stay
+        consistent.
+        """
+        overrides = {}
+        for k, v in hp_pack.items():
+            if k not in self._HP_PACK_ALLOWED:
+                raise ValueError(
+                    f"--hp_pack key '{k}' is not a per-seed vmappable hp. "
+                    f"Allowed: {sorted(self._HP_PACK_ALLOWED)}"
+                )
+            if k == "seed":
+                continue
+            arr = jnp.asarray(v, dtype=jnp.float32)
+            if arr.shape != (N_seeds,):
+                raise ValueError(f"--hp_pack '{k}' has shape {arr.shape}; expected ({N_seeds},)")
+            overrides[self._HP_PACK_CLI_TO_FIELD.get(k, k)] = arr
+        if not overrides:
+            return
+        self.state = self.state._replace(**overrides)
+        if "kl_budget_val" in overrides:
+            kl_budget_v = jnp.asarray(self.state.kl_budget_val, dtype=jnp.float32)
+            self.state = self.state._replace(
+                tfg_eta=jnp.sqrt(jnp.maximum(jnp.float32(0.0), jnp.float32(2.0) * kl_budget_v))
+            )
+        print(f"[hp_pack] applied per-seed overrides: {list(overrides.keys())}")
 
     def save_policy(self, path: str) -> None:
         policy = jax.device_get(self.get_policy_params_to_save())
