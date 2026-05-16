@@ -42,9 +42,7 @@ if __name__ == "__main__":
     resolve_kl_budget(args, act_dim)
 
     print(f"Algorithm: {args.alg}")
-    agent, dpmd_params_list, buffers_list = build_per_seed_state(
-        args, seeds, obs_dim, act_dim,
-    )
+    agent, dpmd_params_list, buffers_list = build_per_seed_state(args, seeds, obs_dim, act_dim)
     params = dpmd_params_list[0]
 
     cfg = DPMDConfig.from_args(args)

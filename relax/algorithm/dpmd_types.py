@@ -12,9 +12,11 @@ and dataclass declarations. The types here are:
 * :class:`DPMDConfig`             — frozen container of every scalar
                                     hyperparameter, built once in
                                     ``scripts/train_mujoco.py``.
-* ``_HP_CFG_TO_STATE`` / ``_HP_CFG_FIELDS`` — translation tables used by
-  ``DPMD._build_initial_state`` to materialise ``HParams`` from a
-  ``DPMDConfig`` (cfg-name → state-name renames + the field order).
+
+``DPMD._build_initial_state`` materialises ``HParams`` from a ``DPMDConfig``
+with an explicit field-by-field ``HParams(gamma=cfg.gamma, ...)`` literal,
+so the cfg→state name mapping (e.g. ``cfg.tau`` → ``hp.polyak_tau``) lives
+at the call site rather than in a separate translation table.
 """
 from dataclasses import dataclass
 from typing import NamedTuple, Optional
@@ -148,21 +150,3 @@ class DPMDConfig:
             kl_budget=args.kl_budget,
             one_step_dist_shift_eta=args.one_step_dist_shift_eta,
         )
-
-
-# Map DPMDConfig field names to the corresponding ``Diffv2TrainState`` field
-# names for the per-seed-vmappable hp scalars. Renames are explicit; identity
-# mappings (``lr_q``, ``reward_scale``, ...) are auto-inferred from set diff.
-_HP_CFG_TO_STATE = {
-    "tau": "polyak_tau",
-    "guidance_strength_multiplier": "guidance_mult",
-    "advantage_ema_tau": "adv_ema_tau",
-    "kl_budget": "kl_budget_val",  # None → 1.0 sentinel handled in _build_initial_state
-}
-# Cfg fields packed into Diffv2TrainState's per-seed hp block (in the order
-# they appear on the state namedtuple).
-_HP_CFG_FIELDS = (
-    "gamma", "tau", "lr_q", "lr_policy", "guidance_strength_multiplier",
-    "advantage_ema_tau", "shape_ema_tau", "kl_budget", "reward_scale",
-    "x0_hat_clip_radius", "mala_adapt_rate", "q_td_huber_width",
-)

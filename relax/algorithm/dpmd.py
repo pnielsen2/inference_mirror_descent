@@ -1,4 +1,3 @@
-from dataclasses import fields
 from typing import Tuple
 
 import jax, jax.numpy as jnp
@@ -13,8 +12,6 @@ from relax.algorithm.dpmd_types import (
     HParams,
     Diffv2TrainState,
     DPMDConfig,
-    _HP_CFG_TO_STATE,
-    _HP_CFG_FIELDS,
 )
 from relax.algorithm.value_head import ValueHead
 from relax.network.diffv2 import Diffv2Net, Diffv2Params
@@ -36,11 +33,11 @@ class DPMD(Algorithm):
         self.cfg = cfg
         self._obs_dim = int(obs_dim)
         self._hidden_dim = int(hidden_dim)
-        # Expose every cfg field as a direct attribute on self so existing
-        # ``self.X`` / ``algorithm.X`` references keep working.
-        for _f in fields(DPMDConfig):
-            object.__setattr__(self, _f.name, getattr(cfg, _f.name))
+        # Derived/exposed flags. Everything else lives on ``self.cfg``; the
+        # two attributes below are also read off the algorithm by the
+        # trainer (``algorithm.on_policy_ema`` / ``algorithm.one_step_dist_shift_eta``).
         self.on_policy_ema = (cfg.kl_budget is not None)
+        self.one_step_dist_shift_eta = bool(cfg.one_step_dist_shift_eta)
         self.policy_loss_key = "losses/Policy_epsilon_MSE"
 
         # --- Optimizers: unscaled Adam; per-seed state.lr_{q,policy} is applied at update time. ---
@@ -70,7 +67,7 @@ class DPMD(Algorithm):
         # and let the JIT'd entry return the full ``MalaSampleResult``; the
         # host-side ``get_action_vmap`` then accesses ``.action`` / ``.q`` /
         # ``.log_eta_scales`` on the resulting namedtuple.
-        agg_critic = lambda qm: _aggregate_q(qm, self.q_critic_agg)
+        agg_critic = lambda qm: _aggregate_q(qm, self.cfg.q_critic_agg)
         env_sampler = lambda key, state, obs: sampler(key, state, obs, agg_critic)
         self._implement_common_behavior(updater, env_sampler)
 
@@ -155,12 +152,12 @@ class DPMD(Algorithm):
             # Policy + target-Q updates, both gated by step % delay_update == 0.
             policy_params, policy_opt_state = delayed_param_update(
                 self.policy_optim, policy_params, policy_grads, policy_opt_state,
-                state.hp.lr_policy, step, self.delay_update,
+                state.hp.lr_policy, step, self.cfg.delay_update,
             )
             target_q_params = tuple(
                 delayed_target_update(
                     q_params[qi], target_q_params[qi], state.hp.polyak_tau,
-                    step, self.delay_update,
+                    step, self.cfg.delay_update,
                 )
                 for qi in range(num_q)
             )
@@ -271,7 +268,7 @@ class DPMD(Algorithm):
         if self.value_head is None or state.value_params is None:
             return state.value_params, state.opt_state.value, jnp.float32(0.0)
 
-        q_for_v = _aggregate_q(q_target_per_q, self.q_critic_agg)
+        q_for_v = _aggregate_q(q_target_per_q, self.cfg.q_critic_agg)
         return self.value_head.update_step(state, q_for_v, next_obs, state.hp.lr_q, self.optim)
 
     def _build_mala_sampler(self):
@@ -284,10 +281,10 @@ class DPMD(Algorithm):
             agent=self.agent,
             value_head=self.value_head,
             timesteps=self._timesteps,
-            energy_multiplier=self.energy_multiplier,
-            batch_independent_guidance=self.batch_independent_guidance,
-            mala_guided_predictor=self.mala_guided_predictor,
-            mala_no_predictor=self.mala_no_predictor,
+            energy_multiplier=self.cfg.energy_multiplier,
+            batch_independent_guidance=self.cfg.batch_independent_guidance,
+            mala_guided_predictor=self.cfg.mala_guided_predictor,
+            mala_no_predictor=self.cfg.mala_no_predictor,
         )
 
     def get_action_vmap(self, key: jax.Array, obs: np.ndarray):
@@ -336,18 +333,12 @@ class DPMD(Algorithm):
 
         Factored out of __init__ so vmap-mode setup can call it N times with
         different init seeds and stack the results along a leading seed axis.
-        The per-seed-vmappable hp scalars are packed programmatically via
-        ``_HP_CFG_FIELDS`` / ``_HP_CFG_TO_STATE`` so the field list lives in
-        exactly one place.
         """
         cfg = self.cfg
-        hp_kwargs = {}
-        for cfg_name in _HP_CFG_FIELDS:
-            state_name = _HP_CFG_TO_STATE.get(cfg_name, cfg_name)
-            v = getattr(cfg, cfg_name)
-            if cfg_name == "kl_budget" and v is None:
-                v = 1.0  # in-graph sentinel; host η-cap uses cfg.kl_budget directly
-            hp_kwargs[state_name] = jnp.float32(v)
+        # In-graph kl_budget sentinel: when --kl_budget is disabled (None),
+        # store 1.0 so the value can still be a jnp.float32 in the vmappable
+        # HParams; the host-side η cap reads ``cfg.kl_budget`` directly.
+        kl_budget_val = 1.0 if cfg.kl_budget is None else cfg.kl_budget
         return Diffv2TrainState(
             params=params,
             opt_state=Diffv2OptStates(
@@ -363,7 +354,20 @@ class DPMD(Algorithm):
             advantage_third_moment_ema=jnp.float32(0.0),
             dist_shift_covariance_ema=jnp.float32(0.0),
             dist_shift_shape_ema=jnp.float32(cfg.initial_dist_shift_shape_ema),
-            hp=HParams(**hp_kwargs),
+            hp=HParams(
+                gamma=jnp.float32(cfg.gamma),
+                polyak_tau=jnp.float32(cfg.tau),
+                lr_q=jnp.float32(cfg.lr_q),
+                lr_policy=jnp.float32(cfg.lr_policy),
+                guidance_mult=jnp.float32(cfg.guidance_strength_multiplier),
+                adv_ema_tau=jnp.float32(cfg.advantage_ema_tau),
+                shape_ema_tau=jnp.float32(cfg.shape_ema_tau),
+                kl_budget_val=jnp.float32(kl_budget_val),
+                reward_scale=jnp.float32(cfg.reward_scale),
+                x0_hat_clip_radius=jnp.float32(cfg.x0_hat_clip_radius),
+                mala_adapt_rate=jnp.float32(cfg.mala_adapt_rate),
+                q_td_huber_width=jnp.float32(cfg.q_td_huber_width),
+            ),
         )
 
     def make_vmapped_state(self, params_list, value_init_keys=None):
@@ -392,8 +396,8 @@ class DPMD(Algorithm):
 
     def get_effective_hparams(self) -> dict:
         return {
-            "lr_policy_effective": float(self.lr_policy),
-            "lr_q_effective": float(self.lr_q),
+            "lr_policy_effective": float(self.cfg.lr_policy),
+            "lr_q_effective": float(self.cfg.lr_q),
         }
 
 

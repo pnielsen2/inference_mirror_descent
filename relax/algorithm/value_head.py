@@ -6,7 +6,7 @@ DPMD:
 * ``init_params(key)`` / ``init_opt_state(params)`` for vmap-mode setup.
 * ``apply(params, obs)`` for the in-jit ``q_mean_from_x`` advantage normalization.
 * ``apply_vmap(vparams_N, obs_N)`` for the host-side ``get_action_vmap`` rollout
-  block (lazy-jitted on first call).
+  block (eagerly ``jax.jit``+``jax.vmap``-wrapped in ``create``).
 * ``update_step(state, q_for_v, next_obs, lr_q, optim)`` for the on-policy V TD
   update inside ``stateless_update``.
 
@@ -16,7 +16,7 @@ layers of ``hidden_dim`` with ReLU; loss is ``mean((V - sg(Q_for_V))^2)``
 with the same per-seed ``lr_q`` scaling and ``optax.scale_by_adam`` updates.
 """
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 import jax
 import jax.numpy as jnp
@@ -31,7 +31,7 @@ class ValueHead:
     obs_dim: int
     hidden_dim: int
     _value_net: hk.Transformed
-    _apply_vmap_jit: Optional[object] = None  # set lazily
+    _apply_vmap: Optional[Callable] = None  # built eagerly in ``create``
 
     @classmethod
     def create(cls, obs_dim: int, hidden_dim: int) -> "ValueHead":
@@ -41,7 +41,17 @@ class ValueHead:
                 activation=jax.nn.relu,
             )(obs))
         )
-        return cls(obs_dim=obs_dim, hidden_dim=hidden_dim, _value_net=value_net)
+        v_apply = value_net.apply
+
+        def _single(vp_i, ob_i):
+            v = v_apply(vp_i, ob_i)
+            if isinstance(v, tuple):
+                v = v[0]
+            return v
+
+        apply_vmap = jax.jit(jax.vmap(_single))
+        return cls(obs_dim=obs_dim, hidden_dim=hidden_dim,
+                   _value_net=value_net, _apply_vmap=apply_vmap)
 
     # --- Initialization -------------------------------------------------
     def init_params(self, key: jax.Array):
@@ -57,19 +67,7 @@ class ValueHead:
 
     # --- Host-side vmapped forward (used by get_action_vmap rollout) ----
     def apply_vmap(self, vparams, obs: jax.Array) -> jax.Array:
-        if self._apply_vmap_jit is None:
-            v_apply = self._value_net.apply
-
-            @jax.jit
-            def _vmap_jit(vp, ob):
-                def single(vp_i, ob_i):
-                    v = v_apply(vp_i, ob_i)
-                    if isinstance(v, tuple):
-                        v = v[0]
-                    return v
-                return jax.vmap(single)(vp, ob)
-            self._apply_vmap_jit = _vmap_jit
-        return self._apply_vmap_jit(vparams, obs)
+        return self._apply_vmap(vparams, obs)
 
     # --- In-jit V TD update -------------------------------------------
     def update_step(self, state, q_for_v: jax.Array, next_obs: jax.Array,

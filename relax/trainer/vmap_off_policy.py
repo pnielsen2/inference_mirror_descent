@@ -32,6 +32,31 @@ from relax.trainer.wandb_logging import WandbMultiSeedLogger, build_config_tag  
 from relax.utils.experience import Experience
 
 
+def _detect_env_can_terminate(env_name: str) -> bool:
+    """Probe a gym(nasium) env id to decide if it ever sets ``terminated=True``.
+
+    Used by ``VmapOffPolicyTrainer`` to skip episode-length / reward-mean
+    metrics for envs that only ever time out (e.g. v5 mujoco envs with
+    ``_terminate_when_unhealthy=False``). Falls back to ``True`` (treat as
+    terminating) when the probe fails for any reason.
+    """
+    try:
+        import gymnasium
+        probe = gymnasium.make(env_name)
+        inner = probe.unwrapped
+        can = getattr(inner, "_terminate_when_unhealthy", None)
+        probe.close()
+        if can is not None:
+            return bool(can)
+        import inspect
+        src = inspect.getsource(inner.step)
+        if "return observation, reward, False, False" in src:
+            return False
+        return True
+    except Exception:
+        return True
+
+
 class VmapOffPolicyTrainer:
     def __init__(
         self,
@@ -103,23 +128,6 @@ class VmapOffPolicyTrainer:
         if _gamma.ndim == 0:
             _gamma = np.broadcast_to(_gamma, (self.N,)).astype(np.float64)
         _q_label = "Q"
-
-        def _detect_env_can_terminate(env_name: str) -> bool:
-            try:
-                import gymnasium
-                probe = gymnasium.make(env_name)
-                inner = probe.unwrapped
-                can = getattr(inner, "_terminate_when_unhealthy", None)
-                probe.close()
-                if can is not None:
-                    return bool(can)
-                import inspect
-                src = inspect.getsource(inner.step)
-                if "return observation, reward, False, False" in src:
-                    return False
-                return True
-            except Exception:
-                return True
 
         _can_terminate = _detect_env_can_terminate(self.env_name)
         self.sample_logs = [
