@@ -34,15 +34,13 @@ def _split_info_vmap(info):
 
 class Algorithm:
     # NOTE: a not elegant blanket implementation of the algorithm interface
-    def _implement_common_behavior(self, stateless_update, stateless_get_action, stateless_get_deterministic_action, stateless_get_value=None):
+    def _implement_common_behavior(self, stateless_update, stateless_get_action):
         # Store the un-jitted stateless fns so vmap-wrappers can compose
         # cleanly (jit-of-vmap instead of vmap-of-jit).
         self._stateless_update = stateless_update
         self._stateless_get_action = stateless_get_action
-        self._stateless_get_deterministic_action = stateless_get_deterministic_action
         self._update_vmap = None
         self._get_action_vmap_fn = None
-        self._get_deterministic_action_vmap_fn = None
 
     def _ensure_vmap_compiled(self):
         """Lazily build vmapped+jitted stateless fns. Idempotent."""
@@ -50,10 +48,6 @@ class Algorithm:
             self._update_vmap = jax.jit(jax.vmap(self._stateless_update))
         if self._get_action_vmap_fn is None:
             self._get_action_vmap_fn = jax.jit(jax.vmap(self._stateless_get_action))
-        if self._get_deterministic_action_vmap_fn is None:
-            self._get_deterministic_action_vmap_fn = jax.jit(
-                jax.vmap(self._stateless_get_deterministic_action)
-            )
 
     def update_vmap(self, key: jax.Array, data: Experience) -> Metric:
         """Vmapped update. key/state/data must have a leading seed axis [N]."""
@@ -91,7 +85,6 @@ class Algorithm:
         policy_params = self.get_policy_params()
         self._update_vmap(key, self.state, data)
         self._get_action_vmap_fn(key, policy_params, obs)
-        self._get_deterministic_action_vmap_fn(policy_params, obs)
 
     def get_effective_hparams(self) -> dict:
         """Return a dict of effective hyperparameters for logging.

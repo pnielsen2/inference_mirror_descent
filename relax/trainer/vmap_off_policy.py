@@ -149,6 +149,14 @@ class VmapOffPolicyTrainer:
         self._prev_adv_per_env: Optional[np.ndarray] = None
         self._prev_valid: Optional[np.ndarray] = None
 
+        # Pick the on-policy EMA update path once at construction time. Off
+        # by default; the rollout block in sample() invokes this only when
+        # the algorithm advertises on_policy_ema=True (i.e. --kl_budget set).
+        if bool(getattr(self.algorithm, "one_step_dist_shift_eta", False)):
+            self._on_policy_ema_update = self._ema_update_one_step
+        else:
+            self._on_policy_ema_update = self._ema_update_kl_only
+
     def _check_supported_config(self):
         alg = self.algorithm
         if getattr(alg, "supervised_steps", 1) > 1:
@@ -268,20 +276,8 @@ class VmapOffPolicyTrainer:
 
         q_var_per_seed = None
         if not getattr(self.algorithm, "on_policy_ema", False):
-            q_var_per_seed = np.zeros((self.N,), dtype=np.float32)
-            for s in range(self.N):
-                q_params_s = tuple(
-                    jax.tree.map(lambda x: x[s], qp)
-                    for qp in self.algorithm.state.params.q
-                )
-                q_var_per_seed[s] = float(
-                    self.algorithm._compute_q_ensemble_var(
-                        action_np[s],
-                        obs_nm[s],
-                        q_params=q_params_s,
-                        tfg_eta=self.algorithm.state.tfg_eta[s],
-                    )
-                )
+            # Single vmapped+jitted call across all seeds; shape [N].
+            q_var_per_seed = self.algorithm.compute_q_ensemble_var_vmap(obs_nm, action_np)
 
         for s in range(self.N):
             seed_info = {
@@ -323,85 +319,101 @@ class VmapOffPolicyTrainer:
         return obs_flat
 
     # ------------------------------------------------------------------
-    # EMA update (host-side, seed-axis-vectorized)
+    # On-policy EMA + adaptive-η update (host-side, seed-axis-vectorized).
+    # Two single-purpose paths, dispatched once at construction time:
+    #
+    #   * _ema_update_kl_only       -- KL-budget-only η selection.
+    #   * _ema_update_one_step      -- KL ceiling AND one-step distribution-
+    #                                  shift η* (requires --one_step_dist_shift_eta).
+    #
+    # Every reduction that was over [M] per-env is over axis=1 of [N, M]
+    # arrays, yielding [N]-shaped per-seed quantities. State EMA fields are
+    # [N] float32 arrays. The numerical sequence (float64 promotion, the
+    # 1e-8 clamp, the 0.574 acceptance target, etc.) is preserved verbatim
+    # from the legacy combined implementation.
     # ------------------------------------------------------------------
-    def _on_policy_ema_update(self, q_per_env: np.ndarray, v_per_env: np.ndarray):
-        """Mirror of OffPolicyTrainer's on_policy_ema block for vmap mode.
+    def _broadcast_state_scalar(self, value) -> np.ndarray:
+        """Promote a state scalar/[N] field to a [N] float64 ndarray."""
+        arr = np.asarray(value).astype(np.float64)
+        if arr.ndim == 0:
+            arr = np.broadcast_to(arr, (self.N,)).astype(np.float64)
+        return arr
 
-        Supports: kl-only, and one_step_dist_shift_eta. Every reduction that
-        was over [M] per-env is now over axis=1 of [N, M] arrays, yielding
-        [N]-shaped per-seed quantities. State EMA fields are [N] floats.
-        """
+    def _ema_update_kl_only(self, q_per_env: np.ndarray, v_per_env: np.ndarray) -> np.ndarray:
+        """KL-budget-only path: update E[A^2] EMA and set η = sqrt(2δ/E[A^2])."""
         alg = self.algorithm
-        adv_per_env = q_per_env - v_per_env          # [N, M]
-        m2_batch = np.mean(adv_per_env ** 2, axis=1)  # [N]
         state = alg.state
-        # Per-seed adv EMA rate: [N]-shaped array from state so this ablation can vmap.
-        tau_v = np.asarray(state.adv_ema_tau).astype(np.float64)
-        if tau_v.ndim == 0:
-            tau_v = np.broadcast_to(tau_v, (self.N,)).astype(np.float64)
-        cur_m2 = np.asarray(state.advantage_second_moment_ema)     # [N]
-        cur_m3 = np.asarray(state.advantage_third_moment_ema)      # [N]
-        cur_c = np.asarray(state.dist_shift_covariance_ema)        # [N]
-        cur_shape = np.asarray(state.dist_shift_shape_ema)         # [N]
+        adv_per_env = q_per_env - v_per_env                # [N, M]
+        m2_batch = np.mean(adv_per_env ** 2, axis=1)        # [N]
+
+        tau_v = self._broadcast_state_scalar(state.adv_ema_tau)
+        cur_m2 = np.asarray(state.advantage_second_moment_ema)
         new_m2 = (1 - tau_v) * cur_m2 + tau_v * m2_batch
 
-        _one_step = bool(getattr(alg, "one_step_dist_shift_eta", False))
-        _any_dist_shift = _one_step
+        kl_budget = self._broadcast_state_scalar(state.kl_budget_val)
+        m2_safe = np.maximum(new_m2, 1e-8)
+        sqrt_v = np.sqrt(m2_safe)
+        eta_kl_raw = np.sqrt(2.0 * kl_budget / m2_safe)
+        new_eta = eta_kl_raw * sqrt_v
 
-        new_m3 = cur_m3
+        alg.state = state._replace(
+            advantage_second_moment_ema=jnp.asarray(new_m2.astype(np.float32)),
+            tfg_eta=jnp.asarray(new_eta.astype(np.float32)),
+        )
+        return adv_per_env
+
+    def _ema_update_one_step(self, q_per_env: np.ndarray, v_per_env: np.ndarray) -> np.ndarray:
+        """One-step distribution-shift path: update {E[A^2], E[A^3], cov, shape}
+        EMAs and pick η = min(η_KL, η*) where η* comes from the second-order
+        expansion using the one-step covariance estimate."""
+        alg = self.algorithm
+        state = alg.state
+        adv_per_env = q_per_env - v_per_env                # [N, M]
+        m2_batch = np.mean(adv_per_env ** 2, axis=1)        # [N]
+        m3_batch = np.mean(adv_per_env ** 3, axis=1)        # [N]
+
+        tau_v = self._broadcast_state_scalar(state.adv_ema_tau)
+        cur_m2 = np.asarray(state.advantage_second_moment_ema)
+        cur_m3 = np.asarray(state.advantage_third_moment_ema)
+        cur_c = np.asarray(state.dist_shift_covariance_ema)
+        cur_shape = np.asarray(state.dist_shift_shape_ema)
+
+        new_m2 = (1 - tau_v) * cur_m2 + tau_v * m2_batch
+        new_m3 = (1 - tau_v) * cur_m3 + tau_v * m3_batch
         new_c = cur_c
         new_shape = cur_shape
 
-        if _any_dist_shift:
-            m3_batch = np.mean(adv_per_env ** 3, axis=1)              # [N]
-            new_m3 = (1 - tau_v) * cur_m3 + tau_v * m3_batch
-
-        c_batch = None
-        c_batch_valid = None
-        if _one_step and self._prev_adv_per_env is not None and self._prev_valid is not None:
-            valid = self._prev_valid  # [N, M] bool
-            valid_count = np.sum(valid, axis=1)  # [N]
+        # One-step covariance c_batch is only valid for env-steps where the
+        # previous step did not terminate; seeds with no valid samples this
+        # batch keep the prior EMA values unchanged.
+        if self._prev_adv_per_env is not None and self._prev_valid is not None:
+            valid = self._prev_valid                           # [N, M] bool
+            valid_count = np.sum(valid, axis=1)                # [N]
             prod = valid.astype(np.float64) * (adv_per_env ** 2) * self._prev_adv_per_env
-            sums = np.sum(prod, axis=1)  # [N]
+            sums = np.sum(prod, axis=1)
             c_batch = np.where(valid_count > 0, sums / np.maximum(valid_count, 1), 0.0)
             c_batch_valid = valid_count > 0
 
-        if _any_dist_shift and c_batch is not None:
-            # Seeds with c_batch_valid get an EMA update; others keep prior values.
             new_c_candidate = (1 - tau_v) * cur_c + tau_v * c_batch
             new_c = np.where(c_batch_valid, new_c_candidate, cur_c)
 
-            gamma = np.asarray(state.gamma).astype(np.float64)
-            if gamma.ndim == 0:
-                gamma = np.broadcast_to(gamma, (self.N,)).astype(np.float64)
-            tau_s = np.asarray(state.shape_ema_tau).astype(np.float64)
-            if tau_s.ndim == 0:
-                tau_s = np.broadcast_to(tau_s, (self.N,)).astype(np.float64)
+            gamma = self._broadcast_state_scalar(state.gamma)
+            tau_s = self._broadcast_state_scalar(state.shape_ema_tau)
             v_raw_safe = np.maximum(m2_batch, 1e-8)
             b_batch = 2.0 * gamma * c_batch + m3_batch
             s_batch = b_batch / v_raw_safe ** 1.5
             new_shape_candidate = (1 - tau_s) * cur_shape + tau_s * s_batch
             new_shape = np.where(c_batch_valid, new_shape_candidate, cur_shape)
 
-        # η selection, per-seed.
-        kl_budget = np.asarray(state.kl_budget_val).astype(np.float64)
-        if kl_budget.ndim == 0:
-            kl_budget = np.broadcast_to(kl_budget, (self.N,)).astype(np.float64)
+        # η = min(η_KL, η*); η* is +inf when shape is non-negative.
+        kl_budget = self._broadcast_state_scalar(state.kl_budget_val)
         m2_safe = np.maximum(new_m2, 1e-8)
-        eta_kl_raw = np.sqrt(2.0 * kl_budget / m2_safe)                # [N]
         sqrt_v = np.sqrt(m2_safe)
+        eta_kl_raw = np.sqrt(2.0 * kl_budget / m2_safe)
+        eta_star_raw = np.where(new_shape < -1e-8, -1.0 / (sqrt_v * new_shape), np.inf)
+        eta_raw = np.minimum(eta_star_raw, eta_kl_raw)
+        new_eta = eta_raw * sqrt_v
 
-        if _one_step:
-            eta_star_raw = np.where(new_shape < -1e-8, -1.0 / (sqrt_v * new_shape), np.inf)
-            eta_raw = np.minimum(eta_star_raw, eta_kl_raw)
-        else:
-            eta_star_raw = np.full_like(eta_kl_raw, np.inf)
-            eta_raw = eta_kl_raw
-
-        new_eta = eta_raw * sqrt_v  # code-space η (per-seed)
-
-        # Write back EMA + eta state.
         alg.state = state._replace(
             advantage_second_moment_ema=jnp.asarray(new_m2.astype(np.float32)),
             advantage_third_moment_ema=jnp.asarray(new_m3.astype(np.float32)),
@@ -409,7 +421,6 @@ class VmapOffPolicyTrainer:
             dist_shift_shape_ema=jnp.asarray(new_shape.astype(np.float32)),
             tfg_eta=jnp.asarray(new_eta.astype(np.float32)),
         )
-
         return adv_per_env
 
     # ------------------------------------------------------------------

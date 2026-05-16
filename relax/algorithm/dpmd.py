@@ -10,8 +10,27 @@ from relax.algorithm.base import Algorithm
 from relax.network.diffv2 import Diffv2Net, Diffv2Params
 from relax.utils.experience import Experience
 from relax.utils.typing_utils import Metric
-from relax.utils.jax_utils import random_key_from_data
- 
+
+
+def _aggregate_q(q_means, mode: str):
+    """Aggregate a list of N Q-network outputs (same shape) elementwise.
+
+    mode='min': pairwise jnp.minimum reduction across the list.
+    mode='mean': sum(q_means) * (1/N).
+
+    Reduction order matches the legacy in-line implementations exactly so
+    swapping callers to this helper is bit-identical.
+    """
+    if mode == "min":
+        q = q_means[0]
+        for m in q_means[1:]:
+            q = jnp.minimum(q, m)
+        return q
+    if mode == "mean":
+        return sum(q_means) * jnp.float32(1.0 / len(q_means))
+    raise ValueError(f"_aggregate_q: unknown mode {mode!r}")
+
+
 class Diffv2OptStates(NamedTuple):
     q: tuple  # tuple of N optax.OptState, one per Q network
     policy: optax.OptState
@@ -19,21 +38,16 @@ class Diffv2OptStates(NamedTuple):
 
 
 class MalaSampleResult(NamedTuple):
-    """Full result bundle from one MALA-corrected sampling pass.
+    """Result bundle from one MALA-corrected sampling pass.
 
-    Returned by :func:`stateless_get_action_mala_full`. Call sites destructure
-    only the fields they need:
-
-    * Public sampler (``stateless_get_action_env``) returns ``(action, q,
-      log_eta_scales)``.
-    * The TD update path uses ``action``, ``log_eta_scales``, and the four
-      MALA diagnostics for wandb logging.
+    Returned by :func:`stateless_get_action_mala_full`. Public sampler
+    (``stateless_get_action_env``) returns ``(action, q, log_eta_scales)``;
+    the TD update path additionally consumes the per-level diagnostics for
+    wandb logging.
     """
     action: jax.Array
     q: jax.Array
     log_eta_scales: jax.Array
-    mala_acc_rate: jax.Array
-    mala_eta_scale: jax.Array
     per_level_acc: jax.Array
     per_level_clip: jax.Array
 
@@ -50,8 +64,6 @@ class Diffv2TrainState(NamedTuple):
     advantage_third_moment_ema: float = 0.0
     dist_shift_covariance_ema: float = 0.0
     dist_shift_shape_ema: float = -1.0        # EMA of s₂ = (2γc + κ₃) / v^(3/2), dimensionless shape
-    dist_shift_coeff_ema: float = -1.0        # EMA of B = 2γc + κ₃, raw η²-coefficient (alt to shape)
-    dist_shift_shape3_ema: float = 0.0       # EMA of s₃ = τ / v², third-order dimensionless shape
     # Per-seed vmappable hyperparameters. Scalars in single-seed mode; under
     # VmapOffPolicyTrainer each field becomes a [N]-shaped array so vmap maps
     # one scalar value to each seed.
@@ -67,7 +79,6 @@ class Diffv2TrainState(NamedTuple):
     x0_hat_clip_radius: jax.Array = 1.0  # clip radius for x0 prediction
     mala_adapt_rate: jax.Array = 0.05   # MALA step-size adaptation rate
     q_td_huber_width: jax.Array = float("inf")  # Q TD huber loss width (in reward units)
-    shape3_ema_tau: jax.Array = 5e-5    # third-order dimensionless shape EMA rate
 
 
 class DPMD(Algorithm):
@@ -124,10 +135,8 @@ class DPMD(Algorithm):
         self.mala_adapt_rate = float(mala_adapt_rate)
         self.advantage_ema_tau = float(advantage_ema_tau)
         self.shape_ema_tau = float(shape_ema_tau)
-        self.shape3_ema_tau = 5e-5
         self.initial_advantage_second_moment_ema = float(initial_advantage_second_moment_ema)
         self.initial_dist_shift_shape_ema = float(initial_dist_shift_shape_ema)
-        self.initial_dist_shift_coeff_ema = self.initial_dist_shift_shape_ema * (max(self.initial_advantage_second_moment_ema, 0.0) ** 1.5)
         self.kl_budget = float(kl_budget) if kl_budget is not None else None
         self.q_critic_agg = str(q_critic_agg)
         self.q_bootstrap_agg = str(q_bootstrap_agg)
@@ -165,19 +174,11 @@ class DPMD(Algorithm):
         self._alphas_cumprod = np.asarray(B_sched.alphas_cumprod)  # [T]
         self._snr = self._alphas_cumprod / np.maximum(1.0 - self._alphas_cumprod, 1e-8)
 
-        # --- N-ary Q aggregation helpers (used by sampling and update) ---
-        def hard_min_q_n(q_means):
-            """Element-wise min across N Q means."""
-            q = q_means[0]
-            for m in q_means[1:]:
-                q = jnp.minimum(q, m)
-            return q
-
-        def aggregate_q_fn_outer(q_means):
-            n = len(q_means)
-            if self.q_critic_agg == "min":
-                return hard_min_q_n(q_means)
-            return sum(q_means) * jnp.float32(1.0 / n)
+        # Q aggregation closures used by the sampler / TD update.
+        # The TD-bootstrap path always uses 'min' (clipped double-Q); the
+        # rollout / guidance path uses the configured --q_critic_agg.
+        agg_min = lambda qm: _aggregate_q(qm, "min")
+        agg_critic = lambda qm: _aggregate_q(qm, self.q_critic_agg)
 
         @jax.jit
         def stateless_update(
@@ -202,25 +203,11 @@ class DPMD(Algorithm):
             diffusion_noise_key = key_splits[4]
             q_langevin_keys = key_splits[8:]  # num_q keys
 
-            # --- N-ary Q helpers ---
-            def reduce_min_q(means_list):
-                """Element-wise min across N Q means."""
-                q = means_list[0]
-                for m in means_list[1:]:
-                    q = jnp.minimum(q, m)
-                return q
-
-            def aggregate_q_n(q_means):
-                """min or mean aggregation across N Q means (matches --q_critic_agg)."""
-                if q_critic_agg == "min":
-                    return reduce_min_q(q_means)
-                return sum(q_means) * jnp.float32(1.0 / num_q)
-
             reward *= state.reward_scale
 
             # Sample a single next-action and evaluate target-Q on it (td_actions=1).
             mala_result = stateless_get_action_mala_full(
-                next_eval_key, state, next_obs, hard_min_q_n,
+                next_eval_key, state, next_obs, agg_min,
             )
             next_action = mala_result.action
             log_eta_scales = mala_result.log_eta_scales
@@ -228,7 +215,7 @@ class DPMD(Algorithm):
 
             not_done = (1 - done)
             # Clipped double Q-learning: all Qs bootstrap from min(target_Q_1..N).
-            q_target_min_for_backup = reduce_min_q(q_target_per_q)
+            q_target_min_for_backup = _aggregate_q(q_target_per_q, "min")
             shared_backup = reward + not_done * state.gamma * q_target_min_for_backup
             q_backup_per_q = [shared_backup] * num_q
             delta = state.q_td_huber_width * state.reward_scale
@@ -346,7 +333,7 @@ class DPMD(Algorithm):
                 # The legacy off-policy V path (critic_normalization='ema'
                 # without kl_budget) was removed; an assertion in __init__
                 # enforces that combo.
-                q_for_v = aggregate_q_n(q_target_per_q)
+                q_for_v = agg_critic(q_target_per_q)
 
                 def value_loss_fn(v_params):
                     v_pred = self._value_net.apply(v_params, next_obs)
@@ -412,12 +399,7 @@ class DPMD(Algorithm):
             mala_adapt_rate_hp = state.mala_adapt_rate
             guidance_mult_hp = state.guidance_mult
 
-            single = obs.ndim == 1
-            if single:
-                obs_batch = obs[None, :]
-            else:
-                obs_batch = obs
-
+            obs_batch = obs
             shape = (*obs_batch.shape[:-1], self.agent.act_dim)
 
             def energy_model(t, x):
@@ -630,37 +612,27 @@ class DPMD(Algorithm):
 
                 init_per_level_acc = jnp.zeros((timesteps,), dtype=jnp.float32)
                 init_per_level_clip_frac = jnp.zeros((timesteps,), dtype=jnp.float32)
-                x_final, _, log_eta_scales_out, acc_sum_final, acc_count_final, per_level_acc_out, per_level_clip_frac_out = jax.lax.fori_loop(
+                x_final, _, log_eta_scales_out, _acc_sum_final, _acc_count_final, per_level_acc_out, per_level_clip_frac_out = jax.lax.fori_loop(
                     0,
                     timesteps,
                     level_body,
                     (x0, loop_key, log_eta_scales_init, jnp.float32(0.0), jnp.float32(0.0), init_per_level_acc, init_per_level_clip_frac),
                 )
 
-                mala_acc_rate = acc_sum_final / jnp.maximum(acc_count_final, jnp.float32(1.0))
-                mala_eta_scale = jnp.float32(jnp.nan)
-
                 act_final = jnp.clip(x_final, -1.0, 1.0)
                 q_means_f = [self.agent.q(qp, obs_batch, act_final) for qp in q_params_tuple]
                 q = aggregate_q_fn(q_means_f)
-                return act_final, q, log_eta_scales_out, mala_acc_rate, mala_eta_scale, per_level_acc_out, per_level_clip_frac_out
+                return act_final, q, log_eta_scales_out, per_level_acc_out, per_level_clip_frac_out
 
             # 3-way split kept verbatim to preserve PRNG layout from a deleted
             # multi-particle / particle-select sampling path; the two unused
             # keys must continue to be split off here for byte-exact PRNG match.
             key_sample, _key_select, _noise_key = jax.random.split(key, 3)
-            act, q, log_eta_scales_out, mala_acc_rate, mala_eta_scale, pl_acc, pl_clip = mala_chain(
+            act, q, log_eta_scales_out, pl_acc, pl_clip = mala_chain(
                 key_sample, log_eta_scales_in
             )
-            if single:
-                return MalaSampleResult(
-                    action=act[0], q=q[0], log_eta_scales=log_eta_scales_out,
-                    mala_acc_rate=mala_acc_rate, mala_eta_scale=mala_eta_scale,
-                    per_level_acc=pl_acc, per_level_clip=pl_clip,
-                )
             return MalaSampleResult(
                 action=act, q=q, log_eta_scales=log_eta_scales_out,
-                mala_acc_rate=mala_acc_rate, mala_eta_scale=mala_eta_scale,
                 per_level_acc=pl_acc, per_level_clip=pl_clip,
             )
 
@@ -669,17 +641,10 @@ class DPMD(Algorithm):
             state: Diffv2TrainState,
             obs: jax.Array,
         ):
-            r = stateless_get_action_mala_full(key, state, obs, aggregate_q_fn_outer)
+            r = stateless_get_action_mala_full(key, state, obs, agg_critic)
             return r.action, r.q, r.log_eta_scales
 
-        def stateless_get_deterministic_action_env(
-            state: Diffv2TrainState,
-            obs: jax.Array,
-        ):
-            key = random_key_from_data(obs)
-            return stateless_get_action_env(key, state, obs)
-
-        self._implement_common_behavior(stateless_update, stateless_get_action_env, stateless_get_deterministic_action_env)
+        self._implement_common_behavior(stateless_update, stateless_get_action_env)
 
     def get_policy_params(self):
         # All stateless_* sampler/update functions take the full Diffv2TrainState;
@@ -793,8 +758,6 @@ class DPMD(Algorithm):
             advantage_third_moment_ema=jnp.float32(0.0),
             dist_shift_covariance_ema=jnp.float32(0.0),
             dist_shift_shape_ema=jnp.float32(self.initial_dist_shift_shape_ema),
-            dist_shift_coeff_ema=jnp.float32(self.initial_dist_shift_coeff_ema),
-            dist_shift_shape3_ema=jnp.float32(0.0),
             gamma=jnp.float32(self.gamma),
             polyak_tau=jnp.float32(self.tau),
             lr_q=jnp.float32(self.lr_q),
@@ -807,7 +770,6 @@ class DPMD(Algorithm):
             x0_hat_clip_radius=jnp.float32(self.x0_hat_clip_radius),
             mala_adapt_rate=jnp.float32(self.mala_adapt_rate),
             q_td_huber_width=jnp.float32(self.q_td_huber_width),
-            shape3_ema_tau=jnp.float32(self.shape3_ema_tau),
         )
 
     def make_vmapped_state(self, params_list, value_init_keys=None):
@@ -886,31 +848,25 @@ class DPMD(Algorithm):
         with open(path, "wb") as f:
             pickle.dump(policy, f)
 
-    def _compute_q_ensemble_var(
-        self,
-        action: np.ndarray,
-        obs: np.ndarray,
-        *,
-        q_params=None,
-        tfg_eta=None,
-    ) -> float:
-        """Compute mean variance of Q across ensemble members for the given (obs, action)."""
-        obs_j = jnp.asarray(obs)
-        act_j = jnp.asarray(action)
-        if obs_j.ndim == 1:
-            obs_j = obs_j[None, :]
-            act_j = act_j[None, :]
-        q_params_tuple = tuple(self.state.params.q if q_params is None else q_params)
-        if len(q_params_tuple) < 2:
-            return 0.0
-        if getattr(self, "_q_ensemble_var_jit", None) is None:
+    def compute_q_ensemble_var_vmap(self, obs_nm: np.ndarray, action_nm: np.ndarray) -> np.ndarray:
+        """Per-seed mean Var(Q_i) across the Q ensemble for [N, M] (obs, action).
+
+        Returns an ``np.ndarray`` of shape ``[N]``. Vmapped+jitted so a single
+        XLA call replaces the host-side per-seed Python loop in the trainer.
+        Only valid for ensembles of size >= 2 (returns zeros otherwise).
+        """
+        q_params = self.state.params.q  # tuple of N_q [N_seeds, ...] pytrees
+        if len(q_params) < 2:
+            return np.zeros((obs_nm.shape[0],), dtype=np.float32)
+        if getattr(self, "_q_ensemble_var_vmap_jit", None) is None:
             q_fn = self.agent.q
 
-            @jax.jit
-            def _fn(q_params_tuple, s, a):
-                means = [q_fn(qp, s, a) for qp in q_params_tuple]
+            def _per_seed(q_params_seed, s, a):
+                means = [q_fn(qp, s, a) for qp in q_params_seed]
                 stacked = jnp.stack(means, axis=0)
                 return jnp.mean(jnp.var(stacked, axis=0))
 
-            self._q_ensemble_var_jit = _fn
-        return float(self._q_ensemble_var_jit(q_params_tuple, obs_j, act_j))
+            self._q_ensemble_var_vmap_jit = jax.jit(jax.vmap(_per_seed))
+        return np.asarray(
+            self._q_ensemble_var_vmap_jit(q_params, jnp.asarray(obs_nm), jnp.asarray(action_nm))
+        )
