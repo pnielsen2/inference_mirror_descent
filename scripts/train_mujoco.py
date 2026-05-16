@@ -56,12 +56,10 @@ if __name__ == "__main__":
     hidden_sizes = [args.hidden_dim] * args.hidden_num
     diffusion_hidden_sizes = [args.diffusion_hidden_dim] * args.hidden_num
 
-    include_next_action = False
     buffers_list = [
         TreeBuffer.from_experience(
             obs_dim, act_dim, size=args.buffer_size,
             seed=seeds.buffer_seeds[i],
-            include_next_action=include_next_action,
         )
         for i in range(N_seeds)
     ]
@@ -161,5 +159,5 @@ if __name__ == "__main__":
         sweep_id=args.sweep_id,
         config_tag_keys=args.config_tag_keys,
     )
-    trainer.setup(Experience.create_example(obs_dim, act_dim, trainer.batch_size, include_next_action=include_next_action))
+    trainer.setup(Experience.create_example(obs_dim, act_dim, trainer.batch_size))
     trainer.run(seeds.train_keys)

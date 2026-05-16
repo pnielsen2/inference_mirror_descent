@@ -4,8 +4,8 @@ import jax, jax.numpy as jnp
 import numpy as np
 import optax
 import haiku as hk
-import pickle
  
+from relax.algorithm import hp_pack as _hp_pack_module
 from relax.algorithm.base import Algorithm
 from relax.algorithm.value_head import ValueHead
 from relax.network.diffv2 import Diffv2Net, Diffv2Params
@@ -182,16 +182,12 @@ class DPMD(Algorithm):
         self._validate_invariants()
 
         # --- Optimizers: unscaled Adam; per-seed state.lr_{q,policy} is applied at update time. ---
-        self.optim, self.policy_optim = self._setup_optimizers()
+        self.optim = optax.scale_by_adam()
+        self.policy_optim = optax.scale_by_adam()
 
         # --- Optional V(s) network for normalized-advantage guidance (critic_normalization='ema'). ---
         value_params_init, value_opt_state_init = self._setup_value_network(params)
 
-        # --- Cached scalars consumed by _build_initial_state and the
-        # stateless_* closures returned by _build_mala_sampler /
-        # _build_update_step / _build_env_sampler. ---
-        self._init_log_eta_scale = jnp.float32(0.0)  # eta_scale = exp(0) = 1.0
-        self._init_tfg_eta = self.tfg_eta
         self._timesteps = int(self.agent.num_timesteps)
 
         # --- Initial vmap-stackable train state ---
@@ -394,12 +390,9 @@ class DPMD(Algorithm):
                 # Scale base energy by energy_multiplier (tempers the base distribution)
                 return self.energy_multiplier * E
 
-            def q_min_from_x0(x0_in):
+            def q_aggregated_at_x0(x0_in):
                 q_means = [self.agent.q(qp, obs_batch, x0_in) for qp in q_params_tuple]
                 return aggregate_q_fn(q_means)
-
-            def sample_x0_for_mala_energy(sample_key, x0_hat, t_idx):
-                return x0_hat, jnp.clip(x0_hat, -x0_hat_clip_radius_hp, x0_hat_clip_radius_hp)
 
             def q_mean_from_x(x_in, t_idx):
                 # Tweedie-clean prediction with energy_multiplier-tempered base
@@ -411,7 +404,7 @@ class DPMD(Algorithm):
                     - noise_pred_scaled * B.sqrt_recipm1_alphas_cumprod[t_idx]
                 )
                 x0_q = jnp.clip(x0_hat, -x0_hat_clip_radius_hp, x0_hat_clip_radius_hp)
-                q = q_min_from_x0(x0_q)
+                q = q_aggregated_at_x0(x0_q)
 
                 agg_fn = jnp.sum if self.batch_independent_guidance else jnp.mean
                 mult = guidance_mult_hp
@@ -424,12 +417,6 @@ class DPMD(Algorithm):
                     return mult * agg_fn(advantage / adv_std)
                 return mult * agg_fn(q)
 
-            _tfg_eta_schedule_ones = jnp.ones((timesteps,), dtype=jnp.float32)
-
-            def lambda_for_step(t_idx: jax.Array, tfg_eta_current: jax.Array) -> jax.Array:
-                t_next = jnp.maximum(t_idx - 1, 0)
-                return tfg_eta_current * _tfg_eta_schedule_ones[t_next]
-
             def grad_guidance(x_in, t_idx):
                 def guided(_):
                     return jax.grad(lambda xx: q_mean_from_x(xx, t_idx))(x_in)
@@ -437,8 +424,7 @@ class DPMD(Algorithm):
                 def unguided(_):
                     return jnp.zeros_like(x_in)
 
-                lam = lambda_for_step(t_idx, tfg_eta_current)
-                return jax.lax.cond(lam > 0.0, guided, unguided, operand=None)
+                return jax.lax.cond(tfg_eta_current > 0.0, guided, unguided, operand=None)
 
             def energy_total(t, x, sample_key):
                 def only_model(x_in):
@@ -451,14 +437,12 @@ class DPMD(Algorithm):
                         x_in * B.sqrt_recip_alphas_cumprod[t]
                         - noise_pred * B.sqrt_recipm1_alphas_cumprod[t]
                     )
-                    x0_preclip, x0_q = sample_x0_for_mala_energy(sample_key, x0_hat, t)
-                    clip_frac = jnp.mean((jnp.abs(x0_preclip) > x0_hat_clip_radius_hp).astype(jnp.float32))
-                    q_min = q_min_from_x0(x0_q)
-                    lambda_t = lambda_for_step(t, tfg_eta_current)
-                    return E_mod - lambda_t * q_min, clip_frac
+                    x0_q = jnp.clip(x0_hat, -x0_hat_clip_radius_hp, x0_hat_clip_radius_hp)
+                    clip_frac = jnp.mean((jnp.abs(x0_hat) > x0_hat_clip_radius_hp).astype(jnp.float32))
+                    q_agg = q_aggregated_at_x0(x0_q)
+                    return E_mod - tfg_eta_current * q_agg, clip_frac
 
-                lambda_t = lambda_for_step(t, tfg_eta_current)
-                return jax.lax.cond(lambda_t > 0.0, with_q, only_model, x)
+                return jax.lax.cond(tfg_eta_current > 0.0, with_q, only_model, x)
 
             def predictor_step(t_idx: jax.Array, x_in: jax.Array, k_in: jax.Array):
                 # DDIM-style deterministic predictor (no sampled noise).
@@ -471,8 +455,7 @@ class DPMD(Algorithm):
                 if self.mala_guided_predictor:
                     grad_q = grad_guidance(x_in, t_idx)
                     sigma_t = B.sqrt_one_minus_alphas_cumprod[t_idx]
-                    lambda_t = lambda_for_step(t_idx, tfg_eta_current)
-                    eps_pred = noise_pred_scaled - lambda_t * sigma_t * grad_q
+                    eps_pred = noise_pred_scaled - tfg_eta_current * sigma_t * grad_q
                 else:
                     eps_pred = noise_pred_scaled
                 model_mean, _ = self.agent.diffusion.p_mean_variance(t_idx, x_in, eps_pred)
@@ -612,27 +595,10 @@ class DPMD(Algorithm):
 
         return stateless_get_action_env
 
-    def get_policy_params(self):
+    def get_rollout_params(self):
         # All stateless_* sampler/update functions take the full Diffv2TrainState;
         # JAX prunes unused leaves at trace time.
         return self.state
-
-    def get_policy_params_to_save(self):
-        return self.state
-
-    def get_rollout_params(self):
-        return self.state
-
-    def load(self, path: str) -> None:
-        with open(path, "rb") as f:
-            state = pickle.load(f)
-        self.state = jax.device_put(state)
-
-    def get_current_tfg_eta(self) -> float:
-        return float(self.state.tfg_eta)
-
-    def set_tfg_eta(self, new_tfg_eta: float) -> None:
-        self.state = self.state._replace(tfg_eta=jnp.float32(new_tfg_eta))
 
     def _validate_invariants(self):
         """Enforce simplify_walkthrough preconditions: only branches actually
@@ -657,11 +623,6 @@ class DPMD(Algorithm):
                 "simplify_walkthrough requires energy_mode=True and mala_steps > 0; "
                 "the non-MALA / non-energy sampling branches have been removed."
             )
-
-    def _setup_optimizers(self):
-        """Unscaled Adam optimizers for Q and policy; per-seed lr_{q,policy}
-        is applied at update time from state, not baked into the chain."""
-        return optax.scale_by_adam(), optax.scale_by_adam()
 
     def _setup_value_network(self, params):
         """Construct the V(s) network used by critic_normalization='ema'
@@ -762,8 +723,8 @@ class DPMD(Algorithm):
                 value=value_opt_state_init,
             ),
             step=jnp.int32(0),
-            log_eta_scales=jnp.full((self._timesteps,), self._init_log_eta_scale, dtype=jnp.float32),
-            tfg_eta=jnp.float32(self._init_tfg_eta),
+            log_eta_scales=jnp.zeros((self._timesteps,), dtype=jnp.float32),
+            tfg_eta=jnp.float32(self.tfg_eta),
             value_params=value_params_init,
             advantage_second_moment_ema=jnp.float32(self.initial_advantage_second_moment_ema),
             advantage_third_moment_ema=jnp.float32(0.0),
@@ -840,84 +801,11 @@ class DPMD(Algorithm):
             "lr_q_effective": float(self.lr_q),
         }
 
-    # Map argparse attribute names that the hp_pack uses to the
-    # corresponding Diffv2TrainState field names. Keys not in this map
-    # share their argparse name with the state field (e.g. "lr_q",
-    # "shape_ema_tau", "reward_scale", ...).
-    _HP_PACK_CLI_TO_FIELD = {
-        "tau": "polyak_tau",
-        "advantage_ema_tau": "adv_ema_tau",
-        "guidance_strength_multiplier": "guidance_mult",
-        "kl_budget": "kl_budget_val",
-        "initial_advantage_second_moment_ema": "advantage_second_moment_ema",
-        "initial_dist_shift_shape_ema": "dist_shift_shape_ema",
-        "tfg_eta": "tfg_eta",
-    }
-    _HP_PACK_ALLOWED = {
-        "lr_q", "lr_policy", "gamma", "tau", "advantage_ema_tau",
-        "guidance_strength_multiplier", "shape_ema_tau", "tfg_eta", "kl_budget",
-        "initial_advantage_second_moment_ema", "initial_dist_shift_shape_ema",
-        "reward_scale", "x0_hat_clip_radius", "mala_adapt_rate",
-        "q_td_huber_width",
-        "seed",
-    }
-
     def apply_hp_pack(self, hp_pack: dict, N_seeds: int) -> None:
         """Apply per-seed hyperparameter overrides to ``self.state``.
 
-        ``hp_pack`` keys are argparse attribute names; values are length-N
-        lists. The ``"seed"`` key is consumed earlier (in derive_seed_bundle)
-        and skipped here. When ``kl_budget`` is overridden, ``tfg_eta`` is
-        automatically rederived as sqrt(2*kl_budget) so the two stay
-        consistent.
+        Thin forwarder around :func:`relax.algorithm.hp_pack.apply` so the
+        algorithm class itself is free of CLI-attribute plumbing.
         """
-        overrides = {}
-        for k, v in hp_pack.items():
-            if k not in self._HP_PACK_ALLOWED:
-                raise ValueError(
-                    f"--hp_pack key '{k}' is not a per-seed vmappable hp. "
-                    f"Allowed: {sorted(self._HP_PACK_ALLOWED)}"
-                )
-            if k == "seed":
-                continue
-            arr = jnp.asarray(v, dtype=jnp.float32)
-            if arr.shape != (N_seeds,):
-                raise ValueError(f"--hp_pack '{k}' has shape {arr.shape}; expected ({N_seeds},)")
-            overrides[self._HP_PACK_CLI_TO_FIELD.get(k, k)] = arr
-        if not overrides:
-            return
-        self.state = self.state._replace(**overrides)
-        if "kl_budget_val" in overrides:
-            kl_budget_v = jnp.asarray(self.state.kl_budget_val, dtype=jnp.float32)
-            self.state = self.state._replace(
-                tfg_eta=jnp.sqrt(jnp.maximum(jnp.float32(0.0), jnp.float32(2.0) * kl_budget_v))
-            )
-        print(f"[hp_pack] applied per-seed overrides: {list(overrides.keys())}")
+        self.state = _hp_pack_module.apply(self.state, hp_pack, N_seeds)
 
-    def save_policy(self, path: str) -> None:
-        policy = jax.device_get(self.get_policy_params_to_save())
-        with open(path, "wb") as f:
-            pickle.dump(policy, f)
-
-    def compute_q_ensemble_var_vmap(self, obs_nm: np.ndarray, action_nm: np.ndarray) -> np.ndarray:
-        """Per-seed mean Var(Q_i) across the Q ensemble for [N, M] (obs, action).
-
-        Returns an ``np.ndarray`` of shape ``[N]``. Vmapped+jitted so a single
-        XLA call replaces the host-side per-seed Python loop in the trainer.
-        Only valid for ensembles of size >= 2 (returns zeros otherwise).
-        """
-        q_params = self.state.params.q  # tuple of N_q [N_seeds, ...] pytrees
-        if len(q_params) < 2:
-            return np.zeros((obs_nm.shape[0],), dtype=np.float32)
-        if getattr(self, "_q_ensemble_var_vmap_jit", None) is None:
-            q_fn = self.agent.q
-
-            def _per_seed(q_params_seed, s, a):
-                means = [q_fn(qp, s, a) for qp in q_params_seed]
-                stacked = jnp.stack(means, axis=0)
-                return jnp.mean(jnp.var(stacked, axis=0))
-
-            self._q_ensemble_var_vmap_jit = jax.jit(jax.vmap(_per_seed))
-        return np.asarray(
-            self._q_ensemble_var_vmap_jit(q_params, jnp.asarray(obs_nm), jnp.asarray(action_nm))
-        )

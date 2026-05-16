@@ -27,6 +27,7 @@ from relax.algorithm import ema_eta
 from relax.buffer import TreeBuffer
 from relax.env.vector import VectorEnv
 from relax.trainer.accumulator import Interval, SampleLog, UpdateLog
+from relax.trainer.sample_metrics import SampleMetricsRecorder
 from relax.trainer.wandb_logging import WandbMultiSeedLogger, build_config_tag  # noqa: F401  (build_config_tag re-exported for analysis scripts)
 from relax.utils.experience import Experience
 
@@ -143,6 +144,15 @@ class VmapOffPolicyTrainer:
             hparams=self.hparams,
             config_tag_keys=self.config_tag_keys,
         )
+        self.recorder = SampleMetricsRecorder(
+            algorithm=self.algorithm,
+            buffers=self.buffers,
+            sample_logs=self.sample_logs,
+            logger=self.logger,
+            env_name=self.env_name,
+            log_path=self.log_path,
+            sample_log_interval=self.sample_log_interval,
+        )
 
         # Per-seed host-side buffers for dist-shift covariance (shape [N, M]).
         self._prev_adv_per_env: Optional[np.ndarray] = None
@@ -172,17 +182,7 @@ class VmapOffPolicyTrainer:
         self.algorithm.warmup_vmap(stacked, self.N)
         self.progress = tqdm(total=self.total_step, desc="Sample Step (per seed)", disable=None, dynamic_ncols=True)
 
-        # Local backup: episode-return curves per seed, so the metric survives
-        # even when wandb's per-project filestream rate limit silently drops
-        # logs. Only episode_return is stored locally (other metrics would be
-        # too large on disk). Metric key mirrors the wandb key:
-        # f"episode_return/{env_name}".
-        self.log_path.mkdir(parents=True, exist_ok=True)
-        self._local_return_path = self.log_path / "episode_returns.csv"
-        if not self._local_return_path.exists():
-            with open(self._local_return_path, "w") as f:
-                f.write(f"seed,step,episode_return/{self.env_name}\n")
-
+        self.recorder.init()
         self.logger.set_snr(getattr(self.algorithm, "_snr", None))
         self.logger.init_runs()
 
@@ -253,51 +253,11 @@ class VmapOffPolicyTrainer:
             self._prev_adv_per_env = adv_per_env_now.copy()
             self._prev_valid = ~done_nm
 
-        # Per-seed buffer add + SampleLog update.
-        action_np = np.asarray(action_nm)
-        action_abs = np.abs(action_np)
-        action_mean = np.mean(action_np, axis=-1)                  # [N, M]
-        action_var = np.var(action_np, axis=-1)                    # [N, M]
-        action_clip_frac = np.mean((action_abs > 0.99).astype(np.float32), axis=-1)  # [N, M]
-        q_mean_per_seed = np.mean(q_per_env, axis=1)                # [N]
-        v_mean_per_seed = np.mean(v_per_env, axis=1) if v_per_env is not None else None
-
-        q_var_per_seed = None
-        if not getattr(self.algorithm, "on_policy_ema", False):
-            # Single vmapped+jitted call across all seeds; shape [N].
-            q_var_per_seed = self.algorithm.compute_q_ensemble_var_vmap(obs_nm, action_np)
-
-        for s in range(self.N):
-            seed_info = {
-                "action_mean": action_mean[s],
-                "action_var": action_var[s],
-                "action_clip_frac": action_clip_frac[s],
-                "q_agg": float(q_mean_per_seed[s]),
-            }
-            if v_mean_per_seed is not None:
-                seed_info["v_value"] = float(v_mean_per_seed[s])
-            if q_var_per_seed is not None:
-                seed_info["q_var"] = float(q_var_per_seed[s])
-            exp_s = Experience.create(
-                obs_nm[s], action_np[s], rew_nm[s], term_nm[s], trunc_nm[s], nxt_nm[s], seed_info,
-            )
-            self.buffers[s].add_batch(exp_s)
-            self.sample_logs[s].add(rew_nm[s], term_nm[s], trunc_nm[s], seed_info)
-
-        # Drain pending episode returns to wandb (per seed) and mirror to a
-        # local CSV so the return curve survives wandb rate-limit drops.
-        ep_key = f"episode_return/{self.env_name}"
-        with open(self._local_return_path, "a", buffering=1) as f_local:
-            for s in range(self.N):
-                for env_step, ret in self.sample_logs[s].take_pending_episode_returns():
-                    self.logger.add_scalar_per_seed(s, ep_key, ret, step=env_step)
-                    f_local.write(f"{s},{int(env_step)},{float(ret)}\n")
-
-        # Periodic sample-interval flush.
-        # All seeds advance sample_step by M in lockstep; check seed 0.
-        sl0 = self.sample_logs[0]
-        if self.sample_log_interval.check(sl0.sample_step):
-            self._log_periodic_sample_metrics()
+        self.recorder.record(
+            obs_nm=obs_nm, action_nm=action_nm,
+            q_per_env=q_per_env, v_per_env=v_per_env,
+            rew_nm=rew_nm, term_nm=term_nm, trunc_nm=trunc_nm, nxt_nm=nxt_nm,
+        )
 
         if np.any(term_flat) or np.any(trunc_flat):
             obs_flat, _ = self.env.reset()
@@ -357,44 +317,6 @@ class VmapOffPolicyTrainer:
                 for s in range(self.N):
                     self.logger.add_scalar_per_seed(s, tag, float(arr[s]),
                                                    step=sample_steps[s])
-
-    # ------------------------------------------------------------------
-    # Periodic sample-interval metrics
-    # ------------------------------------------------------------------
-    def _log_periodic_sample_metrics(self):
-        alg = self.algorithm
-        state = alg.state
-        log = self.logger.add_scalar_per_seed
-        for s in range(self.N):
-            sstep = int(self.sample_logs[s].sample_step)
-            self.sample_logs[s].log_accumulator(
-                lambda k, v, _step, _s=s, _sstep=sstep: log(_s, k, v, step=_sstep)
-            )
-            tfg_eta = float(np.asarray(state.tfg_eta)[s])
-            log(s, "Global_EMAs/tfg_eta", tfg_eta, step=sstep)
-            if getattr(alg, "on_policy_ema", False):
-                m2 = float(np.asarray(state.advantage_second_moment_ema)[s])
-                kl_budget = float(np.asarray(state.kl_budget_val)[s])
-                m3 = float(np.asarray(state.advantage_third_moment_ema)[s])
-                cov = float(np.asarray(state.dist_shift_covariance_ema)[s])
-                shape = float(np.asarray(state.dist_shift_shape_ema)[s])
-                eta = tfg_eta / float(np.sqrt(max(m2, 1e-8)))
-                eta_kl = float(np.sqrt(2.0 * kl_budget / max(m2, 1e-8)))
-                log(s, "Global_EMAs/Advantage_second_moment", m2, step=sstep)
-                log(s, "Global_EMAs/Advantage_third_moment", m3, step=sstep)
-                log(s, "Global_EMAs/Distribution_shift_covariance", cov, step=sstep)
-                log(s, "Global_EMAs/Distribution_shift_shape", shape, step=sstep)
-                log(s, "Global_EMAs/eta", eta, step=sstep)
-                log(s, "Global_EMAs/eta_kl_ceiling", eta_kl, step=sstep)
-                log(s, "Global_EMAs/eta_kl_budget", eta_kl, step=sstep)
-                if bool(getattr(alg, "one_step_dist_shift_eta", False)):
-                    eta_one_step = -1.0 / (float(np.sqrt(max(m2, 1e-8))) * shape) if shape < -1e-8 else float("nan")
-                    if not np.isnan(eta_one_step):
-                        log(s, "Global_EMAs/eta_quadratic", eta_one_step, step=sstep)
-                        log(s, "Global_EMAs/eta_one_step_dist_shift", eta_one_step, step=sstep)
-            else:
-                log(s, "Global_EMAs/eta", tfg_eta, step=sstep)
-        self.logger.flush_all()
 
     # ------------------------------------------------------------------
     # Main loop

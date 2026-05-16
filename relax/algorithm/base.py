@@ -1,5 +1,3 @@
-import pickle
-
 import numpy as np
 import jax, jax.numpy as jnp
 
@@ -55,36 +53,14 @@ class Algorithm:
         self.state, info = self._update_vmap(key, self.state, data)
         return _split_info_vmap(info)
 
-    def save(self, path: str) -> None:
-        state = jax.device_get(self.state)
-        with open(path, "wb") as f:
-            pickle.dump(state, f)
-
-    def load(self, path: str) -> None:
-        with open(path, "rb") as f:
-            state = pickle.load(f)
-        self.state = jax.device_put(state)
-
-    def save_policy(self, path: str) -> None:
-        policy = jax.device_get(self.get_policy_params())
-        with open(path, "wb") as f:
-            pickle.dump(policy, f)
-
-    def get_policy_params(self):
-        return self.state.params.policy
-
-    def get_value_params(self):
-        return self.state.params.value
-
     def warmup_vmap(self, data: Experience, N: int) -> None:
         """Trigger JIT tracing for the vmapped entry points. ``data`` has a
         leading [N] seed axis. ``self.state`` must already be vmap-stacked."""
         self._ensure_vmap_compiled()
         key = jax.random.split(jax.random.key(0), N)
         obs = data.obs[:, 0]  # [N, obs_dim] — one obs vector per seed
-        policy_params = self.get_policy_params()
         self._update_vmap(key, self.state, data)
-        self._get_action_vmap_fn(key, policy_params, obs)
+        self._get_action_vmap_fn(key, self.state, obs)
 
     def get_effective_hparams(self) -> dict:
         """Return a dict of effective hyperparameters for logging.
