@@ -76,10 +76,10 @@ class Diffv2TrainState(NamedTuple):
     opt_state: Diffv2OptStates
     step: int
     log_eta_scales: jax.Array
-    tfg_eta: jax.Array
+    tfg_eta: jax.Array                          # guidance step size η (paper's η_k); applied to raw advantage A in the sampler
     # Normalized advantage guidance state
-    value_params: hk.Params = None  # V(s) network params (optional)
-    advantage_second_moment_ema: float = 1.0  # EMA of E[A^2] where A = Q - V
+    value_params: hk.Params = None             # V(s) network params (optional)
+    advantage_second_moment_ema: float = 1.0   # M = EMA(E[A²]); used by ema_eta.py to compute η = sqrt(2δ/M)
     advantage_third_moment_ema: float = 0.0
     dist_shift_covariance_ema: float = 0.0
     dist_shift_shape_ema: float = -1.0        # EMA of s₂ = (2γc + κ₃) / v^(3/2), dimensionless shape

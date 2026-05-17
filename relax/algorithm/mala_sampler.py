@@ -83,12 +83,22 @@ def build_mala_sampler(
             # Scale base energy by energy_multiplier (tempers the base distribution)
             return energy_multiplier * E
 
+        # FIXME: tfg_eta_current = η = sqrt(2δ/M) (the paper's η).  energy_total
+        # should simply use η·Q(x0_hat) as the guidance energy — Q vs A = Q-V makes
+        # no difference because V(s) is state-only and cancels in the MALA
+        # acceptance ratio.  The only issue is the η *scale*: energy_total was
+        # historically calibrated with sqrt(2δ) (before M was folded into tfg_eta),
+        # so switching to sqrt(2δ/M) changes MALA acceptance probabilities and
+        # requires re-validation before committing.  For now, multiply back by
+        # sqrt(M) to keep the pre-refactor scale and stay algebraically equivalent.
+        tfg_eta_energy = tfg_eta_current * jnp.sqrt(jnp.maximum(adv_second_moment_ema, jnp.float32(1e-6)))
+
         def energy_total(t, x):
             E_mod = energy_model(t, x)
             noise_pred = model.policy(policy_params, obs, x, t)
             x0_hat = reconstruct_x0_from_noise(x, t, noise_pred)
             clip_frac = jnp.mean((jnp.abs(x0_hat) > x0_hat_clip_radius).astype(jnp.float32))
-            return E_mod - tfg_eta_current * q_aggregated_at_clipped_x0_hat(x0_hat), clip_frac
+            return E_mod - tfg_eta_energy * q_aggregated_at_clipped_x0_hat(x0_hat), clip_frac
 
         # ---- Q-guidance gradient (drives predictor step) ------------
         def scaled_policy_noise(t_idx, x_in):
@@ -102,12 +112,11 @@ def build_mala_sampler(
             x0_hat = reconstruct_x0_from_noise(x_in, t_idx, noise_pred_scaled)
             q = q_aggregated_at_clipped_x0_hat(x0_hat)
 
-            # On-policy-EMA / KL-budget mode: normalize advantage (Q - V) / std.
+            # KL-budget mode: guide on advantage A = Q - V.
+            # tfg_eta already encodes 1/sqrt(M) so A is used unnormalized.
             if value_head is not None and value_params is not None:
                 v = value_head.apply(value_params, obs)
-                advantage = q - v
-                adv_std = jnp.sqrt(jnp.maximum(adv_second_moment_ema, jnp.float32(1e-6)))
-                return guidance_multiplier * reduce_over_batch(advantage / adv_std)
+                return guidance_multiplier * reduce_over_batch(q - v)
             return guidance_multiplier * reduce_over_batch(q)
 
         def compute_guidance_gradient(x_in, t_idx):
