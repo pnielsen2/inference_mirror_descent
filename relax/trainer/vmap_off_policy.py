@@ -122,11 +122,7 @@ class VmapOffPolicyTrainer:
             )
 
         self.env_name = env.spec.id if env.spec is not None else "env"
-        _hp = getattr(self.algorithm.state, "hp", None)
-        _gamma_src = getattr(_hp, "gamma", None) if _hp is not None else getattr(self.algorithm, "gamma", 0.99)
-        _gamma = np.asarray(_gamma_src, dtype=np.float64)
-        if _gamma.ndim == 0:
-            _gamma = np.broadcast_to(_gamma, (self.num_runs,)).astype(np.float64)
+        _gamma = np.broadcast_to(np.asarray(self.algorithm.state.hp.gamma, dtype=np.float64), (self.num_runs,))
         _q_label = "Q"
 
         _can_terminate = _detect_env_can_terminate(self.env_name)
@@ -194,7 +190,7 @@ class VmapOffPolicyTrainer:
     # ------------------------------------------------------------------
     # Warmup (random actions)
     # ------------------------------------------------------------------
-    def warmup(self, key: jax.Array):
+    def warmup(self):
         train_obs_flat, _ = self.env.reset()
         # obs_flat: [num_runs*envs_per_run, obs_dim].
         # Each buffer fills to start_step transitions independently.
@@ -295,11 +291,10 @@ class VmapOffPolicyTrainer:
     # Update step
     # ------------------------------------------------------------------
     def update(self, update_key: jax.Array):
-        keys = update_key
         batches = [self.buffers[s].sample(self.batch_size) for s in range(self.num_runs)]
 
         stacked_batches = jax.tree.map(lambda *xs: jnp.stack([jnp.asarray(x) for x in xs], axis=0), *batches)
-        info, array_info = self.algorithm.update_vmap(keys, stacked_batches)
+        info, array_info = self.algorithm.update_vmap(update_key, stacked_batches)
 
         # info: dict tag -> np.ndarray[num_runs]
         # Log per-run; use per-run update step = UpdateLog.update_step * 5
@@ -325,12 +320,8 @@ class VmapOffPolicyTrainer:
     # ------------------------------------------------------------------
     def run(self, key: jax.Array):
         try:
-            # key always has leading [num_runs] run axis (set by train_mujoco.py).
-            split_keys = jax.vmap(lambda k: jax.random.split(k, 2))(key)
-            train_key = split_keys[:, 0]
-            warmup_key = split_keys[:, 1]
-            obs = self.warmup(warmup_key)
-            self._train(train_key, obs)
+            obs = self.warmup()
+            self._train(key, obs)
         except KeyboardInterrupt:
             pass
         finally:

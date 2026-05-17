@@ -4,21 +4,16 @@ on-policy path of DPMD.
 Two pure functions, one per sampler dispatch mode in ``VmapOffPolicyTrainer``:
 
 * :func:`update_state_kl_only` -- KL-budget-only η selection.
-  η = sqrt(2δ / E[A^2])  (then η_state := η * sqrt(E[A^2]) so the in-graph
-  guidance scale matches the formula used by ``q_mean_from_x`` which divides
-  the advantage by sqrt(E[A^2])).
+  η_state = sqrt(2δ).
 
-* :func:`update_state_one_step` -- second-order one-step distribution-shift
-  η*: takes the KL ceiling AND a quadratic-shape correction estimated from
-  consecutive (A_t, A_{t+1}) advantage pairs, returns η = min(η_KL, η*).
+* :func:`update_state_one_step` -- second-order one-step distribution-shift.
+  η_state = min(sqrt(2δ), -1/shape), where shape is a running EMA of the
+  quadratic distribution-shift coefficient estimated from consecutive
+  (A_t, A_{t+1}) advantage pairs.
 
 Each function returns ``(new_state, adv_per_env)``: the trainer replaces
 ``algorithm.state`` with ``new_state`` and uses ``adv_per_env`` to roll the
 one-step covariance buffer for the next call.
-
-The numerical sequence (float64 promotion, the 1e-8 clamps, the order of
-EMA updates) is preserved verbatim from the previous in-trainer
-implementation so this is a pure code move.
 """
 from typing import Tuple
 

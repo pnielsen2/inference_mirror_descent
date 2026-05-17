@@ -121,7 +121,6 @@ class DPMD:
         for TD bootstrap). Called once from ``__init__``; the result is wrapped
         with ``jax.jit(jax.vmap(...))`` and stored as ``_jit_vmap_update``.
         """
-        @jax.jit
         def stateless_update(
             key: jax.Array, state: Diffv2TrainState, data: Experience
         ) -> Tuple[Diffv2OptStates, Metric]:
@@ -183,13 +182,10 @@ class DPMD:
                 state.hp.lr_policy, step, self.cfg.delay_update,
             )
 
-            # Normalized advantage guidance: train V(s'). The advantage-EMA
-            # itself is updated outside jit in VmapOffPolicyTrainer.sample()
-            # (on-policy mode), so we pass state.advantage_second_moment_ema
-            # through unchanged here.
+            # Normalized advantage guidance: train V(s'). advantage_second_moment_ema
+            # is updated on the host side in VmapOffPolicyTrainer, not here.
             value_params_updated, value_opt_state_updated, value_loss_log = \
                 self._value_update_step(state, per_q_target_values, next_obs)
-            new_adv_second_moment_ema = state.advantage_second_moment_ema
 
             state = state._replace(
                 params=ActorCriticParams(q_params, target_q_params, policy_params),
@@ -197,7 +193,6 @@ class DPMD:
                 step=step + 1,
                 log_eta_scales=mala_result.log_eta_scales,
                 value_params=value_params_updated,
-                advantage_second_moment_ema=new_adv_second_moment_ema,
             )
 
             # --- Losses ---
@@ -242,19 +237,17 @@ class DPMD:
             def q_loss_fn(p):
                 q_pred_mean = self.model.q(p, obs, action)
                 td_err = q_pred_mean - backup_qi
-                q_td_loss = self._huber_loss(td_err, state.hp.reward_scale, state.hp.q_td_huber_width)
-                
-                return q_td_loss, q_pred_mean
+                return self._huber_loss(td_err, state.hp.reward_scale, state.hp.q_td_huber_width)
 
-            (qi_loss, qi_pred), qi_grads = jax.value_and_grad(q_loss_fn, has_aux=True)(qp)
+            qi_loss, qi_grads = jax.value_and_grad(q_loss_fn)(qp)
             update, new_opt = self.optim.update(qi_grads, opt_s, params=qp)
             update = jax.tree.map(lambda u: -state.hp.lr_q * u, update)
             new_qp = optax.apply_updates(qp, update)
-            return new_qp, new_opt, qi_loss, qi_pred
+            return new_qp, new_opt, qi_loss
 
         # Stack the N (params, opt-state, backup) tuples along a leading axis,
         # vmap one Adam step over the ensemble, then unstack back to N tuples.
-        stacked_new_qp, stacked_new_q_opt_states, all_q_losses, _all_q_preds = jax.vmap(
+        stacked_new_qp, stacked_new_q_opt_states, all_q_losses = jax.vmap(
             single_q_train_step
         )(stack_trees(q_params), stack_trees(q_opt_states), jnp.stack(q_backup_per_q))
 
