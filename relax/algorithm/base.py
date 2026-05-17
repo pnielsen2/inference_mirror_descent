@@ -30,46 +30,4 @@ def _split_info_vmap(info):
     return scalar_info, array_info
 
 
-class Algorithm:
-    # NOTE: a not elegant blanket implementation of the algorithm interface
-    def _implement_common_behavior(self, stateless_update, stateless_get_action):
-        """Registers the two stateless fns; base class will wrap them as ``update_vmap`` / ``get_action_vmap``."""
-        # Store the un-jitted stateless fns so vmap-wrappers can compose
-        # cleanly (jit-of-vmap instead of vmap-of-jit).
-        self._stateless_update = stateless_update
-        self._stateless_get_action = stateless_get_action
-        self._update_vmap = None
-        self._get_action_vmap_fn = None
 
-    def _ensure_vmap_compiled(self):
-        """Lazily build vmapped+jitted stateless fns. Idempotent."""
-        if self._update_vmap is None:
-            self._update_vmap = jax.jit(jax.vmap(self._stateless_update))
-        if self._get_action_vmap_fn is None:
-            self._get_action_vmap_fn = jax.jit(jax.vmap(self._stateless_get_action))
-
-    def update_vmap(self, key: jax.Array, data: Experience) -> Metric:
-        """Vmapped update. key/state/data must have a leading seed axis [N]."""
-        self._ensure_vmap_compiled()
-        self.state, info = self._update_vmap(key, self.state, data)
-        return _split_info_vmap(info)
-
-    def warmup_vmap(self, data: Experience, N: int) -> None:
-        """Trigger JIT tracing for the vmapped entry points. ``data`` has a
-        leading [N] seed axis. ``self.state`` must already be vmap-stacked."""
-        self._ensure_vmap_compiled()
-        key = jax.random.split(jax.random.key(0), N)
-        obs = data.obs[:, 0]  # [N, obs_dim] — one obs vector per seed
-        self._update_vmap(key, self.state, data)
-        self._get_action_vmap_fn(key, self.state, obs)
-
-    def get_effective_hparams(self) -> dict:
-        """Return a dict of effective hyperparameters for logging.
-
-        Subclasses can override this to expose any internal hyperparameters,
-        including parameters that are overridden relative to the raw CLI args
-        (e.g., clamped values, derived quantities, or algorithm-specific
-        interpretations). The default implementation returns an empty dict.
-        """
-
-        return {}

@@ -41,7 +41,7 @@ def _q_ensemble_var_vmap(algorithm, obs_nm: np.ndarray, action_nm: np.ndarray,
     if len(q_params) < 2:
         return np.zeros((obs_nm.shape[0],), dtype=np.float32)
     if jit_cache.get("fn") is None:
-        q_fn = algorithm.agent.q
+        q_fn = algorithm.model.q
 
         def _per_seed(q_params_seed, s, a):
             means = [q_fn(qp, s, a) for qp in q_params_seed]

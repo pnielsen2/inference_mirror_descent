@@ -22,7 +22,7 @@ import numpy as np
 from gymnasium import Env
 from tqdm import tqdm
 
-from relax.algorithm import Algorithm
+from relax.algorithm.dpmd import DPMD
 from relax.algorithm import ema_eta
 from relax.buffer import TreeBuffer
 from relax.env.vector import VectorEnv
@@ -61,7 +61,7 @@ class VmapOffPolicyTrainer:
     def __init__(
         self,
         env: Env,
-        algorithm: Algorithm,
+        algorithm: DPMD,
         buffers: List[TreeBuffer],
         log_path: Path,
         *,
@@ -301,16 +301,13 @@ class VmapOffPolicyTrainer:
         keys = update_key
         batches = [self.buffers[s].sample(self.batch_size) for s in range(self.N)]
 
-        def stack_leaves(*xs):
-            return jnp.stack([jnp.asarray(x) for x in xs], axis=0)
-
-        stacked = jax.tree.map(stack_leaves, *batches)
-        info, array_info = self.algorithm.update_vmap(keys, stacked)
-        self.logger.accumulate_arrays(array_info)
+        stacked_batches = jax.tree.map(lambda *xs: jnp.stack([jnp.asarray(x) for x in xs], axis=0), *batches)
+        info, array_info = self.algorithm.update_vmap(keys, stacked_batches)
 
         # info: dict tag -> np.ndarray[N]
         # Log per-seed; use per-seed update step = UpdateLog.update_step * 5
         # (existing convention from UpdateLog.log at line 291 of accumulator.py).
+        self.logger.accumulate_arrays(array_info)
         self.update_log.update_step += 1
         current_env_step = self.sample_logs[0].sample_step
         log_this_step = (
@@ -353,11 +350,6 @@ class VmapOffPolicyTrainer:
             split_keys = jax.vmap(lambda k: jax.random.split(k, 2))(seed_keys)
             sample_key, update_key = split_keys[:, 0], split_keys[:, 1]
             obs = self.sample(sample_key, obs)
-            # Unified path: split out ``update_per_iteration`` per-seed subkeys
-            # and run one update per subkey. With update_per_iteration == 1
-            # this is NOT bit-identical to ``self.update(update_key)`` (since
-            # jax.random.split(k, 1) != k), but it matches the >1 branch
-            # exactly for any update_per_iteration >= 1.
             update_keys = jax.vmap(
                 lambda k: jax.random.split(k, self.update_per_iteration)
             )(update_key)

@@ -25,12 +25,13 @@ import jax
 import jax.numpy as jnp
 
 from relax.algorithm.dpmd_types import Diffv2TrainState, MalaSampleResult
-from relax.network.diffv2 import Diffv2Net
+from relax.network.actor_critic import ActorCritic
+from relax.utils.diffusion import p_mean_variance
 
 
 def build_mala_sampler(
     *,
-    agent: Diffv2Net,
+    model: ActorCritic,
     value_head,                    # ValueHead | None — supplied iff on-policy-EMA / KL-budget mode
     timesteps: int,
     energy_multiplier: float,
@@ -62,29 +63,30 @@ def build_mala_sampler(
         guidance_mult_hp = state.hp.guidance_mult
 
         obs_batch = obs
-        shape = (*obs_batch.shape[:-1], agent.act_dim)
+        shape = (*obs_batch.shape[:-1], model.act_dim)
 
         # 3-way split kept verbatim to preserve PRNG layout from a deleted
         # multi-particle / particle-select sampling path; the two unused
         # keys must continue to be split off here for byte-exact PRNG match.
         key_sample, _key_select, _noise_key = jax.random.split(key, 3)
         key_x, loop_key = jax.random.split(key_sample)
-        B = agent.diffusion.beta_schedule()
+        B = model.schedule
+        x_recon_clip_radius = model.x_recon_clip_radius
 
         # ---- Sampler-local helpers (capture `state`, `obs_batch`, `B`) ---
         def energy_model(t, x):
-            E = agent.energy_fn(policy_params, obs_batch, x, t)
+            E = model.energy_fn(policy_params, obs_batch, x, t)
             # Scale base energy by energy_multiplier (tempers the base distribution)
             return energy_multiplier * E
 
         def q_aggregated_at_x0(x0_in):
-            q_means = [agent.q(qp, obs_batch, x0_in) for qp in q_params_tuple]
+            q_means = [model.q(qp, obs_batch, x0_in) for qp in q_params_tuple]
             return aggregate_q_fn(q_means)
 
         def q_mean_from_x(x_in, t_idx):
             # Tweedie-clean prediction with energy_multiplier-tempered base
             # score; guidance component is NOT scaled.
-            noise_pred = agent.policy(policy_params, obs_batch, x_in, t_idx)
+            noise_pred = model.policy(policy_params, obs_batch, x_in, t_idx)
             noise_pred_scaled = energy_multiplier * noise_pred
             x0_hat = (
                 x_in * B.sqrt_recip_alphas_cumprod[t_idx]
@@ -132,7 +134,7 @@ def build_mala_sampler(
 
             def with_q(x_in):
                 E_mod = energy_model(t, x_in)
-                noise_pred = agent.policy(policy_params, obs_batch, x_in, t)
+                noise_pred = model.policy(policy_params, obs_batch, x_in, t)
                 x0_hat = (
                     x_in * B.sqrt_recip_alphas_cumprod[t]
                     - noise_pred * B.sqrt_recipm1_alphas_cumprod[t]
@@ -150,20 +152,20 @@ def build_mala_sampler(
         # the legacy stochastic DDPM predictor path.
         if mala_guided_predictor:
             def predictor_step(t_idx, x_in, k_in):
-                noise_pred = agent.policy(policy_params, obs_batch, x_in, t_idx)
+                noise_pred = model.policy(policy_params, obs_batch, x_in, t_idx)
                 noise_pred_scaled = energy_multiplier * noise_pred  # base score; guidance below is NOT scaled
                 k_out, _z_key = jax.random.split(k_in)
                 grad_q = grad_guidance(x_in, t_idx)
                 sigma_t = B.sqrt_one_minus_alphas_cumprod[t_idx]
                 eps_pred = noise_pred_scaled - tfg_eta_current * sigma_t * grad_q
-                model_mean, _ = agent.diffusion.p_mean_variance(t_idx, x_in, eps_pred)
+                model_mean, _ = p_mean_variance(B, t_idx, x_in, eps_pred, x_recon_clip_radius)
                 return model_mean, k_out
         else:
             def predictor_step(t_idx, x_in, k_in):
-                noise_pred = agent.policy(policy_params, obs_batch, x_in, t_idx)
+                noise_pred = model.policy(policy_params, obs_batch, x_in, t_idx)
                 noise_pred_scaled = energy_multiplier * noise_pred
                 k_out, _z_key = jax.random.split(k_in)
-                model_mean, _ = agent.diffusion.p_mean_variance(t_idx, x_in, noise_pred_scaled)
+                model_mean, _ = p_mean_variance(B, t_idx, x_in, noise_pred_scaled, x_recon_clip_radius)
                 return model_mean, k_out
 
         # ---- Post-MALA transition: either DDIM step or skip (build-time choice) ----
@@ -242,7 +244,7 @@ def build_mala_sampler(
             acc_count_before = acc_count
             x_curr, k, log_eta_scale_final, acc_sum_level, acc_count_level, clip_sum_level = jax.lax.fori_loop(
                 0,
-                agent.mala_steps,
+                model.mala_steps,
                 mala_body,
                 (x_curr, k, log_eta_scale0, jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0)),
             )
@@ -257,7 +259,7 @@ def build_mala_sampler(
             level_acc_count = acc_count - acc_count_before
             level_acc = level_acc_sum / jnp.maximum(level_acc_count, jnp.float32(1.0))
             per_level_acc = per_level_acc.at[t].set(level_acc)
-            mala_steps_f = jnp.float32(agent.mala_steps)
+            mala_steps_f = jnp.float32(model.mala_steps)
             per_level_clip_frac = per_level_clip_frac.at[t].set(
                 clip_sum_level / jnp.maximum(mala_steps_f, jnp.float32(1.0))
             )
@@ -278,7 +280,7 @@ def build_mala_sampler(
         )
 
         act_final = jnp.clip(x_final, -1.0, 1.0)
-        q_means_f = [agent.q(qp, obs_batch, act_final) for qp in q_params_tuple]
+        q_means_f = [model.q(qp, obs_batch, act_final) for qp in q_params_tuple]
         q = aggregate_q_fn(q_means_f)
         return MalaSampleResult(
             action=act_final, q=q, log_eta_scales=log_eta_scales_out,

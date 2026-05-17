@@ -37,46 +37,6 @@ class QNet(hk.Module):
         return mlp(self.hidden_sizes, 1, self.activation, self.output_activation, squeeze_output=True, zero_init_final=self.zero_init_final)(input)
 
 
-@dataclass
-@fix_repr
-class EnergyPolicyNet(hk.Module):
-    hidden_sizes: Sequence[int]
-    activation: Activation
-    output_activation: Activation = Identity
-    time_dim: int = 16
-    horizon_dim: int = 8
-    zero_init_final: bool = False
-    name: str = None
-
-    def __call__(
-        self,
-        obs: jax.Array,
-        act: jax.Array,
-        t: jax.Array,
-        h: jax.Array,
-    ) -> jax.Array:
-        """Forward pass with required horizon index h.
-
-        Args:
-            obs: Observation, shape [..., obs_dim]
-            act: Action, shape [..., act_dim]
-            t: Diffusion timestep
-            h: Horizon step index (use 0 for single-step mode)
-        """
-        te = scaled_sinusoidal_encoding(t, dim=self.time_dim, batch_shape=obs.shape[:-1])
-        te = hk.Linear(self.time_dim * 2)(te)
-        te = self.activation(te)
-        te = hk.Linear(self.time_dim)(te)
-        # Always use horizon embedding for consistent parameter structure
-        he = scaled_sinusoidal_encoding(h, dim=self.horizon_dim, batch_shape=obs.shape[:-1])
-        he = hk.Linear(self.horizon_dim * 2)(he)
-        he = self.activation(he)
-        he = hk.Linear(self.horizon_dim)(he)
-        input = jnp.concatenate((obs, act, te, he), axis=-1)
-        # Output scalar energy (squeeze last dim)
-        return mlp(self.hidden_sizes, 1, self.activation, self.output_activation, squeeze_output=True, zero_init_final=self.zero_init_final)(input)
-
-
 def mlp(hidden_sizes: Sequence[int], output_size: int, activation: Activation, output_activation: Activation, *, squeeze_output: bool = False, zero_init_final: bool = False) -> Callable[[jax.Array], jax.Array]:
     layers = []
     for hidden_size in hidden_sizes:

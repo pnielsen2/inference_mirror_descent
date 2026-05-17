@@ -1,13 +1,8 @@
-from typing import Protocol, Optional
+from typing import Optional
 from dataclasses import dataclass
 
 import numpy as np
 import jax, jax.numpy as jnp
-import optax
-
-class DiffusionModel(Protocol):
-    def __call__(self, t: jax.Array, x: jax.Array) -> jax.Array:
-        ...
 
 @dataclass(frozen=True)
 class BetaScheduleCoefficients:
@@ -93,59 +88,53 @@ class BetaScheduleCoefficients:
         betas = np.clip(betas, 1e-8, 0.999)
         return betas
 
-@dataclass(frozen=True)
-class GaussianDiffusion:
-    num_timesteps: int
-    beta_schedule_scale: float = 0.3
-    beta_schedule_type: str = 'linear'
-    x_recon_clip_radius: Optional[float] = 1.0
-    snr_max: float = 124.0
+def build_beta_schedule(
+    num_timesteps: int,
+    beta_schedule_type: str,
+    snr_max: float,
+) -> BetaScheduleCoefficients:
+    """Eager builder for the DDPM noise schedule.
 
-    def beta_schedule(self):
-        with jax.ensure_compile_time_eval():
-            target_abar_0 = self.snr_max / (1.0 + self.snr_max)
+    Returns a :class:`BetaScheduleCoefficients` holding all 13 precomputed
+    arrays. Called once at ``ActorCritic.create`` time so downstream code
+    can just attribute-access ``model.schedule.sqrt_alphas_cumprod`` etc.
+    instead of calling a method that re-derives them.
+    """
+    target_abar_0 = snr_max / (1.0 + snr_max)
 
-            if self.beta_schedule_type == 'constant_kl':
-                betas = BetaScheduleCoefficients.constant_kl_beta_schedule(
-                    self.num_timesteps, snr_max=self.snr_max)
-            elif self.beta_schedule_type == 'cosine':
-                raw_betas = BetaScheduleCoefficients.cosine_beta_schedule(self.num_timesteps)
-                scale = (1.0 - target_abar_0) / raw_betas[0]
-                betas = np.clip(scale * raw_betas, 0, 0.999)
-            elif self.beta_schedule_type == 'linear':
-                raw_betas = BetaScheduleCoefficients.linear_beta_schedule(self.num_timesteps)
-                scale = (1.0 - target_abar_0) / raw_betas[0]
-                betas = np.clip(scale * raw_betas, 0, 0.999)
-            return BetaScheduleCoefficients.from_beta(betas)
+    if beta_schedule_type == 'constant_kl':
+        betas = BetaScheduleCoefficients.constant_kl_beta_schedule(
+            num_timesteps, snr_max=snr_max)
+    elif beta_schedule_type == 'cosine':
+        raw_betas = BetaScheduleCoefficients.cosine_beta_schedule(num_timesteps)
+        scale = (1.0 - target_abar_0) / raw_betas[0]
+        betas = np.clip(scale * raw_betas, 0, 0.999)
+    elif beta_schedule_type == 'linear':
+        raw_betas = BetaScheduleCoefficients.linear_beta_schedule(num_timesteps)
+        scale = (1.0 - target_abar_0) / raw_betas[0]
+        betas = np.clip(scale * raw_betas, 0, 0.999)
+    else:
+        raise ValueError(f"Unknown beta_schedule_type: {beta_schedule_type}")
+    return BetaScheduleCoefficients.from_beta(betas)
 
-    def p_mean_variance(self, t: int, x: jax.Array, noise_pred: jax.Array):
-        B = self.beta_schedule()
-        x_recon = x * B.sqrt_recip_alphas_cumprod[t] - noise_pred * B.sqrt_recipm1_alphas_cumprod[t]
-        if self.x_recon_clip_radius is not None:
-            r = jnp.float32(self.x_recon_clip_radius)
-            x_recon = jnp.clip(x_recon, -r, r)
-        model_mean = x_recon * B.posterior_mean_coef1[t] + x * B.posterior_mean_coef2[t]
-        model_log_variance = B.posterior_log_variance_clipped[t]
-        return model_mean, model_log_variance
 
-    def q_sample(self, t: int, x_start: jax.Array, noise: jax.Array):
-        B = self.beta_schedule()
-        return B.sqrt_alphas_cumprod[t] * x_start + B.sqrt_one_minus_alphas_cumprod[t] * noise
+def p_mean_variance(
+    schedule: BetaScheduleCoefficients,
+    t,
+    x: jax.Array,
+    noise_pred: jax.Array,
+    x_recon_clip_radius: Optional[float] = None,
+):
+    """DDPM reverse-process posterior mean / log-variance.
 
-    def p_loss(self, key: jax.Array, model: DiffusionModel, t: jax.Array, x_start: jax.Array):
-        """Standard diffusion denoising loss: mean( (eps_pred - eps)**2 ).
-
-        Equivalent to upstream `inference_mirror_descent`'s
-        `weighted_p_loss(weights=ones, ..., reduction="mean")` after XLA
-        elides the multiply-by-ones. Note that upstream uses
-        `optax.squared_error = (x-y)**2`, NOT `optax.l2_loss` which is
-        `0.5 * (x-y)**2`; the factor of 2 matters for bit-exact
-        reproducibility against the reference run.
-        """
-        assert t.ndim == 1 and t.shape[0] == x_start.shape[0]
-
-        noise = jax.random.normal(key, x_start.shape)
-        x_noisy = jax.vmap(self.q_sample)(t, x_start, noise)
-        noise_pred = model(t, x_noisy)
-        loss = optax.squared_error(noise_pred, noise)
-        return loss.mean()
+    ``t`` is the diffusion timestep index (scalar). Returns
+    ``(model_mean, model_log_variance)`` where ``model_log_variance`` is
+    just ``schedule.posterior_log_variance_clipped[t]``.
+    """
+    x_recon = x * schedule.sqrt_recip_alphas_cumprod[t] - noise_pred * schedule.sqrt_recipm1_alphas_cumprod[t]
+    if x_recon_clip_radius is not None:
+        r = jnp.float32(x_recon_clip_radius)
+        x_recon = jnp.clip(x_recon, -r, r)
+    model_mean = x_recon * schedule.posterior_mean_coef1[t] + x * schedule.posterior_mean_coef2[t]
+    model_log_variance = schedule.posterior_log_variance_clipped[t]
+    return model_mean, model_log_variance

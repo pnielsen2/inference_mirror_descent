@@ -25,7 +25,7 @@ import jax
 import optax
 import haiku as hk
 
-from relax.network.diffv2 import Diffv2Params
+from relax.network.actor_critic import ActorCriticParams
 
 
 class Diffv2OptStates(NamedTuple):
@@ -72,7 +72,7 @@ class HParams(NamedTuple):
 
 
 class Diffv2TrainState(NamedTuple):
-    params: Diffv2Params
+    params: ActorCriticParams
     opt_state: Diffv2OptStates
     step: int
     log_eta_scales: jax.Array
@@ -120,7 +120,7 @@ class DPMDConfig:
     @classmethod
     def from_args(cls, args) -> "DPMDConfig":
         """Build a frozen DPMDConfig from the argparse ``Namespace`` produced
-        by :mod:`scripts._train_args`. Handles the ``--lr`` → ``--lr_q`` /
+        by :mod:`relax.cli.train_args`. Handles the ``--lr`` → ``--lr_q`` /
         ``--lr_policy`` fallback so the single source of truth for the
         config-from-CLI mapping lives here, not in ``train_mujoco.py``.
         """

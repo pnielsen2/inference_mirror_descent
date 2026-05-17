@@ -7,8 +7,8 @@ from relax.utils.experience import Experience
 from relax.utils.fs import PROJECT_ROOT
 from relax.utils.seeding import derive_seed_bundle
 
-from _train_args import build_parser, validate_args
-from _train_setup import resolve_kl_budget, build_per_seed_state
+from relax.cli.train_args import build_parser, validate_args
+from relax.cli.train_setup import resolve_kl_budget, build_per_seed_state
 
 
 if __name__ == "__main__":
@@ -41,11 +41,11 @@ if __name__ == "__main__":
     resolve_kl_budget(args, act_dim)
 
     print(f"Algorithm: {args.alg}")
-    agent, dpmd_params_list, buffers_list = build_per_seed_state(args, seeds, obs_dim, act_dim)
+    model, dpmd_params_list, buffers_list = build_per_seed_state(args, seeds, obs_dim, act_dim)
     params = dpmd_params_list[0]
 
     cfg = DPMDConfig.from_args(args)
-    algorithm = DPMD(agent, params, cfg, obs_dim=obs_dim, hidden_dim=args.hidden_dim)
+    algorithm = DPMD(model, params, cfg, obs_dim=obs_dim, hidden_dim=args.hidden_dim)
 
     algorithm.state = algorithm.make_vmapped_state(dpmd_params_list)
     if _hp_loaded is not None:
