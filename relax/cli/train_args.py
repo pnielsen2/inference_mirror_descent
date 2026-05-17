@@ -23,8 +23,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timing_log_every", type=int, default=0)
 
     # ----- vmap / sweep plumbing --------------------------------------------
-    parser.add_argument("--parallel_seeds", type=int, default=1, help="If > 1, train N independent DPMD seeds in parallel on a single device via jax.vmap. Env layout uses a single VectorEnv of size parallel_seeds * num_vec_envs. Current packed support covers the KL-budget/on-policy-EMA path and fixed-tfg_eta mode.")
-    parser.add_argument("--hp_pack_inline", type=str, default=None, help="Inline JSON with per-seed hyperparameter overrides. Each key is an argparse attribute name of this script (e.g. 'tau', 'tfg_eta', 'advantage_ema_tau', 'guidance_strength_multiplier', 'kl_budget', 'shape_ema_tau', 'seed') mapped to a list of length parallel_seeds. Applied after vmap state construction; internally translated to Diffv2TrainState field names via _CLI_TO_FIELD.")
+    parser.add_argument("--parallel_runs", type=int, default=1, help="If > 1, train N independent DPMD runs in parallel on a single device via jax.vmap. Env layout uses a single VectorEnv of size parallel_runs * num_vec_envs. Current packed support covers the KL-budget/on-policy-EMA path and fixed-tfg_eta mode.")
+    parser.add_argument("--hp_pack_inline", type=str, default=None, help="Inline JSON with per-run hyperparameter overrides. Each key is an argparse attribute name of this script (e.g. 'tau', 'tfg_eta', 'advantage_ema_tau', 'guidance_strength_multiplier', 'kl_budget', 'shape_ema_tau', 'seed') mapped to a list of length parallel_runs. Applied after vmap state construction; internally translated to Diffv2TrainState field names via _CLI_TO_FIELD.")
     parser.add_argument("--sweep_id", type=int, default=None, help="Launcher-assigned integer identifying this sweep. When set, every wandb run from this invocation is placed in wandb group 'sweep_<sweep_id>', and each per-vmap-slot run's config includes a 'config_tag' field built from sweep_id + the per-slot hyperparameters (excluding seed/env) so a single tag value filters wandb to all runs across envs/seeds that share this hp configuration.")
     parser.add_argument("--config_tag_keys", type=str, default=None, help="Comma-separated list of argparse attribute names whose values should be included in the per-slot config_tag. Typically set automatically by scripts/launch.py to the union of all --ablate hard+easy flags (minus env and seed). Values come from the hp_pack (per-slot) when the key is a pack key, else from this script's CLI args (shared across all vmap slots within the job).")
 
@@ -114,8 +114,8 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
     if args.one_step_dist_shift_eta and args.kl_budget is None and args.kl_budget_per_dim is None:
         args.kl_budget_per_dim = 5.33
 
-    if args.parallel_seeds <= 0:
-        parser.error("--parallel_seeds must be >= 1.")
+    if args.parallel_runs <= 0:
+        parser.error("--parallel_runs must be >= 1.")
     if args.num_vec_envs <= 0:
         parser.error("--num_vec_envs must be > 0 in simplify_walkthrough (vectorized/vmapped path only).")
     if args.mala_steps <= 0:

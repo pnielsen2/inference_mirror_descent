@@ -1,8 +1,8 @@
-"""Multi-seed wandb logging plumbing for VmapOffPolicyTrainer.
+"""Multi-run wandb logging plumbing for VmapOffPolicyTrainer.
 
-Owns one wandb.Run per vmap seed, plus the host-side per-seed pending-scalar
+Owns one wandb.Run per vmap run, plus the host-side per-run pending-scalar
 buffers and the update-step array accumulator. The trainer itself is now
-RL-focused; it just calls ``logger.add_scalar_per_seed(...)`` /
+RL-focused; it just calls ``logger.add_scalar_per_run(...)`` /
 ``logger.flush_all()`` etc. Behavior (PRNG, log keys, log values, log steps,
 config_tag strings) is byte-identical to the old in-trainer implementation.
 """
@@ -36,7 +36,7 @@ def _format_tag_value(v) -> str:
     return str(v)
 
 
-def build_config_tag(hp_pack: Optional[dict], seed_index: int,
+def build_config_tag(hp_pack: Optional[dict], run_index: int,
                      sweep_id: Optional[int],
                      hparams: Optional[dict] = None,
                      tag_keys: Optional[list] = None) -> str:
@@ -48,13 +48,13 @@ def build_config_tag(hp_pack: Optional[dict], seed_index: int,
     for this slurm job). This lets the tag capture both easy (vmappable,
     per-slot) and hard (per-job, shared across the vmap) ablation axes. Seed
     and env are conventionally kept out of the tag at the call site so the
-    tag groups runs across envs and seed replicas.
+    tag groups runs across envs and run replicas.
     """
     parts = []
     if tag_keys:
         for k in sorted(tag_keys):
             if hp_pack is not None and k in hp_pack:
-                v = hp_pack[k][seed_index]
+                v = hp_pack[k][run_index]
             elif hparams is not None and k in hparams:
                 v = hparams[k]
             else:
@@ -65,17 +65,17 @@ def build_config_tag(hp_pack: Optional[dict], seed_index: int,
 
 
 class WandbMultiSeedLogger:
-    """One wandb.Run per vmap seed with batched per-seed scalar flushes.
+    """One wandb.Run per vmap run with batched per-run scalar flushes.
 
-    Each seed's run uses its own sample_step as the wandb x-axis, so we
-    buffer pending scalars per seed; switching to a new step for a given
-    seed flushes that seed's pending dict to its run.
+    Each run uses its own sample_step as the wandb x-axis, so we
+    buffer pending scalars per run; switching to a new step for a given
+    run flushes that run's pending dict to its wandb.Run.
     """
 
     def __init__(
         self,
         *,
-        N: int,
+        num_runs: int,
         env_name: str,
         log_path: Path,
         wandb_names: Optional[List[str]],
@@ -84,7 +84,7 @@ class WandbMultiSeedLogger:
         hparams: dict,
         config_tag_keys: Optional[List[str]],
     ):
-        self.N = int(N)
+        self.num_runs = int(num_runs)
         self.env_name = env_name
         self.log_path = log_path
         self._wandb_names = wandb_names
@@ -94,8 +94,8 @@ class WandbMultiSeedLogger:
         self.config_tag_keys = config_tag_keys
 
         self._runs: List = []
-        self._pending: List[dict] = [{} for _ in range(self.N)]
-        self._pending_step: List[Optional[int]] = [None] * self.N
+        self._pending: List[dict] = [{} for _ in range(self.num_runs)]
+        self._pending_step: List[Optional[int]] = [None] * self.num_runs
         self._array_accum: dict = {}
         # Set by trainer once the algorithm is constructed; controls the
         # x-axis used for per-level array tables (log2 SNR if available).
@@ -105,16 +105,16 @@ class WandbMultiSeedLogger:
         base_name = self.log_path.name
         # Keep group = env name (its original semantics). sweep_id is logged
         # as a regular config field so filtering in wandb is
-        # config.sweep_id == N.
+        # config.sweep_id == <sweep_id>.
         group = self.env_name
-        for s in range(self.N):
+        for s in range(self.num_runs):
             if s > 0 and _WANDB_INIT_STAGGER_MAX_SECONDS > 0:
                 time.sleep(random.uniform(_WANDB_INIT_STAGGER_MIN_SECONDS,
                                           _WANDB_INIT_STAGGER_MAX_SECONDS))
             name = self._wandb_names[s] if self._wandb_names else f"{base_name}-s{s}"
             cfg = dict(self.hparams)
             cfg["seed_index"] = s
-            cfg["parallel_seeds"] = self.N
+            cfg["parallel_seeds"] = self.num_runs
             # Overwrite each hp_pack key's shared-CLI-default scalar with the
             # per-slot value, so wandb's filter / parallel-coordinates UI
             # reflects the actual hyperparameter this vmap slot is running.
@@ -159,25 +159,25 @@ class WandbMultiSeedLogger:
     # ------------------------------------------------------------------
     # Scalar logging
     # ------------------------------------------------------------------
-    def add_scalar_per_seed(self, seed: int, tag: str, value: float,
-                            step: Optional[int] = None):
+    def add_scalar_per_run(self, run: int, tag: str, value: float,
+                           step: Optional[int] = None):
         if step is not None:
             # Flush if the step changed.
-            if self._pending_step[seed] is not None and step != self._pending_step[seed]:
-                self.flush_seed(seed)
-            self._pending_step[seed] = int(step)
-        self._pending[seed][tag] = float(value)
+            if self._pending_step[run] is not None and step != self._pending_step[run]:
+                self.flush_run(run)
+            self._pending_step[run] = int(step)
+        self._pending[run][tag] = float(value)
 
-    def _buffer_per_seed(self, seed: int, data: dict, step: int):
-        if self._pending_step[seed] is not None and step != self._pending_step[seed]:
-            self.flush_seed(seed)
-        self._pending[seed].update(data)
-        self._pending_step[seed] = int(step)
+    def _buffer_per_run(self, run: int, data: dict, step: int):
+        if self._pending_step[run] is not None and step != self._pending_step[run]:
+            self.flush_run(run)
+        self._pending[run].update(data)
+        self._pending_step[run] = int(step)
 
-    def add_arrays_vmap(self, array_info: dict, sample_steps_per_seed: List[int]):
+    def add_arrays_vmap(self, array_info: dict, sample_steps_per_run: List[int]):
         """Log per-seed array metrics as wandb.Table with one row per level.
 
-        ``array_info`` maps tag -> np.ndarray of shape [N, levels]. When
+        ``array_info`` maps tag -> np.ndarray of shape [num_runs, levels]. When
         ``self.snr`` is provided and matches ``levels``, the table x-axis is
         ``log2_snr``; otherwise it is integer ``level``.
         """
@@ -188,11 +188,11 @@ class WandbMultiSeedLogger:
         if snr is not None:
             log2_snr = np.log2(np.maximum(snr, 1e-12))
 
-        for s in range(self.N):
-            step = int(sample_steps_per_seed[s])
-            seed_arrays = {tag: np.asarray(value)[s] for tag, value in array_info.items()}
+        for s in range(self.num_runs):
+            step = int(sample_steps_per_run[s])
+            run_arrays = {tag: np.asarray(value)[s] for tag, value in array_info.items()}
 
-            for tag, value in seed_arrays.items():
+            for tag, value in run_arrays.items():
                 arr = np.asarray(value)
                 if snr is not None and len(arr) == len(snr):
                     table = wandb.Table(
@@ -204,7 +204,7 @@ class WandbMultiSeedLogger:
                         columns=["level", "value"],
                         data=[[int(i), float(arr[i])] for i in range(len(arr))],
                     )
-                self._buffer_per_seed(s, {tag: table}, step)
+                self._buffer_per_run(s, {tag: table}, step)
 
     # ------------------------------------------------------------------
     # Update-step array accumulator
@@ -213,7 +213,7 @@ class WandbMultiSeedLogger:
         for tag, vals in array_info.items():
             self._array_accum.setdefault(tag, []).append(np.asarray(vals))
 
-    def flush_accumulated_arrays(self, sample_steps_per_seed: List[int]):
+    def flush_accumulated_arrays(self, sample_steps_per_run: List[int]):
         """Average accumulated per-update arrays and log them. No-op if empty."""
         if not self._array_accum:
             return
@@ -222,20 +222,20 @@ class WandbMultiSeedLogger:
             for tag, v_list in self._array_accum.items()
         }
         self._array_accum.clear()
-        self.add_arrays_vmap(averaged, sample_steps_per_seed)
+        self.add_arrays_vmap(averaged, sample_steps_per_run)
 
     # ------------------------------------------------------------------
     # Flushing
     # ------------------------------------------------------------------
-    def flush_seed(self, s: int):
+    def flush_run(self, s: int):
         if self._pending[s]:
             self._runs[s].log(self._pending[s], step=self._pending_step[s])
             self._pending[s] = {}
         self._pending_step[s] = None
 
     def flush_all(self):
-        for s in range(self.N):
-            self.flush_seed(s)
+        for s in range(self.num_runs):
+            self.flush_run(s)
 
     def finish(self):
         for run in self._runs:

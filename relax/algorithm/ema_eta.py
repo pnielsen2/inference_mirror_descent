@@ -30,15 +30,15 @@ def _broadcast_state_scalar(value, N: int) -> np.ndarray:
     """Promote a state scalar/[N] field to a [N] float64 ndarray."""
     arr = np.asarray(value).astype(np.float64)
     if arr.ndim == 0:
-        arr = np.broadcast_to(arr, (N,)).astype(np.float64)
+        arr = np.broadcast_to(arr, (N,))
     return arr
 
 
-def update_state_kl_only(state, q_per_env: np.ndarray, v_per_env: np.ndarray,
-                         N: int) -> Tuple[object, np.ndarray]:
+def update_state_kl_only(state, q_per_env: np.ndarray, v_per_env: np.ndarray) -> Tuple[object, np.ndarray]:
     """KL-budget-only path: update E[A^2] EMA and set η = sqrt(2δ/E[A^2])."""
-    adv_per_env = q_per_env - v_per_env                # [N, M]
-    m2_batch = np.mean(adv_per_env ** 2, axis=1)        # [N]
+    N = q_per_env.shape[0]
+    adv_per_env = q_per_env - v_per_env                # [num_runs, envs_per_run]
+    m2_batch = np.mean(adv_per_env ** 2, axis=1)        # [num_runs]
 
     tau_v = _broadcast_state_scalar(state.hp.adv_ema_tau, N)
     cur_m2 = np.asarray(state.advantage_second_moment_ema)
@@ -58,14 +58,14 @@ def update_state_kl_only(state, q_per_env: np.ndarray, v_per_env: np.ndarray,
 
 
 def update_state_one_step(state, q_per_env: np.ndarray, v_per_env: np.ndarray,
-                          prev_adv_per_env, prev_valid,
-                          N: int) -> Tuple[object, np.ndarray]:
+                          prev_adv_per_env, prev_valid) -> Tuple[object, np.ndarray]:
     """One-step distribution-shift path: update {E[A^2], E[A^3], cov, shape}
     EMAs and pick η = min(η_KL, η*) where η* comes from the second-order
     expansion using the one-step covariance estimate."""
-    adv_per_env = q_per_env - v_per_env                # [N, M]
-    m2_batch = np.mean(adv_per_env ** 2, axis=1)        # [N]
-    m3_batch = np.mean(adv_per_env ** 3, axis=1)        # [N]
+    N = q_per_env.shape[0]
+    adv_per_env = q_per_env - v_per_env                # [num_runs, envs_per_run]
+    m2_batch = np.mean(adv_per_env ** 2, axis=1)        # [num_runs]
+    m3_batch = np.mean(adv_per_env ** 3, axis=1)        # [num_runs]
 
     tau_v = _broadcast_state_scalar(state.hp.adv_ema_tau, N)
     cur_m2 = np.asarray(state.advantage_second_moment_ema)

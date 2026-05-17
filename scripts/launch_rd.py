@@ -195,7 +195,7 @@ def parse_args():
                    help="Pack up to N runs that differ only in 'easy' ablations "
                         "(ones marked 'easy: true' in the sweep YAML, whose per-seed "
                         "hp override is vmap-packable) into a single SLURM job using "
-                        "--parallel_seeds N --hp_pack <json>. Runs that differ in any "
+                        "--parallel_runs N --hp_pack <json>. Runs that differ in any "
                         "non-easy ('hard') flag are placed in separate jobs. Default 1.")
     p.add_argument("--mps", dest="mps", action="store_true", default=True,
                    help="Start an NVIDIA MPS daemon in the job so the K chunk-mates share "
@@ -531,14 +531,14 @@ def _submit_mps_chunks(args, runs, batch_id, scripts_dir, slurm_dir,
 def _submit_vmap_packs(args, sweep, packs, runs, batch_id, scripts_dir,
                        slurm_dir, job_name_base, base_in_seed):
     """One sbatch per vmap pack: a single python process runs
-    --parallel_seeds K --hp_pack <json> with the pack's hard flags."""
+    --parallel_runs K --hp_pack <json> with the pack's hard flags."""
     submitted = 0
     runs_by_idx = {r["run_idx"]: r for r in runs}
     for pk in packs:
         k_seeds = len(pk["run_ids"])
-        # Build tokens: base + hard + parallel_seeds + hp_pack + suffix + seed
+        # Build tokens: base + hard + parallel_runs + hp_pack + suffix + seed
         tokens = list(sweep["base"]) + list(pk["hard_flags"])
-        tokens += ["--parallel_seeds", str(k_seeds)]
+        tokens += ["--parallel_runs", str(k_seeds)]
         if pk["hp_pack_path"] is not None:
             tokens += ["--hp_pack", pk["hp_pack_path"]]
         tokens += ["--suffix", pk["suffix"]]

@@ -642,7 +642,7 @@ def generate_packs(base_cmd: str, seeds: list, ablations: list,
                 cmd = modify_cmd_for_flag(cmd, flag, val)
             if anchor_seed is not None:
                 cmd = modify_cmd_for_flag(cmd, "seed", str(anchor_seed))
-            cmd = modify_cmd_for_flag(cmd, "parallel_seeds", str(K))
+            cmd = modify_cmd_for_flag(cmd, "parallel_runs", str(K))
             if hp_pack:
                 inline = json.dumps(hp_pack, separators=(",", ":"))
                 cmd = f"{cmd} --hp_pack_inline {shlex.quote(inline)}"

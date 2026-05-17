@@ -1,19 +1,19 @@
 """Host-side per-step bookkeeping + periodic wandb metrics for the vmapped
-multi-seed trainer.
+multi-run trainer.
 
 Encapsulates everything that's "what wandb sees", not "what the algorithm
 does":
 
-* per-seed buffer-add scalars (action_mean/var/clip_frac, q_agg, v_value,
+* per-run buffer-add scalars (action_mean/var/clip_frac, q_agg, v_value,
   q_var) computed from the rollout outputs, buffer.add_batch, SampleLog.add;
-* per-seed episode-return drain (wandb scalar + local CSV mirror that
+* per-run episode-return drain (wandb scalar + local CSV mirror that
   survives wandb rate-limit drops);
 * periodic ``Global_EMAs/*`` flush of η / advantage moments / one-step
   dist-shift estimates;
 * the per-step Q-ensemble variance diagnostic (vmapped+jitted across
-  seeds, lazily compiled on first call).
+  runs, lazily compiled on first call).
 
-The trainer's ``sample()`` collapses to: rollout → ema update → env.step →
+The trainer's ``gather_transitions()`` collapses to: rollout → ema update → env.step →
 ``recorder.record(...)``.
 """
 from pathlib import Path
@@ -30,25 +30,25 @@ from relax.utils.experience import Experience
 
 def _q_ensemble_var_vmap(algorithm, obs_nm: np.ndarray, action_nm: np.ndarray,
                          jit_cache: dict) -> np.ndarray:
-    """Per-seed mean Var(Q_i) across the Q ensemble for [N, M] (obs, action).
+    """Per-run mean Var(Q_i) across the Q ensemble for [num_runs, envs_per_run] (obs, action).
 
-    Returns an ``np.ndarray`` of shape ``[N]``. Vmapped+jitted so a single
-    XLA call replaces the host-side per-seed Python loop. Only valid for
+    Returns an ``np.ndarray`` of shape ``[num_runs]``. Vmapped+jitted so a single
+    XLA call replaces the host-side per-run Python loop. Only valid for
     ensembles of size >= 2 (returns zeros otherwise). The compiled fn is
     cached on the recorder via ``jit_cache``.
     """
-    q_params = algorithm.state.params.q  # tuple of N_q [N_seeds, ...] pytrees
+    q_params = algorithm.state.params.q  # tuple of N_q [N_runs, ...] pytrees
     if len(q_params) < 2:
         return np.zeros((obs_nm.shape[0],), dtype=np.float32)
     if jit_cache.get("fn") is None:
         q_fn = algorithm.model.q
 
-        def _per_seed(q_params_seed, s, a):
-            means = [q_fn(qp, s, a) for qp in q_params_seed]
+        def _per_run(q_params_run, s, a):
+            means = [q_fn(qp, s, a) for qp in q_params_run]
             stacked = jnp.stack(means, axis=0)
             return jnp.mean(jnp.var(stacked, axis=0))
 
-        jit_cache["fn"] = jax.jit(jax.vmap(_per_seed))
+        jit_cache["fn"] = jax.jit(jax.vmap(_per_run))
     return np.asarray(
         jit_cache["fn"](q_params, jnp.asarray(obs_nm), jnp.asarray(action_nm))
     )
@@ -73,7 +73,7 @@ class SampleMetricsRecorder:
         self.env_name = env_name
         self.log_path = log_path
         self.sample_log_interval = sample_log_interval
-        self.N = len(buffers)
+        self.num_runs = len(buffers)
         self._q_var_jit_cache: dict = {}
         self._local_return_path: Path | None = None
 
@@ -105,46 +105,46 @@ class SampleMetricsRecorder:
     ):
         action_np = np.asarray(action_nm)
         action_abs = np.abs(action_np)
-        action_mean = np.mean(action_np, axis=-1)                                    # [N, M]
-        action_var = np.var(action_np, axis=-1)                                      # [N, M]
-        action_clip_frac = np.mean((action_abs > 0.99).astype(np.float32), axis=-1)  # [N, M]
-        q_mean_per_seed = np.mean(q_per_env, axis=1)                                  # [N]
-        v_mean_per_seed = np.mean(v_per_env, axis=1) if v_per_env is not None else None
+        action_mean = np.mean(action_np, axis=-1)                                    # [num_runs, envs_per_run]
+        action_var = np.var(action_np, axis=-1)                                      # [num_runs, envs_per_run]
+        action_clip_frac = np.mean((action_abs > 0.99).astype(np.float32), axis=-1)  # [num_runs, envs_per_run]
+        q_mean_per_run = np.mean(q_per_env, axis=1)                                  # [num_runs]
+        v_mean_per_run = np.mean(v_per_env, axis=1) if v_per_env is not None else None
 
-        q_var_per_seed = None
+        q_var_per_run = None
         if not getattr(self.algorithm, "on_policy_ema", False):
-            q_var_per_seed = _q_ensemble_var_vmap(
+            q_var_per_run = _q_ensemble_var_vmap(
                 self.algorithm, obs_nm, action_np, self._q_var_jit_cache,
             )
 
-        for s in range(self.N):
-            seed_info = {
+        for s in range(self.num_runs):
+            run_info = {
                 "action_mean": action_mean[s],
                 "action_var": action_var[s],
                 "action_clip_frac": action_clip_frac[s],
-                "q_agg": float(q_mean_per_seed[s]),
+                "q_agg": float(q_mean_per_run[s]),
             }
-            if v_mean_per_seed is not None:
-                seed_info["v_value"] = float(v_mean_per_seed[s])
-            if q_var_per_seed is not None:
-                seed_info["q_var"] = float(q_var_per_seed[s])
+            if v_mean_per_run is not None:
+                run_info["v_value"] = float(v_mean_per_run[s])
+            if q_var_per_run is not None:
+                run_info["q_var"] = float(q_var_per_run[s])
             exp_s = Experience.create(
-                obs_nm[s], action_np[s], rew_nm[s], term_nm[s], trunc_nm[s], nxt_nm[s], seed_info,
+                obs_nm[s], action_np[s], rew_nm[s], term_nm[s], trunc_nm[s], nxt_nm[s], run_info,
             )
             self.buffers[s].add_batch(exp_s)
-            self.sample_logs[s].add(rew_nm[s], term_nm[s], trunc_nm[s], seed_info)
+            self.sample_logs[s].add(rew_nm[s], term_nm[s], trunc_nm[s], run_info)
 
-        # Drain pending episode returns to wandb (per seed) and mirror to a
+        # Drain pending episode returns to wandb (per run) and mirror to a
         # local CSV so the return curve survives wandb rate-limit drops.
         ep_key = f"episode_return/{self.env_name}"
         with open(self._local_return_path, "a", buffering=1) as f_local:
-            for s in range(self.N):
+            for s in range(self.num_runs):
                 for env_step, ret in self.sample_logs[s].take_pending_episode_returns():
-                    self.logger.add_scalar_per_seed(s, ep_key, ret, step=env_step)
+                    self.logger.add_scalar_per_run(s, ep_key, ret, step=env_step)
                     f_local.write(f"{s},{int(env_step)},{float(ret)}\n")
 
         # Periodic sample-interval flush.
-        # All seeds advance sample_step by M in lockstep; check seed 0.
+        # All runs advance sample_step by envs_per_run in lockstep; check run 0.
         if self.sample_log_interval.check(self.sample_logs[0].sample_step):
             self.flush_periodic()
 
@@ -154,8 +154,8 @@ class SampleMetricsRecorder:
     def flush_periodic(self):
         alg = self.algorithm
         state = alg.state
-        log = self.logger.add_scalar_per_seed
-        for s in range(self.N):
+        log = self.logger.add_scalar_per_run
+        for s in range(self.num_runs):
             sstep = int(self.sample_logs[s].sample_step)
             self.sample_logs[s].log_accumulator(
                 lambda k, v, _step, _s=s, _sstep=sstep: log(_s, k, v, step=_sstep)
