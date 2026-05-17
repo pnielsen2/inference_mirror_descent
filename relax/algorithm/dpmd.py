@@ -133,10 +133,7 @@ class DPMD:
             policy_opt_state = state.opt_state.policy
             step = state.step
             num_q = len(q_params)
-            # 8 fixed + num_q trailing slots; only 0, 3, 4 are consumed below.
-            # The other slots are reserved to preserve PRNG layout against legacy paths.
-            (next_eval_key, _, _, diffusion_time_key, diffusion_noise_key,
-             _, _, _, *_) = jax.random.split(key, 8 + num_q)
+            next_eval_key, diffusion_time_key, diffusion_noise_key = jax.random.split(key, 3)
 
             reward *= state.hp.reward_scale
 

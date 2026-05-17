@@ -61,11 +61,7 @@ def build_mala_sampler(
 
         action_shape = (*obs.shape[:-1], model.act_dim)
 
-        # 3-way split kept verbatim to preserve PRNG layout from a deleted
-        # multi-particle / particle-select sampling path; the two unused
-        # keys must continue to be split off here for byte-exact PRNG match.
-        key_sample, _key_select, _noise_key = jax.random.split(key, 3)
-        key_x, loop_key = jax.random.split(key_sample)
+        key_x, loop_key = jax.random.split(key, 2)
         schedule = model.schedule
         x_recon_clip_radius = model.x_recon_clip_radius
         reduce_over_batch = jnp.sum if batch_independent_guidance else jnp.mean
@@ -88,27 +84,11 @@ def build_mala_sampler(
             return energy_multiplier * E
 
         def energy_total(t, x):
-            # NOTE: keep the ``lax.cond(tfg_eta_current > 0.0, ...)`` wrapper
-            # for the same XLA-fusion / bit-exactness reason as
-            # ``compute_guidance_gradient``
-            # above. Both branches are mathematically equivalent when
-            # ``tfg_eta_current > 0`` (the only regime exercised today), but
-            # collapsing the cond perturbs floating-point reduction order in
-            # the surrounding fused region.
-            def with_q(x_in):
-                E_mod = energy_model(t, x_in)
-                # Use raw (unscaled) noise pred for Tweedie reconstruction;
-                # energy_model already applies energy_multiplier.
-                noise_pred = model.policy(policy_params, obs, x_in, t)
-                x0_hat = reconstruct_x0_from_noise(x_in, t, noise_pred)
-                clip_frac = jnp.mean((jnp.abs(x0_hat) > x0_hat_clip_radius).astype(jnp.float32))
-                q_agg = q_aggregated_at_clipped_x0_hat(x0_hat)
-                return E_mod - tfg_eta_current * q_agg, clip_frac
-
-            def only_model(x_in):
-                return energy_model(t, x_in), jnp.float32(0.0)
-
-            return jax.lax.cond(tfg_eta_current > 0.0, with_q, only_model, x)
+            E_mod = energy_model(t, x)
+            noise_pred = model.policy(policy_params, obs, x, t)
+            x0_hat = reconstruct_x0_from_noise(x, t, noise_pred)
+            clip_frac = jnp.mean((jnp.abs(x0_hat) > x0_hat_clip_radius).astype(jnp.float32))
+            return E_mod - tfg_eta_current * q_aggregated_at_clipped_x0_hat(x0_hat), clip_frac
 
         # ---- Q-guidance gradient (drives predictor step) ------------
         def scaled_policy_noise(t_idx, x_in):
@@ -131,48 +111,28 @@ def build_mala_sampler(
             return guidance_multiplier * reduce_over_batch(q)
 
         def compute_guidance_gradient(x_in, t_idx):
-            # NOTE: keep the ``lax.cond(tfg_eta_current > 0.0, ...)`` wrapper.
-            # When ``tfg_eta_current == 0`` the unguided branch is a constant
-            # zero, but with ``tfg_eta_current > 0`` (the case for all current
-            # KL-budget / eta-sweep runs) the cond is still load-bearing for
-            # bit-exactness: removing it lets XLA fuse ``jax.grad(guidance_value_from_x)``
-            # the surrounding fused region differently, which flips the last
-            # ULPs of MALA-energy reductions and breaks the bit-exact baseline.
-            def guided(_):
-                return jax.grad(lambda xx: guidance_value_from_x(xx, t_idx))(x_in)
-
-            def unguided(_):
-                return jnp.zeros_like(x_in)
-
-            return jax.lax.cond(tfg_eta_current > 0.0, guided, unguided, operand=None)
+            return jax.grad(lambda xx: guidance_value_from_x(xx, t_idx))(x_in)
 
         # ---- DDIM predictor step (guided or unguided, chosen at build time) ----
-        # The PRNG split is retained -- and the resulting ``_z_key``
-        # intentionally unused -- to keep ``k_out`` bit-identical with
-        # the legacy stochastic DDPM predictor path.
         if mala_guided_predictor:
-            def ddim_step(t_idx, x_in, k_in):
-                noise_pred_scaled = scaled_policy_noise(t_idx, x_in)  # base score; guidance below is NOT scaled.
-                k_out, _z_key = jax.random.split(k_in)
+            def ddim_step(t_idx, x_in):
+                noise_pred_scaled = scaled_policy_noise(t_idx, x_in)
                 grad_q = compute_guidance_gradient(x_in, t_idx)
                 sigma_t = schedule.sqrt_one_minus_alphas_cumprod[t_idx]
                 eps_pred = noise_pred_scaled - tfg_eta_current * sigma_t * grad_q
                 x0_hat = jnp.clip(reconstruct_x0_from_noise(x_in, t_idx, eps_pred),
                                    -x_recon_clip_radius, x_recon_clip_radius)
-                model_mean = x0_hat * schedule.posterior_mean_coef1[t_idx] + x_in * schedule.posterior_mean_coef2[t_idx]
-                return model_mean, k_out
+                return x0_hat * schedule.posterior_mean_coef1[t_idx] + x_in * schedule.posterior_mean_coef2[t_idx]
         else:
-            def ddim_step(t_idx, x_in, k_in):
+            def ddim_step(t_idx, x_in):
                 noise_pred_scaled = scaled_policy_noise(t_idx, x_in)
-                k_out, _z_key = jax.random.split(k_in)
                 x0_hat = jnp.clip(reconstruct_x0_from_noise(x_in, t_idx, noise_pred_scaled),
                                    -x_recon_clip_radius, x_recon_clip_radius)
-                model_mean = x0_hat * schedule.posterior_mean_coef1[t_idx] + x_in * schedule.posterior_mean_coef2[t_idx]
-                return model_mean, k_out
+                return x0_hat * schedule.posterior_mean_coef1[t_idx] + x_in * schedule.posterior_mean_coef2[t_idx]
 
         if mala_no_predictor:
-            def denoising_step(t_idx, x_curr, k):
-                return x_curr, k
+            def denoising_step(t_idx, x_curr):
+                return x_curr
         else:
             denoising_step = ddim_step
 
@@ -250,7 +210,7 @@ def build_mala_sampler(
             mala_corrected_x_t, rng, log_eta_scales, acc_sum, clip_sum = run_mala_chain_at_level(
                 t_idx, x_t, rng, log_eta_scales,
             )
-            x_t_minus_1, rng = denoising_step(t_idx, mala_corrected_x_t, rng)
+            x_t_minus_1 = denoising_step(t_idx, mala_corrected_x_t)
 
             # ---- per-level diagnostics ----
             mala_steps_f = jnp.float32(model.mala_steps)

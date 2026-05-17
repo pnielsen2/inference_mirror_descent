@@ -45,10 +45,7 @@ def update_state_kl_only(state, q_per_env: np.ndarray, v_per_env: np.ndarray) ->
     new_m2 = (1 - tau_v) * cur_m2 + tau_v * m2_batch
 
     kl_budget = _broadcast_state_scalar(state.hp.kl_budget_val, N)
-    m2_safe = np.maximum(new_m2, 1e-8)
-    sqrt_v = np.sqrt(m2_safe)
-    eta_kl_raw = np.sqrt(2.0 * kl_budget / m2_safe)
-    new_eta = eta_kl_raw * sqrt_v
+    new_eta = np.sqrt(2.0 * kl_budget)
 
     new_state = state._replace(
         advantage_second_moment_ema=jnp.asarray(new_m2.astype(np.float32)),
@@ -102,12 +99,9 @@ def update_state_one_step(state, q_per_env: np.ndarray, v_per_env: np.ndarray,
 
     # η = min(η_KL, η*); η* is +inf when shape is non-negative.
     kl_budget = _broadcast_state_scalar(state.hp.kl_budget_val, N)
-    m2_safe = np.maximum(new_m2, 1e-8)
-    sqrt_v = np.sqrt(m2_safe)
-    eta_kl_raw = np.sqrt(2.0 * kl_budget / m2_safe)
-    eta_star_raw = np.where(new_shape < -1e-8, -1.0 / (sqrt_v * new_shape), np.inf)
-    eta_raw = np.minimum(eta_star_raw, eta_kl_raw)
-    new_eta = eta_raw * sqrt_v
+    eta_kl = np.sqrt(2.0 * kl_budget)
+    eta_star = np.where(new_shape < -1e-8, -1.0 / new_shape, np.inf)
+    new_eta = np.minimum(eta_star, eta_kl)
 
     new_state = state._replace(
         advantage_second_moment_ema=jnp.asarray(new_m2.astype(np.float32)),
