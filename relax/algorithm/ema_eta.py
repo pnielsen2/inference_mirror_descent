@@ -46,7 +46,7 @@ def update_state_one_step(state, q_per_env: np.ndarray, v_per_env: np.ndarray,
     m2_hat = np.mean(adv_per_env ** 2, axis=1)
     m3_hat = np.mean(adv_per_env ** 3, axis=1)
 
-    new_m2_ema = _ema(state.advantage_second_moment_ema, m2_hat, state.hp.adv_ema_tau)
+    # s_hat construction
     # One-step covariance estimator ĉ = mean((A')²·A); only valid for
     # non-terminal transitions (A' from next step, A from current step).
     # On step 1, prev_valid is all-False so cont_count=0 everywhere and
@@ -56,15 +56,19 @@ def update_state_one_step(state, q_per_env: np.ndarray, v_per_env: np.ndarray,
     c_hat = np.sum(prev_valid * (adv_per_env ** 2) * prev_adv_per_env, axis=1) / np.maximum(cont_count, 1)
     s_hat = (2.0 * state.hp.gamma * c_hat + m3_hat) / np.maximum(m2_hat, 1e-8) ** 1.5
 
-    new_c_ema     = np.where(any_continued, _ema(state.dist_shift_covariance_ema, c_hat,  state.hp.adv_ema_tau), state.dist_shift_covariance_ema)
+    # EMA updates
+    new_m2_ema = _ema(state.advantage_second_moment_ema, m2_hat, state.hp.adv_ema_tau)
     new_shape_ema = np.where(any_continued, _ema(state.dist_shift_shape_ema, s_hat, state.hp.shape_ema_tau), state.dist_shift_shape_ema)
 
-    # η = min(η_KL, η*);  η* = -1/(sqrt(M)·s),  +∞ when s ≥ 0.
+    # new_eta calculation: η = min(η_KL, η*);  η* = -1/(sqrt(M)·s),  +∞ when s ≥ 0.
     sqrt_m2  = np.sqrt(np.maximum(new_m2_ema, 1e-6))
     eta_kl   = np.sqrt(2.0 * state.hp.kl_budget_val) / sqrt_m2
     eta_star = np.where(new_shape_ema < -1e-8, -1.0 / (sqrt_m2 * new_shape_ema), np.inf)
     new_eta  = np.minimum(eta_star, eta_kl)
+
+    # EMA updates for logging
     new_m3_ema = _ema(state.advantage_third_moment_ema, m3_hat, state.hp.adv_ema_tau)
+    new_c_ema     = np.where(any_continued, _ema(state.dist_shift_covariance_ema, c_hat,  state.hp.adv_ema_tau), state.dist_shift_covariance_ema)
     return state._replace(
         advantage_second_moment_ema=new_m2_ema,
         dist_shift_shape_ema       =new_shape_ema,

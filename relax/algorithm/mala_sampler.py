@@ -54,7 +54,6 @@ def build_mala_sampler(
         log_eta_scales_in = state.log_eta_scales
         tfg_eta_current = state.tfg_eta
         value_params = state.value_params
-        adv_second_moment_ema = state.advantage_second_moment_ema
         x0_hat_clip_radius = state.hp.x0_hat_clip_radius
         mala_adapt_rate = state.hp.mala_adapt_rate
         guidance_multiplier = state.hp.guidance_mult
@@ -83,22 +82,15 @@ def build_mala_sampler(
             # Scale base energy by energy_multiplier (tempers the base distribution)
             return energy_multiplier * E
 
-        # FIXME: tfg_eta_current = η = sqrt(2δ/M) (the paper's η).  energy_total
-        # should simply use η·Q(x0_hat) as the guidance energy — Q vs A = Q-V makes
-        # no difference because V(s) is state-only and cancels in the MALA
-        # acceptance ratio.  The only issue is the η *scale*: energy_total was
-        # historically calibrated with sqrt(2δ) (before M was folded into tfg_eta),
-        # so switching to sqrt(2δ/M) changes MALA acceptance probabilities and
-        # requires re-validation before committing.  For now, multiply back by
-        # sqrt(M) to keep the pre-refactor scale and stay algebraically equivalent.
-        tfg_eta_energy = tfg_eta_current * jnp.sqrt(jnp.maximum(adv_second_moment_ema, jnp.float32(1e-6)))
-
+        # tfg_eta_current = η = sqrt(2δ/M) (the paper's η, eq. 2).
+        # Q vs A = Q-V makes no difference: V(s) is state-only and cancels
+        # in the MALA acceptance ratio.
         def energy_total(t, x):
             E_mod = energy_model(t, x)
             noise_pred = model.policy(policy_params, obs, x, t)
             x0_hat = reconstruct_x0_from_noise(x, t, noise_pred)
             clip_frac = jnp.mean((jnp.abs(x0_hat) > x0_hat_clip_radius).astype(jnp.float32))
-            return E_mod - tfg_eta_energy * q_aggregated_at_clipped_x0_hat(x0_hat), clip_frac
+            return E_mod - tfg_eta_current * q_aggregated_at_clipped_x0_hat(x0_hat), clip_frac
 
         # ---- Q-guidance gradient (drives predictor step) ------------
         def scaled_policy_noise(t_idx, x_in):
