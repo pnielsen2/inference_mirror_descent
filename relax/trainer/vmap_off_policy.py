@@ -161,8 +161,9 @@ class VmapOffPolicyTrainer:
         )
 
         # Per-run host-side buffers for dist-shift covariance (shape [num_runs, envs_per_run]).
-        self._prev_adv_per_env: Optional[np.ndarray] = None
-        self._prev_valid: Optional[np.ndarray] = None
+        # All-False / zero on step 1 → valid_count=0 → c_batch_valid=False → EMA unchanged.
+        self._prev_adv_per_env = np.zeros((self.num_runs, self.envs_per_run), dtype=np.float32)
+        self._prev_valid       = np.zeros((self.num_runs, self.envs_per_run), dtype=bool)
 
         # Pick the on-policy EMA update path once at construction time. Off
         # by default; the rollout block in sample() invokes this only when
