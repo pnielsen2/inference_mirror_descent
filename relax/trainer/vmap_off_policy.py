@@ -202,12 +202,12 @@ class VmapOffPolicyTrainer:
             # Reshape [num_runs*envs_per_run, ...] -> [num_runs, envs_per_run, ...]. The trailing -1 is the feature
             # dim: obs_dim for obs/next_obs, act_dim for action; reward/term/
             # trunc are scalar-per-env, so no feature dim.
-            obs_nm = np.asarray(train_obs_flat).reshape(self.num_runs, self.envs_per_run, -1)
-            action_nm = np.asarray(action).reshape(self.num_runs, self.envs_per_run, -1)
-            nxt_nm = np.asarray(next_obs_flat).reshape(self.num_runs, self.envs_per_run, -1)
-            rew_nm = np.asarray(reward_flat).reshape(self.num_runs, self.envs_per_run)
-            terminated_nm = np.asarray(terminated_flat).reshape(self.num_runs, self.envs_per_run)
-            truncated_nm = np.asarray(truncated_flat).reshape(self.num_runs, self.envs_per_run)
+            obs_nm        = train_obs_flat.reshape(self.num_runs, self.envs_per_run, -1)
+            action_nm     = action.reshape(self.num_runs, self.envs_per_run, -1)
+            nxt_nm        = next_obs_flat.reshape(self.num_runs, self.envs_per_run, -1)
+            rew_nm        = reward_flat.reshape(self.num_runs, self.envs_per_run)
+            terminated_nm = terminated_flat.reshape(self.num_runs, self.envs_per_run)
+            truncated_nm  = truncated_flat.reshape(self.num_runs, self.envs_per_run)
 
             for s in range(self.num_runs):
                 exp_s = Experience.create(
@@ -226,7 +226,7 @@ class VmapOffPolicyTrainer:
     # ------------------------------------------------------------------
     def gather_transitions(self, keys: jax.Array, obs_flat: np.ndarray) -> np.ndarray:
         # obs_flat: [num_runs*envs_per_run, obs_dim] (from prior env.step)
-        obs_nm = np.asarray(obs_flat).reshape(self.num_runs, self.envs_per_run, -1)
+        obs_nm = obs_flat.reshape(self.num_runs, self.envs_per_run, -1)
 
         # Vmapped policy rollout. Returns (action [num_runs,envs_per_run,A], q [num_runs,envs_per_run], v [num_runs,envs_per_run] or None).
         action_nm, q_per_env, v_per_env = self.algorithm.get_action_vmap(keys, obs_nm)
@@ -243,10 +243,10 @@ class VmapOffPolicyTrainer:
         next_obs_flat, reward_flat, term_flat, trunc_flat, info = self.env.step(action_flat)
 
         # Reshape all outputs back to [num_runs, envs_per_run, ...].
-        nxt_nm = np.asarray(next_obs_flat).reshape(self.num_runs, self.envs_per_run, -1)
-        rew_nm = np.asarray(reward_flat).reshape(self.num_runs, self.envs_per_run)
-        term_nm = np.asarray(term_flat).reshape(self.num_runs, self.envs_per_run)
-        trunc_nm = np.asarray(trunc_flat).reshape(self.num_runs, self.envs_per_run)
+        nxt_nm   = next_obs_flat.reshape(self.num_runs, self.envs_per_run, -1)
+        rew_nm   = reward_flat.reshape(self.num_runs, self.envs_per_run)
+        term_nm  = term_flat.reshape(self.num_runs, self.envs_per_run)
+        trunc_nm = trunc_flat.reshape(self.num_runs, self.envs_per_run)
 
         # Roll one-step covariance buffer using this-step done mask.
         if bool(getattr(self.algorithm, "one_step_dist_shift_eta", False)) and adv_per_env_now is not None:
