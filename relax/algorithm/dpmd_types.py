@@ -100,7 +100,7 @@ class DPMDConfig:
     lr_q: float = 1e-4
     delay_update: int = 2
     reward_scale: float = 0.2
-    q_critic_agg: str = "min"
+    q_agg_sample: str = "min"
     tfg_eta: float = 0.0
     x0_hat_clip_radius: float = 1.0
     mala_adapt_rate: float = 0.05
@@ -133,7 +133,7 @@ class DPMDConfig:
             lr_q=float(lr_q),
             delay_update=args.delay_update,
             reward_scale=args.reward_scale,
-            q_critic_agg=args.q_critic_agg,
+            q_agg_sample=args.q_agg_sample,
             tfg_eta=args.tfg_eta,
             x0_hat_clip_radius=args.x0_hat_clip_radius,
             mala_adapt_rate=args.mala_adapt_rate,

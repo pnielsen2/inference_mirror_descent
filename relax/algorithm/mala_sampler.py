@@ -35,9 +35,9 @@ def build_mala_sampler(
     """Return ``stateless_get_action_mala_full(key, state, obs, aggregate_q_fn)``.
 
     The returned closure is jit-able and vmap-able. ``aggregate_q_fn`` is
-    supplied per-call (the TD-update path passes ``min``-aggregation; the
-    rollout path passes ``--q_critic_agg``-aggregation), letting the same
-    sampler serve both call sites.
+    supplied per-call; both the rollout path and the TD next-action sampling
+    path pass ``--q_agg_sample``-aggregation, letting the same sampler serve
+    both call sites.
     """
     def stateless_get_action_mala_full(
         key: jax.Array,

@@ -53,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reward_scale", type=float, default=0.2, help="Scale factor applied to rewards before Q/value learning. Default 0.2 matches original DPMD. Set to 1.0 for clarity when using inference-time guidance (adjust tfg_eta accordingly).")
 
     # ----- Q learning -------------------------------------------------------
-    parser.add_argument("--q_critic_agg", type=str, default="min", choices=["min", "mean"], help="Aggregation for the Q signal used in tilting and reweighting. The TD-bootstrap path is hardcoded to 'min' (clipped double-Q).")
+    parser.add_argument("--q_agg_sample", type=str, default="min", choices=["min", "mean"], help="Aggregation for Q used in sampling, both for rollout and for the TD next-action sample. The TD-backup target itself is hardcoded to 'min' (clipped double-Q).")
     parser.add_argument("--q_td_huber_width", type=float, default=float("inf"), help="Huber width (delta) for critic TD error in DPMD. Default inf recovers the current MSE TD loss. Effective width is scaled by reward_scale internally.")
 
     # ----- guidance + KL budget --------------------------------------------

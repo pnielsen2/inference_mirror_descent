@@ -84,11 +84,10 @@ class DPMD:
             mala_guided_predictor=self.cfg.mala_guided_predictor,
             mala_no_predictor=self.cfg.mala_no_predictor,
         )
-        # Build the training-step closure; body is _stateless_update below.
-        agg_min = lambda qm: _aggregate_q(qm, "min")
-        updater = self._stateless_update(sampler, agg_min)
-        # Rollout sampler: bind the configured --q_critic_agg aggregation.
-        agg_critic = lambda qm: _aggregate_q(qm, self.cfg.q_critic_agg)
+        # Both sampling paths (rollout + TD next-action) use --q_agg_sample aggregation.
+        # The TD-backup target itself remains hardcoded to 'min' (clipped double-Q).
+        agg_critic = lambda qm: _aggregate_q(qm, self.cfg.q_agg_sample)
+        updater = self._stateless_update(sampler, agg_critic)
         stateless_get_action = lambda key, state, obs: sampler(key, state, obs, agg_critic)
         self._jit_vmap_update = jax.jit(jax.vmap(updater))
         self._jit_vmap_get_action = jax.jit(jax.vmap(stateless_get_action))
@@ -114,12 +113,14 @@ class DPMD:
         per_elem_loss = jnp.where(use_huber_loss, huber_per_elem, td_err * td_err)
         return jnp.mean(per_elem_loss)
 
-    def _stateless_update(self, sampler, agg_min):
+    def _stateless_update(self, sampler, agg_sample_fn):
         """Return the ``stateless_update(key, state, data)`` closure.
 
-        Captures ``sampler`` (MALA sampler) and ``agg_min`` (min Q aggregation
-        for TD bootstrap). Called once from ``__init__``; the result is wrapped
-        with ``jax.jit(jax.vmap(...))`` and stored as ``_jit_vmap_update``.
+        Captures ``sampler`` (MALA sampler) and ``agg_sample_fn`` (Q aggregation
+        used when sampling the TD next-action; distinct from the backup target
+        which is hardcoded to 'min'). Called once from ``__init__``; the result
+        is wrapped with ``jax.jit(jax.vmap(...))`` and stored as
+        ``_jit_vmap_update``.
         """
         def stateless_update(
             key: jax.Array, state: Diffv2TrainState, data: Experience
@@ -137,7 +138,7 @@ class DPMD:
             reward *= state.hp.reward_scale
 
             # Sample a single tilted next-action
-            mala_result = sampler(next_eval_key, state, next_obs, agg_min)
+            mala_result = sampler(next_eval_key, state, next_obs, agg_sample_fn)
             tilted_action = mala_result.action
 
             # Clipped double Q-learning: all Qs bootstrap from min_i(target_Q_i).
@@ -262,7 +263,7 @@ class DPMD:
         if self.value_head is None or state.value_params is None:
             return state.value_params, state.opt_state.value, jnp.float32(0.0)
 
-        q_for_v = _aggregate_q(per_q_target_values, self.cfg.q_critic_agg)
+        q_for_v = _aggregate_q(per_q_target_values, self.cfg.q_agg_sample)
         return self.value_head.update_step(state, q_for_v, next_obs, state.hp.lr_q, self.optim)
 
     def get_action_vmap(self, key: jax.Array, obs: np.ndarray):
@@ -386,7 +387,7 @@ def _aggregate_q(q_means, mode: str):
 
     mode='min':  pairwise jnp.minimum reduction across the list (used for the
                  TD-bootstrap target — clipped double-Q).
-    mode='mean': sum(q_means) * (1/N) (selectable via ``--q_critic_agg`` for
+    mode='mean': sum(q_means) * (1/N) (selectable via ``--q_agg_sample`` for
                  the rollout / guidance path).
 
     Reduction order matches the legacy in-line implementations exactly so
