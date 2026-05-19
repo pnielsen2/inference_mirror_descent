@@ -32,7 +32,7 @@ class Experience(NamedTuple):
     def create_example(obs_dim: int, action_dim: int, batch_size: Optional[int] = None, include_next_action: bool = False):
         leading_dims = (batch_size,) if batch_size is not None else ()
         # Always include next_action in the example (for consistent buffer structure)
-        # The field will only be populated when track_next_action is enabled
+        # next_action is always allocated for buffer shape consistency but only populated by algorithms that use SARSA-style TD (unused)
         return Experience(
             obs=np.zeros((*leading_dims, obs_dim), dtype=np.float32),
             action=np.zeros((*leading_dims, action_dim), dtype=np.float32),

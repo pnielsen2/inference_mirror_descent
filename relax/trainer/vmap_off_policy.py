@@ -169,9 +169,9 @@ class VmapOffPolicyTrainer:
         # by default; the rollout block in sample() invokes this only when
         # the algorithm advertises on_policy_ema=True (i.e. --kl_budget set).
         if bool(getattr(self.algorithm, "one_step_dist_shift_eta", False)):
-            self._on_policy_ema_update = self._ema_update_one_step
+            self._update_eta = self._ema_update_one_step
         else:
-            self._on_policy_ema_update = self._ema_update_kl_only
+            self._update_eta = self._ema_update_kl_only
 
     # ------------------------------------------------------------------
     # Setup
@@ -192,7 +192,7 @@ class VmapOffPolicyTrainer:
     # Warmup (random actions)
     # ------------------------------------------------------------------
     def warmup(self):
-        train_obs_flat, _ = self.env.reset()
+        train_obs_flat = self.env.get_current_obs()
         # obs_flat: [num_runs*envs_per_run, obs_dim].
         # Each buffer fills to start_step transitions independently.
         # Since we step all num_runs*envs_per_run envs in sync, per-buffer per-step add is envs_per_run.
@@ -216,10 +216,7 @@ class VmapOffPolicyTrainer:
                 )
                 self.buffers[s].add_batch(exp_s)
 
-            if np.any(terminated_flat) or np.any(truncated_flat):
-                train_obs_flat, _ = self.env.reset()
-            else:
-                train_obs_flat = next_obs_flat
+            train_obs_flat = self.env.get_current_obs()
         return train_obs_flat
 
     # ------------------------------------------------------------------
@@ -232,13 +229,6 @@ class VmapOffPolicyTrainer:
         # Vmapped policy rollout. Returns (action [num_runs,envs_per_run,A], q [num_runs,envs_per_run], v [num_runs,envs_per_run] or None).
         action_nm, q_per_env, v_per_env = self.algorithm.get_action_vmap(keys, obs_nm)
 
-        # Host-side run-axis-vectorized EMA + eta update.
-        # NOTE: _prev_* roll-forward happens AFTER env.step (below) so we know
-        # which envs terminated/truncated this step.
-        adv_per_env_now = None
-        if getattr(self.algorithm, "on_policy_ema", False) and v_per_env is not None:
-            adv_per_env_now = self._on_policy_ema_update(q_per_env, v_per_env)
-
         # Env step (flatten for Option B).
         action_flat = action_nm.reshape(self.num_runs * self.envs_per_run, -1)
         next_obs_flat, reward_flat, term_flat, trunc_flat, info = self.env.step(action_flat)
@@ -249,11 +239,14 @@ class VmapOffPolicyTrainer:
         term_nm  = term_flat.reshape(self.num_runs, self.envs_per_run)
         trunc_nm = trunc_flat.reshape(self.num_runs, self.envs_per_run)
 
-        # Roll one-step covariance buffer using this-step done mask.
-        if bool(getattr(self.algorithm, "one_step_dist_shift_eta", False)) and adv_per_env_now is not None:
-            done_nm = term_nm | trunc_nm
-            self._prev_adv_per_env = adv_per_env_now.copy()
-            self._prev_valid = ~done_nm
+        # Update η + moment EMAs in algorithm.state.
+        # When using one-step dist-shift, also save raw A = Q-V and the done mask
+        # for the next step's cross-step covariance estimator ĉ = mean((A')²·A).
+        if getattr(self.algorithm, "on_policy_ema", False) and v_per_env is not None:
+            self._update_eta(q_per_env, v_per_env)
+            if bool(getattr(self.algorithm, "one_step_dist_shift_eta", False)):
+                self._prev_adv_per_env = (q_per_env - v_per_env).copy()
+                self._prev_valid = ~(term_nm | trunc_nm)
 
         self.recorder.record(
             obs_nm=obs_nm, action_nm=action_nm,
@@ -261,10 +254,7 @@ class VmapOffPolicyTrainer:
             rew_nm=rew_nm, term_nm=term_nm, trunc_nm=trunc_nm, nxt_nm=nxt_nm,
         )
 
-        if np.any(term_flat) or np.any(trunc_flat):
-            obs_flat, _ = self.env.reset()
-        else:
-            obs_flat = next_obs_flat
+        obs_flat = self.env.get_current_obs()
 
         return obs_flat
 

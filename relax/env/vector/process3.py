@@ -107,6 +107,9 @@ class ProcessVectorEnv(VectorEnv):
         assert seed is None and options is None
         return self.obs.copy(), {}
 
+    def get_current_obs(self) -> np.ndarray:
+        return self.obs.copy()
+
     def step(self, action: np.ndarray):
         self.action[:] = action
         self._notify(0b01)

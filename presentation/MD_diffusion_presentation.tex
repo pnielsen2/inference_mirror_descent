@@ -84,28 +84,25 @@
 % ═══════════════════════════════════════════════════════════════════════════════
 \section{Algorithm}
 
-\begin{frame}{Algorithm: MD Diffusion Policy with Adaptive $\eta$}
+\begin{frame}{Algorithm: MD Diffusion Policy}
 \begin{fitcenter}
 \begin{algorithmic}[1]
-\REQUIRE Policy $\pi_\theta$ (diffusion), critics $Q_{\phi_k}$, value $V_\psi$, replay buffer $\mathcal{D}$
-\REQUIRE KL budget $\delta$, discount $\gamma$, target update rate $\tau_Q$
-\STATE Initialize \textsc{AdaptiveEta} state (EMAs $v, s$; budget $\delta$; rates $\tau$); \; $\eta \leftarrow \sqrt{2\delta}$
+\REQUIRE Policy $\pi_\theta$ (diffusion), critics $Q_{\phi_k}$, replay buffer $\mathcal{D}$
+\REQUIRE Guidance $\eta$, discount $\gamma$, target update rate $\tau_Q$
 \STATE Initialize target network parameters: $\bar{\phi}_k \leftarrow \phi_k$
 \FOR{each environment step}
-  \STATE \textcolor{gray}{\textit{// Sample action and adapt step size (on-policy)}}
-  \STATE $a \leftarrow \textsc{SampleFromTiltedPolicy}(s,\, \pi_\theta,\, (Q_{\phi_1}, Q_{\phi_2}),\, \eta)$ \COMMENT{Algorithm 2}
-  \STATE $\eta \leftarrow \textsc{AdaptiveEta}.\textsc{Update}\!\big(\{Q_{\phi_k}(s,a)\}_k, V_\psi(s)\big)$ \COMMENT{Algorithm 3}
+  \STATE \textcolor{gray}{\textit{// Sample action}}
+  \STATE $a \leftarrow \textsc{SampleFromTiltedPolicy}(s,\, \pi_\theta,\, \tfrac{1}{2}(Q_{\phi_1}{+}Q_{\phi_2}),\, \eta)$ \COMMENT{Alg.~2; mean Q for env}
   \STATE \textcolor{gray}{\textit{// Collect experience}}
   \STATE Execute $a$; observe reward $r$, next state $s'$, termination flag $d$
   \STATE $\mathcal{D} \leftarrow \mathcal{D} \cup \{(s, a, r, s', d)\}$
   \STATE \textcolor{gray}{\textit{// Critic update}}
   \STATE Sample minibatch $\{(s_j, a_j, r_j, s'_j, d_j)\}_{j=1}^B \sim \mathcal{D}$
-  \STATE $a'_j \leftarrow \textsc{SampleFromTiltedPolicy}(s'_j,\, \pi_\theta,\, (Q_{\phi_1}, Q_{\phi_2}),\, \eta)$
+  \STATE $a'_j \leftarrow \textsc{SampleFromTiltedPolicy}(s'_j,\, \pi_\theta,\, \min(Q_{\phi_1},Q_{\phi_2}),\, \eta)$ \COMMENT{min Q for TD}
   \STATE $y_j \leftarrow r_j + \gamma\,(1{-}d_j)\,\min_k(Q_{\bar{\phi}_k}(s'_j, a'_j))$
   \STATE Update each $Q_{\phi_k}$ by minimizing $\frac{1}{B}\sum_j \textsc{Huber}_{30}(Q_{\phi_k}(s_j, a_j) - y_j)$
   \STATE $\bar{\phi}_k \leftarrow \tau_Q\,\phi_k + (1{-}\tau_Q)\,\bar{\phi}_k$ for $k{=}1,2$ \COMMENT{Polyak averaging}
-  \STATE \textcolor{gray}{\textit{// Value and policy update}}
-  \STATE Update $V_\psi$ by minimizing $\frac{1}{B}\sum_j (V_\psi(s'_j) - \min(Q_{\phi_1}(s'_j, a'_j),\, Q_{\phi_2}(s'_j, a'_j)))^2$
+  \STATE \textcolor{gray}{\textit{// Policy update}}
   \STATE Fit $\pi_\theta(s'_j)$ to $a'_j$ by minimizing diffusion loss
 \ENDFOR
 \end{algorithmic}
@@ -116,110 +113,45 @@
 \begin{frame}{Algorithm 2: \textsc{SampleFromTiltedPolicy} (MALA $+$ DDIM)}
 \begin{fitcenter}
 \begin{algorithmic}[1]
-\REQUIRE State $s$, energy-param.\ policy $E_\theta$, critics $Q_{\phi_1},Q_{\phi_2}$
-\REQUIRE Guidance $\eta$, log step-sizes $\{\ell_t\}$, schedule $\{\beta_t,\sigma_t\}$, clip $r$
-\STATE $\epsilon_\theta(x,t;s) \coloneqq \nabla_x E_\theta(x,t;s)$ \COMMENT{score fn via autodiff}
-\STATE $\mathrm{AggQ}(a) \leftarrow \tfrac{1}{2}(Q_{\phi_1}(s,a)+Q_{\phi_2}(s,a))$
-\STATE $\lambda_t \leftarrow \eta$ for all $t$; \; sample $x_{T-1}\sim\mathcal{N}(0,I)$
+\REQUIRE State $s$, energy policy $E_\theta$, aggregated critic $\bar Q(s,a)$, guidance $\eta$
+\REQUIRE Log step-sizes $\{\ell_t\}$, schedule $\{\bar\alpha_t,\alpha_t,\beta_t\}$, clips $r$ (Q-eval), $r_0$ (recon), adapt rate $\rho$
+\STATE $\hat\epsilon_\theta(x,t)\coloneqq\nabla_x E_\theta(s,x,t)$;\quad $\sigma_t\coloneqq\sqrt{1{-}\bar\alpha_t}$;\quad $\hat x_0(x,t)\coloneqq(x-\sigma_t\hat\epsilon_\theta(x,t))/\sqrt{\bar\alpha_t}$ \COMMENT{Tweedie}
+\STATE $U_t(x)\coloneqq E_\theta(s,x,t)-\eta\cdot\bar Q(s,\,\mathrm{clip}(\hat x_0(x,t),{-}r,r))$ \COMMENT{tilted energy}
+\STATE Sample $x_T\sim\mathcal{N}(0,I)$
 \FOR{$t=T{-}1,\dots,0$}
   \FOR{$m=1,\dots,M$}
-    \STATE \textcolor{gray}{\textit{// MALA correction ($M{=}2$ steps per noise level)}}
-    \STATE $\hat x_0 \leftarrow \mathrm{clip}(\textsc{Denoise}(x_t,t),-r,r)$
-    \STATE $U_t \leftarrow E_\theta(x_t,t;s) - \lambda_t\mathrm{AggQ}(\hat x_0)$ \COMMENT{Q-tilted energy}
-    \STATE $\eta_t \leftarrow \mathrm{clip}(\exp(\ell_t)\beta_t, 10^{-8}, 0.5)$
-    \STATE $x' \leftarrow x_t - \eta_t\nabla_{x_t}U_t + \sqrt{2\eta_t}\,\xi$, \; $\xi\sim\mathcal{N}(0,I)$
-    \STATE Accept/reject $x'$ via MH with energy $U_t$
-    \STATE $\ell_t \leftarrow \mathrm{clip}(\ell_t{+}\rho(\mathbf{1}_{\text{acc}}{-}0.574), \ell_{\min}, \ell_{\max})$
+    \STATE \textcolor{gray}{\textit{// MALA corrector ($M{=}2$ steps at this noise level)}}
+    \STATE $\eta_t\leftarrow\mathrm{clip}(\exp(\ell_t)\beta_t,\;10^{-8},\;0.5)$
+    \STATE $\mu\leftarrow x_t-\eta_t\nabla U_t(x_t)$;\quad $x'\leftarrow\mu+\sqrt{2\eta_t}\,\xi$,\;\;$\xi\sim\mathcal{N}(0,I)$
+    \STATE $\mu'\leftarrow x'-\eta_t\nabla U_t(x')$;\quad $\log\alpha\leftarrow(U_t(x_t){-}U_t(x'))+\tfrac{\|x'{-}\mu\|^2-\|x_t{-}\mu'\|^2}{4\eta_t}$ \COMMENT{MALA MH}
+    \STATE $x_t\leftarrow x'$ if $\log u<\min(0,\log\alpha)$,\;\;$u\sim\mathrm{Uniform}(0,1)$
+    \STATE $\ell_t\leftarrow\mathrm{clip}(\ell_t{+}\rho(\mathbf{1}_{\mathrm{acc}}{-}0.574),\;\ell_{\min},\;\ell_{\max})$
   \ENDFOR
-  \STATE \textcolor{gray}{\textit{// Guided predictor step:}}
-  \STATE $\hat x_0 \leftarrow \mathrm{clip}(\textsc{Denoise}(x_t,t),-r,r)$
-  \STATE $\epsilon_g \leftarrow \epsilon_\theta(x_t,t;s) - \lambda_t\sigma_t\nabla_{x_t}\mathrm{AggQ}(\hat x_0)$ \COMMENT{Q-guided}
-  \STATE $x_{t-1}\leftarrow\mu_\theta(x_t,t,\epsilon_g)$ \COMMENT{DDIM step}
+  \STATE \textcolor{gray}{\textit{// Guided DDIM predictor:}}
+  \STATE $g\leftarrow\nabla_{x_t}\bar Q(s,\,\mathrm{clip}(\hat x_0(x_t,t),{-}r,r))$;\quad $\hat\epsilon_g\leftarrow\hat\epsilon_\theta(x_t,t)-\eta\sigma_t g$
+  \STATE $\hat x_0^g\leftarrow\mathrm{clip}\!\left(\tfrac{x_t-\sigma_t\hat\epsilon_g}{\sqrt{\bar\alpha_t}},\;{-}r_0,\;r_0\right)$;\quad $x_{t-1}\leftarrow\tfrac{\beta_t\sqrt{\bar\alpha_{t-1}}}{1{-}\bar\alpha_t}\hat x_0^g+\tfrac{(1{-}\bar\alpha_{t-1})\sqrt{\alpha_t}}{1{-}\bar\alpha_t}x_t$
 \ENDFOR
-\STATE $a\leftarrow\mathrm{clip}(x_0,-1,1)$
-\STATE \textbf{return} $a$, $\mathrm{AggQ}(a)$, updated $\{\ell_t\}$
+\STATE \textbf{return} $\mathrm{clip}(x_0,{-}1,1)$, updated $\{\ell_t\}$
 \end{algorithmic}
 \end{fitcenter}
 \end{frame}
 
 % ═══════════════════════════════════════════════════════════════════════════════
-\begin{frame}{Algorithm 3: \textsc{AdaptiveEta.Update} (KL $+$ one-step shift)}
-\begin{fitcenter}
-\begin{algorithmic}[1]
-\REQUIRE Rollout $\{q_j,v_j\}_{j=1}^M$, previous $\{A_j^{\mathrm{prev}}\}$ on valid lanes, budget $\delta$
-\REQUIRE EMA state $(m_2,m_3,c,s,B)$, discount $\gamma$, rates $(\tau_v,\tau_s)$
-\STATE $A_j \leftarrow q_j - v_j$ for $j=1,\dots,M$
-\STATE $m_2^{\mathrm{b}} \leftarrow \tfrac{1}{M}\sum_j A_j^2$; \quad $m_2 \leftarrow (1{-}\tau_v)m_2+\tau_v m_2^{\mathrm{b}}$
-\IF{one-step shift mode}
-  \STATE $m_3^{\mathrm{b}} \leftarrow \tfrac{1}{M}\sum_j A_j^3$; \quad $m_3 \leftarrow (1{-}\tau_v)m_3+\tau_v m_3^{\mathrm{b}}$
-  \STATE $c^{\mathrm{b}} \leftarrow \mathrm{mean}_{\mathrm{valid}\,j}(A_j^2 A_j^{\mathrm{prev}})$ \COMMENT{skip terminated}
-  \STATE $c \leftarrow (1{-}\tau_v)c+\tau_v c^{\mathrm{b}}$
-  \STATE $B^{\mathrm{b}} \leftarrow 2\gamma\,c^{\mathrm{b}}+m_3^{\mathrm{b}}$
-  \STATE $s^{\mathrm{b}} \leftarrow B^{\mathrm{b}}/\max(m_2^{\mathrm{b}},10^{-8})^{3/2}$
-  \STATE $s \leftarrow (1{-}\tau_s)s+\tau_s s^{\mathrm{b}}$; \; $B \leftarrow (1{-}\tau_s)B+\tau_s B^{\mathrm{b}}$
-  \STATE $\eta_{\mathrm{KL}} \leftarrow \sqrt{2\delta/\max(m_2,10^{-8})}$
-  \STATE $\eta_\star \leftarrow {-}1/(\sqrt{\max(m_2,10^{-8})}\,s)$ \COMMENT{or ${-}m_2/B$ in direct mode}
-  \STATE $\eta_{\mathrm{raw}} \leftarrow \min(\eta_\star,\,\eta_{\mathrm{KL}})$
-\ELSE
-  \STATE $\eta_{\mathrm{raw}} \leftarrow \sqrt{2\delta/\max(m_2,10^{-8})}$ \COMMENT{pure KL budget}
-\ENDIF
-\STATE $\eta_{\mathrm{code}} \leftarrow \eta_{\mathrm{raw}}\sqrt{\max(m_2,10^{-8})}$ \COMMENT{code-space guidance}
-\STATE Store $A^{\mathrm{prev}}\leftarrow A$ on non-terminal lanes
-\STATE \textbf{return} updated EMAs and $\eta_{\mathrm{code}}$
-\end{algorithmic}
-\end{fitcenter}
+\begin{frame}{Algorithm 2: Mathematical Foundations}
+\small
+\textbf{What MALA targets at each level.}\; MALA samples from the $Q$-tilted EBM $p_t(x\mid s)\propto\exp(-U_t(x))$, where $U_t$ is defined in Alg.~2. The EBM sequence interpolates from a Gaussian ($t{=}T$) to the exact tilted distribution $\pi'\propto\pi_\theta e^{\eta Q}$ at $t{=}0$.
+
+\smallskip
+\textbf{Why energy-based?}\; MALA requires the density ratio $p_t(x')/p_t(x)$; score networks give only $\nabla\log p_t$. The energy MLP $E_\theta$ outputs a scalar, so the ratio is computable:
+\[
+  \frac{p_t(x')}{p_t(x)} = \exp\!\bigl(U_t(x)-U_t(x')\bigr)
+\]
+This is the first term of $\log\alpha$ in Alg.~2. The second term $\smash{\tfrac{\|x'-\mu\|^2-\|x_t-\mu'\|^2}{4\eta_t}}$ corrects for the asymmetric gradient-biased proposal; pure Langevin dynamics (without this correction) has $O(\eta_t)$ bias.
+
+\smallskip
+\textbf{Why Tweedie for $\bar Q$?}\; At $t{=}0$, na\"{i}ve score summation is exact: $\nabla\log(p_0\,e^{\eta Q})=\nabla\log p_0+\eta\nabla Q$. At $t{>}0$, the correct tilted score requires the intractable marginal $\tilde p_t(x_t)=\int p_{t|0}(x_t|x_0)\,\tilde p_0(x_0)\,dx_0$, so $\nabla\log\tilde p_t\neq\nabla\log p_t+\eta\nabla Q(s,\hat x_0)$. The Tweedie estimate $\hat x_0(x_t,t)=\mathbb{E}[x_0|x_t]$ is a tractable substitute; MALA's accept/reject absorbs the approximation error.
+
 \end{frame}
 
-% ═══════════════════════════════════════════════════════════════════════════════
-\section{Next Steps}
-
-\begin{frame}{Next Steps: Correcting the MALA Energy Scaling}
-\footnotesize
-\textbf{The problem.}\;
-Let $f_\theta(x,t;s)$ denote the raw scalar output of the energy network.
-It is trained via $\varepsilon$-prediction:
-$\nabla_x f_\theta \approx \varepsilon = -\sigma_t\,\nabla_x\!\log p_t(x)$,
-where $\sigma_t \coloneqq \sqrt{1-\bar\alpha_t}$.
-Integrating:
-\[
-  f_\theta(x,t) \;\approx\; -\sigma_t\,\log p_t(x) + C(t).
-\]
-
-\vspace{-0.5em}
-The current MALA corrector uses $f_\theta$ directly in the MH acceptance ratio.
-With Q-tilting, its stationary distribution is
-\[
-  \pi_{\text{current}}(x) \;\propto\; \exp\!\bigl(-f_\theta(x,t)\bigr)\cdot\exp\!\bigl(\lambda_t\,\mathrm{AggQ}\bigr)
-    \;=\; p_t(x)^{\,\sigma_t}\cdot\exp\!\bigl(\lambda_t\,\mathrm{AggQ}\bigr).
-\]
-
-\vspace{-0.5em}
-Because $\sigma_t < 1$, the base distribution $p_t^{\,\sigma_t}$ is
-\textcolor{redaccent}{flattened (higher-entropy)} relative to $p_t$.
-Near $t{=}0$: $\sigma_t\!\to\!0$, so $p_t^{\,\sigma_t}\!\to\!\text{uniform}$
-and the corrector's target is determined \textbf{entirely by $Q$-guidance}---
-this is effectively \textcolor{redaccent}{max-entropy RL with no KL penalty
-to the learned base policy}.
-
-\medskip
-\textbf{The fix (following Du et al., \textit{Reduce, Reuse, Recycle}, ICML 2023).}\;
-Define the properly scaled energy $E_\theta \coloneqq f_\theta / \sigma_t$:
-\[
-  E_\theta(x,t) \;\coloneqq\; \frac{f_\theta(x,t)}{\sigma_t}
-    \;\approx\; -\log p_t(x) + C'(t).
-\]
-
-\vspace{-0.5em}
-Using $E_\theta$ in the MALA corrector gives the Q-tilted target
-\[
-  \pi_{\text{fixed}}(x) \;\propto\; \exp\!\bigl(-E_\theta(x,t)\bigr)\cdot\exp\!\bigl(\lambda_t\,\mathrm{AggQ}\bigr)
-    \;=\; p_t(x)\cdot\exp\!\bigl(\lambda_t\,\mathrm{AggQ}\bigr),
-\]
-
-\vspace{-0.5em}
-which is the \textcolor{greenaccent}{correct VP marginal} tilted by $Q$
-at every noise level---i.e., \textcolor{greenaccent}{KL-regularized RL
-with the learned diffusion policy as the base}.
-\end{frame}
 
 \end{document}

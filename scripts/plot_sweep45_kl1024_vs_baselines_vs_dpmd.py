@@ -11,6 +11,8 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
+import wandb
+
 import plot_sweep_4env_training_curves as base
 import plot_sweep_6env_training_curves as six_env
 
@@ -34,6 +36,31 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
+ROLLING_WINDOW = 11
+
+
+def smooth_hist(hist: pd.DataFrame, window: int = ROLLING_WINDOW) -> pd.DataFrame:
+    """Apply a backward-looking rolling mean of `window` episodes to returns."""
+    hist = hist.copy()
+    hist["return"] = hist["return"].rolling(window, min_periods=1).mean()
+    return hist
+
+
+def rescale_to_target_max(hists: list[pd.DataFrame], target_max: float) -> list[pd.DataFrame]:
+    """Rescale each seed's _step so its maximum maps to target_max."""
+    result = []
+    for hist in hists:
+        if hist is None or len(hist) == 0:
+            result.append(hist)
+            continue
+        hist = hist.copy()
+        s_max = float(hist["_step"].max())
+        if s_max > 0 and s_max != target_max:
+            hist["_step"] = hist["_step"] * (target_max / s_max)
+        result.append(hist)
+    return result
+
+
 def canonicalize_hist(hist: pd.DataFrame | None) -> pd.DataFrame | None:
     if hist is None or len(hist) == 0:
         return None
@@ -53,13 +80,35 @@ def canonicalize_hist(hist: pd.DataFrame | None) -> pd.DataFrame | None:
     return out.reset_index(drop=True)
 
 
-def load_sweep45_histories(sweep_id: int, config_tag: str):
-    histories = defaultdict(list)
-    found = six_env.discover_local_histories(sweep_id, config_tag)
-    for env, _seed, _seed_index, _run_id, hist in found:
-        canon = canonicalize_hist(hist)
-        if canon is not None:
-            histories[env].append(canon)
+# Hardcoded wandb run IDs for sweep45 kl_budget=1024 (8 seeds per env).
+SWEEP45_RUN_IDS: dict[str, list[str]] = {
+    "Ant-v3":         ["fepyisin", "5vcxwghc", "r6od1b70", "7lce7wj7", "yxkffn2c", "r9xyr8bz", "yfvjmok6", "d5ehks9f"],
+    "HalfCheetah-v3": ["o7etiyl2", "xxnn144m", "vb9ljmta", "hucmlk2i", "h74hqdbv", "g75dmb1h", "9rnei5ej", "9jff3s2r"],
+    "Hopper-v3":      ["3r7qyuq6", "1o9ypcv8", "bll9d49g", "39s804k2", "u7x0c695", "8tn5316z", "hs39yp3h", "1yn1xaor"],
+    "Humanoid-v3":    ["9fk6skn6", "qlq8lwqm", "mecu931a", "t3m41biu", "uyae7y0v", "5xz6p4i5", "6ai20bf1", "msadbg7g"],
+    "Swimmer-v3":     ["cuk37n3e", "3gp14sy4", "tcnnwg4x", "zhflkz2g", "lyhs9luy", "yfsl5es5", "taxqev3e", "poc6hjzv"],
+    "Walker2d-v3":    ["9dpeefa6", "xmge3230", "6q6xxtty", "k0msvm6m", "9bfrdrmr", "iprvrm3u", "xacaqcky", "6pjfcysz"],
+}
+
+
+def load_sweep45_histories():
+    api = wandb.Api()
+    histories: dict[str, list[pd.DataFrame]] = defaultdict(list)
+    for env, run_ids in SWEEP45_RUN_IDS.items():
+        ep_key = f"episode_return/{env}"
+        for run_id in run_ids:
+            try:
+                run = api.run(f"{base.WANDB_PROJECT}/{run_id}")
+                rows = run.history(keys=[ep_key], x_axis="_step", pandas=True)
+            except Exception as e:
+                print(f"  warning: could not fetch {run_id}: {e}", flush=True)
+                continue
+            if rows is None or len(rows) == 0 or ep_key not in rows.columns:
+                continue
+            hist = rows[["_step", ep_key]].rename(columns={ep_key: "return"})
+            canon = canonicalize_hist(hist)
+            if canon is not None:
+                histories[env].append(smooth_hist(canon))
     return dict(histories)
 
 
@@ -80,12 +129,19 @@ def load_dpmd_histories(root: Path):
         hist = df[["step", value_col]].rename(columns={"step": "_step", value_col: "return"})
         canon = canonicalize_hist(hist)
         if canon is not None:
-            histories[env].append(canon)
+            histories[env].append(smooth_hist(canon))
     return dict(histories)
+
+
+MIN_COVERAGE_FRAC = 0.5  # drop seeds that reached < 50% of the longest seed's max step
 
 
 def interp_runs(runs: list[pd.DataFrame], num_points: int):
     usable = [hist for hist in runs if hist is not None and len(hist) >= 2]
+    if not usable:
+        return np.array([]), np.empty((0, 0), dtype=float)
+    global_max = max(float(hist["_step"].max()) for hist in usable)
+    usable = [hist for hist in usable if float(hist["_step"].max()) >= MIN_COVERAGE_FRAC * global_max]
     if not usable:
         return np.array([]), np.empty((0, 0), dtype=float)
     min_step = max(float(hist["_step"].min()) for hist in usable)
@@ -134,7 +190,7 @@ def plot_interpolated_series(ax, env: str, runs: list[pd.DataFrame], label: str,
 def build_output_path(args: argparse.Namespace) -> Path:
     if args.out is not None:
         return args.out
-    return base.FIG_DIR / "training_curves_6env_sweep45_kl1024_vs_baselines_vs_dpmd.png"
+    return base.FIG_DIR / "eta45_vs_baselines.png"
 
 
 def verify_env_coverage(name: str, histories: dict[str, list[pd.DataFrame]]):
@@ -147,8 +203,13 @@ def main() -> None:
     args = parse_args()
     six_env.configure_plot_style()
 
-    sweep45_histories = load_sweep45_histories(args.sweep_id, args.config_tag)
+    sweep45_histories = load_sweep45_histories()
     dpmd_histories = load_dpmd_histories(args.dpmd_root)
+
+    if "Humanoid-v3" in sweep45_histories:
+        sweep45_histories["Humanoid-v3"] = rescale_to_target_max(
+            sweep45_histories["Humanoid-v3"], float(args.max_steps)
+        )
 
     verify_env_coverage(args.config_tag, sweep45_histories)
     verify_env_coverage(DPMD_LABEL, dpmd_histories)

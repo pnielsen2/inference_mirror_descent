@@ -86,6 +86,9 @@ class RelaxWrapper(Wrapper):
         obs, info = self.env.reset(seed=seed, options=options)
         return obs.astype(np.float32, copy=False), info
 
+    def get_current_obs(self) -> np.ndarray:
+        return self.env.get_current_obs().astype(np.float32, copy=False)
+
     def step(self, action: np.ndarray):
         action = action.astype(self.original_action_dtype)
         if self.needs_rescale:

@@ -151,13 +151,11 @@ class DPMD:
                 state, obs, action, q_params, q_opt_states, q_backup_per_q
             )
 
-            target_q_params = tuple(
-                delayed_target_update(
-                    q_params[qi], target_q_params[qi], state.hp.polyak_tau,
-                    step, self.cfg.delay_update,
-                )
-                for qi in range(num_q)
-            )
+            # No-op when not doing adaptive eta
+            value_params_updated, value_opt_state_updated, value_loss_log = \
+                self._value_update_step(state, per_q_target_values, next_obs)
+
+            target_q_params = tuple(delayed_target_update(q_params[i], target_q_params[i], state.hp.polyak_tau, step, self.cfg.delay_update) for i in range(num_q))
 
             def policy_loss_fn(policy_params) -> jax.Array:
                 # Standard diffusion score-matching loss (eps-MSE)
@@ -182,10 +180,7 @@ class DPMD:
                 state.hp.lr_policy, step, self.cfg.delay_update,
             )
 
-            # Normalized advantage guidance: train V(s'). advantage_second_moment_ema
-            # is updated on the host side in VmapOffPolicyTrainer, not here.
-            value_params_updated, value_opt_state_updated, value_loss_log = \
-                self._value_update_step(state, per_q_target_values, next_obs)
+
 
             state = state._replace(
                 params=ActorCriticParams(q_params, target_q_params, policy_params),

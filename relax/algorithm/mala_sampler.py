@@ -12,10 +12,6 @@ One full pass of the sampler:
 * Return ``MalaSampleResult(action, q, log_eta_scales, per_level_acc,
   per_level_clip)`` with the per-level acceptance / clip arrays the trainer
   logs to wandb.
-
-Behavior and PRNG layout are byte-identical to the previous in-DPMD
-implementation; this is a pure refactor that hoists the closure to module
-scope so ``dpmd.py`` reads top-to-bottom around the training step.
 """
 from typing import Callable
 
@@ -76,48 +72,33 @@ def build_mala_sampler(
             x0_clipped = jnp.clip(x0_hat, -x0_hat_clip_radius, x0_hat_clip_radius)
             return aggregate_q_fn([model.q(qp, obs, x0_clipped) for qp in q_params_tuple])
 
-        # ---- Energy target (drives MALA correction steps) -----------
-        def energy_model(t, x):
-            E = model.energy_fn(policy_params, obs, x, t)
-            # Scale base energy by energy_multiplier (tempers the base distribution)
-            return energy_multiplier * E
-
-        # tfg_eta_current = η = sqrt(2δ/M) (the paper's η, eq. 2).
-        # Q vs A = Q-V makes no difference: V(s) is state-only and cancels
-        # in the MALA acceptance ratio.
+        # tfg_eta_current = η: fixed constant, sqrt(2δ/M) (KL-budget), or
+        # min(η_KL, η*) (one-step dist-shift), depending on run config.
         def energy_total(t, x):
-            E_mod = energy_model(t, x)
+            E_mod = energy_multiplier * model.energy_fn(policy_params, obs, x, t)
             noise_pred = model.policy(policy_params, obs, x, t)
             x0_hat = reconstruct_x0_from_noise(x, t, noise_pred)
             clip_frac = jnp.mean((jnp.abs(x0_hat) > x0_hat_clip_radius).astype(jnp.float32))
             return E_mod - tfg_eta_current * q_aggregated_at_clipped_x0_hat(x0_hat), clip_frac
 
-        # ---- Q-guidance gradient (drives predictor step) ------------
-        def scaled_policy_noise(t_idx, x_in):
-            noise_pred = model.policy(policy_params, obs, x_in, t_idx)
-            return energy_multiplier * noise_pred
-
         def guidance_value_from_x(x_in, t_idx):
             # Tweedie-clean prediction with energy_multiplier-tempered base
             # score; guidance component is NOT scaled.
-            noise_pred_scaled = scaled_policy_noise(t_idx, x_in)
-            x0_hat = reconstruct_x0_from_noise(x_in, t_idx, noise_pred_scaled)
+            eps_pred = model.policy(policy_params, obs, x_in, t_idx)
+            x0_hat = reconstruct_x0_from_noise(x_in, t_idx, eps_pred)
             q = q_aggregated_at_clipped_x0_hat(x0_hat)
 
             # KL-budget mode: guide on advantage A = Q - V.
             # tfg_eta already encodes 1/sqrt(M) so A is used unnormalized.
-            if value_head is not None and value_params is not None:
-                v = value_head.apply(value_params, obs)
-                return guidance_multiplier * reduce_over_batch(q - v)
             return guidance_multiplier * reduce_over_batch(q)
 
         def compute_guidance_gradient(x_in, t_idx):
-            return jax.grad(lambda xx: guidance_value_from_x(xx, t_idx))(x_in)
+            return jax.grad(lambda x: guidance_value_from_x(x, t_idx))(x_in)
 
         # ---- DDIM predictor step (guided or unguided, chosen at build time) ----
         if mala_guided_predictor:
             def ddim_step(t_idx, x_in):
-                noise_pred_scaled = scaled_policy_noise(t_idx, x_in)
+                noise_pred_scaled = energy_multiplier * model.policy(policy_params, obs, x_in, t_idx)
                 grad_q = compute_guidance_gradient(x_in, t_idx)
                 sigma_t = schedule.sqrt_one_minus_alphas_cumprod[t_idx]
                 eps_pred = noise_pred_scaled - tfg_eta_current * sigma_t * grad_q
@@ -126,7 +107,7 @@ def build_mala_sampler(
                 return x0_hat * schedule.posterior_mean_coef1[t_idx] + x_in * schedule.posterior_mean_coef2[t_idx]
         else:
             def ddim_step(t_idx, x_in):
-                noise_pred_scaled = scaled_policy_noise(t_idx, x_in)
+                noise_pred_scaled = energy_multiplier * model.policy(policy_params, obs, x_in, t_idx)
                 x0_hat = jnp.clip(reconstruct_x0_from_noise(x_in, t_idx, noise_pred_scaled),
                                    -x_recon_clip_radius, x_recon_clip_radius)
                 return x0_hat * schedule.posterior_mean_coef1[t_idx] + x_in * schedule.posterior_mean_coef2[t_idx]

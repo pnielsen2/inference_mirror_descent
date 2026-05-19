@@ -1,7 +1,8 @@
 import json
 import time
 
-from relax.algorithm.dpmd import DPMD, DPMDConfig
+from relax.algorithm.dpmd import DPMD
+from relax.algorithm.dpmd_types import DPMDConfig
 from relax.env import create_vector_env
 from relax.utils.experience import Experience
 from relax.utils.fs import PROJECT_ROOT
@@ -20,17 +21,15 @@ if __name__ == "__main__":
         from jax import config
         config.update("jax_disable_jit", True)
 
-    N_runs = int(args.parallel_runs)
-
     # Load the inline hp_pack JSON, if any. Used below for per-entry master
     # seeds AND the later _replace overrides on the vmap state.
     _hp_loaded = json.loads(args.hp_pack_inline) if args.hp_pack_inline is not None else None
 
-    seeds = derive_seed_bundle(args.seed, N_runs, _hp_loaded)
+    seeds = derive_seed_bundle(args.seed, args.parallel_runs, _hp_loaded)
 
     env, obs_dim, act_dim = create_vector_env(
         args.env,
-        args.num_vec_envs * N_runs,
+        args.num_vec_envs * args.parallel_runs,
         seeds.env_seed,
         seeds.env_action_seed,
         per_entry_env_seeds=seeds.per_entry_env_seeds,
@@ -50,7 +49,7 @@ if __name__ == "__main__":
     algorithm.state = algorithm.make_vmapped_state(dpmd_params_list)
     if _hp_loaded is not None:
         from relax.algorithm import hp_pack
-        algorithm.state = hp_pack.apply(algorithm.state, _hp_loaded, N_runs)
+        algorithm.state = hp_pack.apply(algorithm.state, _hp_loaded, args.parallel_runs)
         if seeds.per_entry_masters is not None:
             print(f"[hp_pack] applied per-entry master seeds "
                   f"(buffers + init networks + train keys): {seeds.per_entry_masters}")
@@ -70,7 +69,7 @@ if __name__ == "__main__":
         algorithm=algorithm,
         buffers=buffers_list,
         log_path=exp_dir,
-        parallel_runs=N_runs,
+        parallel_runs=args.parallel_runs,
         per_run_envs=args.num_vec_envs,
         batch_size=args.batch_size,
         start_step=args.start_step,

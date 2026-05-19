@@ -39,7 +39,7 @@ def delayed_target_update(params, target_params, tau, step, delay):
     """Polyak-averaged target update gated by ``step % delay == 0``."""
     return jax.lax.cond(
         step % delay == 0,
-        lambda tp: optax.incremental_update(params, tp, tau),
+        lambda tp: optax.incremental_update(params, tp, tau), # Polyak Update
         lambda tp: tp,
         target_params,
     )
