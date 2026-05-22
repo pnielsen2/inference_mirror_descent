@@ -1,0 +1,305 @@
+\documentclass[final,hyperref={pdfpagelabels=false}]{beamer}
+\usepackage[orientation=landscape,size=custom,width=121.92,height=91.44,scale=1.4]{beamerposter}
+\usetheme{default}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{tikz}
+\usetikzlibrary{arrows,arrows.meta,positioning,shapes,calc,decorations.pathreplacing}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+\graphicspath{{../../figures/}}
+
+\definecolor{harvardcrimson}{RGB}{165,28,48}
+\definecolor{softblue}{RGB}{65,105,225}
+\definecolor{softgreen}{RGB}{34,139,34}
+\definecolor{softorange}{RGB}{255,140,0}
+\definecolor{lightgray}{RGB}{245,245,245}
+\definecolor{darkgray}{RGB}{60,60,60}
+\definecolor{lightorange}{RGB}{255,200,120}
+
+\setbeamercolor{headline}{bg=harvardcrimson,fg=white}
+\setbeamercolor{block title}{bg=harvardcrimson,fg=white}
+\setbeamercolor{block body}{bg=lightgray,fg=darkgray}
+\setbeamercolor{block alerted title}{bg=softorange,fg=white}
+\setbeamercolor{block alerted body}{bg=lightorange!10,fg=darkgray}
+\setbeamerfont{block title}{size=\Large,series=\bfseries}
+\setbeamerfont{headline title}{size=\Huge,series=\bfseries}
+\setbeamertemplate{navigation symbols}{}
+
+\newlength{\sepwidth}
+\newlength{\colwidth}
+\setlength{\sepwidth}{0.02\paperwidth}
+\setlength{\colwidth}{0.30\paperwidth}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\mathrm{Var}}
+
+\begin{document}
+\begin{frame}[t]
+
+\begin{beamercolorbox}[wd=\paperwidth,ht=10cm]{headline}
+\vspace{1cm}
+\centering
+{\fontsize{72}{80}\selectfont\bfseries MALA-Guided Mirror Descent}\\[0.8cm]
+{\fontsize{42}{50}\selectfont Inference-Time Tilting of Diffusion Policies for Online RL}\\[1cm]
+{\fontsize{36}{44}\selectfont Philp Nielsen}\\[0.5cm]
+\end{beamercolorbox}
+
+\vspace{1cm}
+
+\begin{columns}[t]
+
+\begin{column}{\colwidth}
+
+\begin{block}{\Large Mirror Descent as an Inference-Time Policy Update}
+\small
+Mirror descent improves a policy by exponentially tilting it toward high-value actions:
+\[
+\pi'(a\mid s) \propto \pi_\theta(a\mid s)\,\exp\!\bigl(\eta\,Q(s,a)\bigr).
+\]
+
+\vspace{0.3em}
+MGMD uses a diffusion policy as the base distribution $\pi_\theta$ and performs this improvement step at sampling time.
+
+\vspace{0.3em}
+\textbf{Why diffusion policies are a good fit:}
+\begin{itemize}
+    \item \textbf{Expressive:} they represent multimodal action distributions well.
+    \item \textbf{Trainable:} the policy is still learned by standard denoising score matching.
+    \item \textbf{Deployable:} all critic information is injected at inference time, then distilled back into the policy through replay.
+\end{itemize}
+
+\vspace{0.3em}
+The practical challenge is not writing down $\pi'$, but sampling from it accurately during reverse diffusion.
+\end{block}
+
+\vspace{0.8cm}
+
+\begin{block}{\Large Diffusion Policies, Tweedie Reconstruction, and Guidance}
+\small
+A diffusion policy starts from Gaussian noise and denoises toward an action:
+\[
+q(a_t\mid a_0)=\mathcal{N}\!\bigl(\sqrt{\bar\alpha_t}\,a_0,\,(1-\bar\alpha_t)I\bigr),
+\qquad
+a_T \to a_{T-1} \to \cdots \to a_0.
+\]
+
+\vspace{0.3em}
+The network predicts noise, which gives the Tweedie clean-action estimate
+\[
+\hat a_0(a_t)=\frac{a_t-\sqrt{1-\bar\alpha_t}\,\hat\epsilon_\theta(a_t,s,t)}{\sqrt{\bar\alpha_t}}.
+\]
+
+\vspace{0.3em}
+A natural training-free guidance rule evaluates the critic only on clean actions:
+\[
+\hat\epsilon_t^{\mathrm{Tw}}(a_t)
+=
+\hat\epsilon_\theta(a_t,s,t)
+-
+\eta\sqrt{1-\bar\alpha_t}\,\nabla_{a_t}Q\!\bigl(s,\hat a_0(a_t)\bigr).
+\]
+
+\vspace{0.3em}
+This is attractive because the critic never has to model noisy actions, but it does \emph{not} give the exact score of the tilted noisy marginals for intermediate $t$.
+\end{block}
+
+\vspace{0.8cm}
+
+\begin{block}{\Large Why MGMD Needs MCMC Corrections}
+\small
+The exact reverse process for the tilted policy would require the noisy tilted marginals $\tilde p_t$, not just the clean tilt at $t=0$.
+Instead, MGMD treats each noise level as a separate energy-based target:
+\[
+p_t(a_t\mid s) \propto \exp\!\bigl(-E_t^{\mathrm{guided}}(a_t,s)\bigr),
+\qquad
+E_t^{\mathrm{guided}}(a_t,s)=E_\theta(s,a_t,t)-\eta\,Q\!\bigl(s,\hat a_0(a_t)\bigr).
+\]
+
+\vspace{0.3em}
+This viewpoint gives the right endpoints:
+\begin{itemize}
+    \item at high noise, the target is close to the Gaussian base distribution,
+    \item as $t \to 0$, the target approaches $\pi'(a\mid s) \propto \pi_\theta(a\mid s)e^{\eta Q(s,a)}$.
+\end{itemize}
+
+\vspace{0.3em}
+MGMD therefore corrects the sampler \textbf{at every noise level} with MALA, rather than relying on plain guidance alone.
+\end{block}
+
+\vspace{0.8cm}
+
+\begin{block}{\Large Adaptive Guidance Strength}
+\small
+The current project also adapts the tilt magnitude instead of fixing it forever. A simple scale-invariant rule is the KL-budget update
+\[
+\eta_k = \sqrt{\frac{2\Delta}{\E_{s\sim d_{\pi_k}}\!\left[\Var_{a\sim\pi_k}\bigl(A_k(s,a)\bigr)\right]}}.
+\]
+
+\vspace{0.2em}
+In the code, this can be combined with a one-step distribution-shift correction that tracks advantage moments with EMAs. The effect is intuitive: guidance becomes weaker when critic uncertainty or policy-shift risk is high, and stronger when the critic signal is consistently informative.
+\end{block}
+
+\end{column}
+
+\begin{column}{\colwidth}
+
+\begin{block}{\Large Energy-Based Parameterization}
+\small
+Metropolis--Hastings needs \textbf{energy differences}, not just score vectors. MGMD therefore uses an energy-based diffusion policy:
+\[
+\hat\epsilon_\theta(s,a_t,t)
+\coloneqq
+\sqrt{1-\bar\alpha_t}\,\nabla_{a_t}E_\theta(s,a_t,t).
+\]
+
+\vspace{0.3em}
+The training objective is still the standard diffusion loss:
+\[
+\mathcal{L}_{\mathrm{diff}}(\theta)
+=
+\E_{a_0,\epsilon,t}
+\left[
+\left\lVert
+\hat\epsilon_\theta\!\left(s,\sqrt{\bar\alpha_t}a_0+\sqrt{1-\bar\alpha_t}\,\epsilon,t\right)-\epsilon
+\right\rVert^2
+\right].
+\]
+
+\vspace{0.3em}
+This keeps diffusion training simple, while making both of the ingredients for MALA available:
+\begin{itemize}
+    \item gradients $\nabla_{a_t}E_t^{\mathrm{guided}}$ for Langevin proposals,
+    \item energy differences $E_t^{\mathrm{guided}}(a)-E_t^{\mathrm{guided}}(a')$ for MH acceptance.
+\end{itemize}
+\end{block}
+
+\vspace{0.8cm}
+
+\begin{block}{\Large MALA Correction at Each Diffusion Level}
+\small
+At each noise level $t$, MGMD runs a short MALA chain targeting
+\[
+p_t(a_t\mid s) \propto \exp\!\bigl(-E_t^{\mathrm{guided}}(a_t,s)\bigr).
+\]
+
+\vspace{0.3em}
+\textbf{Langevin proposal:}
+\[
+a_t' = a_t - s_t\,\nabla_{a_t}E_t^{\mathrm{guided}}(a_t,s) + \sqrt{2s_t}\,z,
+\qquad z\sim\mathcal{N}(0,I).
+\]
+
+\textbf{MH correction:} with $\mu(a)=a-s_t\nabla E_t^{\mathrm{guided}}(a)$,
+\[
+\alpha(a,a')
+=
+\min\!\left\{1,
+\exp\!\left(
+E_t^{\mathrm{guided}}(a)-E_t^{\mathrm{guided}}(a')
++
+\frac{\|a'-\mu(a)\|^2-\|a-\mu(a')\|^2}{4s_t}
+\right)
+\right\}.
+\]
+
+\vspace{0.3em}
+Each diffusion level maintains its own step size $s_t$, adapted online toward the classical MALA target acceptance rate of \textbf{0.574}. This matters because the energy landscape is smooth at high noise and sharp near $t=0$.
+\end{block}
+
+\vspace{0.8cm}
+
+\begin{block}{\Large Sampler: MALA Corrector + DDIM Predictor}
+ \small
+ \textbf{Algorithm 1:} tilted-policy sampler
+ 
+ {\footnotesize
+ \begin{algorithmic}[1]
+ \STATE Sample $a_T \sim \mathcal{N}(0,I)$
+ \FOR{$t=T,T-1,\ldots,1$}
+     \STATE Form $E_t^{\mathrm{guided}}(a_t,s)$ using $\hat a_0(a_t)$
+     \FOR{$m=1,\ldots,M$}
+         \STATE Propose $a_t' \sim \mathcal{N}(a_t-s_t\nabla E_t^{\mathrm{guided}},2s_tI)$
+         \STATE Accept or reject with the MH rule above
+         \STATE Adapt $s_t$ toward acceptance rate $0.574$
+     \ENDFOR
+     \STATE Apply a guided DDIM step to obtain $a_{t-1}$
+ \ENDFOR
+ \STATE \textbf{return} $\mathrm{clip}(a_0,-1,1)$
+ \end{algorithmic}
+ }
+
+\vspace{0.2em}
+The corrector enforces the intended level-wise distribution; the predictor moves efficiently to the next cleaner diffusion level.
+\end{block}
+
+\end{column}
+
+\begin{column}{\colwidth}
+
+\begin{block}{\Large Results: MuJoCo Online RL}
+\begin{center}
+\includegraphics[width=0.98\textwidth]{eta45_vs_baselines.png}
+\end{center}
+
+\small
+\vspace{0.2em}
+\textbf{Setup:} six MuJoCo environments, 1M environment steps, multiple seeds, and comparisons against SAC, TD3, PPO, TRPO, DIPO, and the earlier diffusion-policy mirror-descent baseline DPMD.
+
+ \vspace{0.3em}
+ \textbf{Reading the figure:}
+ MGMD is competitive across the benchmark suite and improves clearly over the earlier diffusion-policy mirror-descent approach, showing that inference-time MALA corrections can translate into better online control performance.
+ \end{block}
+ 
+ \vspace{0.8cm}
+ 
+ \begin{block}{\Large Online RL Loop in the Current Codebase}
+ \small
+ The training loop follows the authoritative presentation closely:
+ \begin{enumerate}
+      \item Sample an action from the current tilted policy with the MALA-guided sampler.
+      \item Execute it, collect $(s,a,r,s',d)$, and append to the replay buffer.
+      \item Update twin critics by TD learning using \textbf{min}-$Q$ targets and a Huber loss.
+      \item Fit the diffusion policy to sampled actions with the usual denoising loss.
+ \end{enumerate}
+ 
+ \vspace{0.3em}
+ \textbf{Important implementation detail:}
+ \begin{itemize}
+     \item use the \textbf{mean} of the twin critics during sampling for a stronger guidance signal,
+     \item use the \textbf{min} of the twin critics inside TD targets to limit overestimation.
+ \end{itemize}
+ 
+ \vspace{0.3em}
+ \textbf{Representative settings used in this code:}
+ \begin{itemize}
+     \item 20 diffusion levels with a cosine schedule,
+     \item deterministic DDIM predictor,
+     \item 2 MALA steps per diffusion level,
+     \item per-level Robbins--Monro adaptation of $s_t$,
+     \item Tweedie/Q clip radius $3.0$, Huber width $30$, replay size $4\times 10^5$, UTD ratio $8$.
+ \end{itemize}
+ \end{block}
+ 
+ \vspace{0.8cm}
+ 
+ \begin{alertblock}{\Large Takeaways}
+ \small
+\begin{itemize}
+    \item \textbf{Mirror descent target:} the desired policy update is an exponential tilt of the current diffusion policy by the critic.
+    \item \textbf{Core technical move:} rewrite guided diffusion as a sequence of energy-based targets and correct each level with MALA.
+    \item \textbf{Why it matters:} energy parameterization preserves standard diffusion training while making exact MH corrections possible.
+    \item \textbf{Practical knob:} more inference-time compute can be spent on extra MALA steps, rather than changing the training objective.
+\end{itemize}
+\end{alertblock}
+
+\end{column}
+
+\end{columns}
+
+\end{frame}
+\end{document}

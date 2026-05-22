@@ -1,0 +1,261 @@
+\documentclass[final,hyperref={pdfpagelabels=false}]{beamer}
+\usepackage[orientation=landscape,size=custom,width=121.92,height=91.44,scale=1.38]{beamerposter}
+\usetheme{default}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{bm}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,decorations.pathreplacing,shapes.geometric}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{algorithmic}
+\graphicspath{{../../figures/}{../figures/}{figures/}}
+\definecolor{harvardcrimson}{RGB}{165,28,48}
+\definecolor{accent}{HTML}{2171B5}
+\definecolor{greenaccent}{HTML}{2E7D32}
+\definecolor{orangeaccent}{HTML}{E65100}
+\definecolor{lightgray}{RGB}{245,245,245}
+\definecolor{darkgray}{RGB}{60,60,60}
+\setbeamercolor{headline}{bg=harvardcrimson,fg=white}
+\setbeamercolor{block title}{bg=harvardcrimson,fg=white}
+\setbeamercolor{block body}{bg=lightgray,fg=darkgray}
+\setbeamerfont{block title}{size=\Large,series=\bfseries}
+\setbeamerfont{headline title}{size=\Huge,series=\bfseries}
+\setbeamertemplate{navigation symbols}{}
+\newlength{\sepwidth}
+\newlength{\colwidth}
+\setlength{\sepwidth}{0.02\paperwidth}
+\setlength{\colwidth}{0.30\paperwidth}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\Var}{\mathrm{Var}}
+\DeclareMathOperator{\Cov}{Cov}
+\begin{document}
+\begin{frame}[t]
+\begin{beamercolorbox}[wd=\paperwidth,ht=10cm]{headline}
+\vspace{1cm}
+\centering
+{\fontsize{72}{80}\selectfont\bfseries MALA-Guided Mirror Descent}\\[0.8cm]
+{\fontsize{40}{48}\selectfont Inference-Time Policy Extraction for Diffusion Reinforcement Learning}\\[1cm]
+{\fontsize{34}{40}\selectfont Philp Nielsen}\\[0.5cm]
+\end{beamercolorbox}
+\vspace{1cm}
+\begin{columns}[t]
+\begin{column}{\colwidth}
+\begin{block}{\Large Mirror Descent as the Policy Update Target}
+\small
+The clean policy-improvement target is an exponential tilt of the current policy:
+\[
+\pi_{k+1}(a\mid s)\;\propto\;\pi_k(a\mid s)\,\exp\!\bigl(\eta\,Q(s,a)\bigr).
+\]
+For expressive diffusion policies, the hard part is not writing this target down, but \textbf{sampling from it accurately}.
+
+\vspace{0.4em}
+\textbf{Why this matters in online RL:}
+\begin{itemize}
+    \item The critic changes throughout training, so the tilted target distribution also changes.
+    \item Weighted regression methods only realize the tilt indirectly.
+    \item MGMD instead spends compute on \textbf{constructing better action targets}, then distills them with the usual diffusion loss.
+\end{itemize}
+\end{block}
+
+\vspace{0.8cm}
+
+\begin{block}{\Large Diffusion Policies and Tweedie Guidance}
+\small
+A diffusion policy generates actions by denoising from Gaussian noise:
+\[
+q(a_t\mid a_0)=\mathcal{N}\!\bigl(\sqrt{\bar\alpha_t}\,a_0,\,(1-\bar\alpha_t)I\bigr),
+\qquad a_T\sim \mathcal{N}(0,I).
+\]
+The clean-action estimate at noise level $t$ is the Tweedie reconstruction
+\[
+\hat a_0(a_t)=\frac{a_t-\sqrt{1-\bar\alpha_t}\,\hat\epsilon_\theta(a_t,s,t)}{\sqrt{\bar\alpha_t}}.
+\]
+Using a clean critic gives the guided score field
+\[
+\hat\epsilon_t^{\mathrm{Tw}}(a_t)=\hat\epsilon_\theta(a_t,s,t)-\eta\sqrt{1-\bar\alpha_t}\,\nabla_{a_t}\bar Q\!\bigl(s,\hat a_0(a_t)\bigr).
+\]
+
+\vspace{0.3em}
+\textbf{Key point:}
+this signal is strong in practice because $\bar Q$ is evaluated on clean actions, but it does \textbf{not} by itself guarantee the correct noisy marginals for $t>0$.
+\end{block}
+
+\vspace{0.8cm}
+
+\begin{block}{\Large Energy Parameterization Makes MALA Possible}
+\small
+MGMD uses an energy-based diffusion policy so that both gradients and energy differences are available:
+\[
+\hat\epsilon_\theta(a_t,s,t)=\sqrt{1-\bar\alpha_t}\,\nabla_{a_t}E_\theta(a_t,s,t).
+\]
+This yields the guided energy at each diffusion level
+\[
+E_t^{\mathrm{guided}}(a_t,s)=E_\theta(a_t,s,t)-\eta\,\bar Q\!\bigl(s,\hat a_0(a_t)\bigr).
+\]
+
+\vspace{0.3em}
+\begin{itemize}
+    \item $\nabla E_t^{\mathrm{guided}}$ drives Langevin proposals toward better actions.
+    \item $E_t^{\mathrm{guided}}(a)-E_t^{\mathrm{guided}}(a')$ gives the Metropolis--Hastings correction term.
+    \item The sampler therefore has a principled level-wise target, not just a heuristic guidance direction.
+\end{itemize}
+\end{block}
+\end{column}
+
+\begin{column}{\colwidth}
+\begin{block}{\Large MALA Correction at Each Noise Level}
+\small
+At level $t$, MGMD targets
+\[
+p_t(a\mid s)\propto\exp\!\bigl(-E_t^{\mathrm{guided}}(a,s)\bigr).
+\]
+A MALA proposal takes the form
+\[
+a' = a-s_t\nabla_a E_t^{\mathrm{guided}}(a,s)+\sqrt{2s_t}\,z,
+\qquad z\sim\mathcal{N}(0,I),
+\]
+with proposal mean $\mu(a)=a-s_t\nabla_a E_t^{\mathrm{guided}}(a,s)$. The MH acceptance probability is
+\[
+\alpha(a,a')=\min\!\left\{1,\exp\!\left[
+E_t^{\mathrm{guided}}(a,s)-E_t^{\mathrm{guided}}(a',s)
++\frac{\|a'-\mu(a)\|^2-\|a-\mu(a')\|^2}{4s_t}
+\right]\right\}.
+\]
+
+\vspace{0.3em}
+\begin{itemize}
+    \item The gradient gives directed proposals.
+    \item MH removes the finite-step bias from pure Langevin dynamics.
+    \item Each diffusion level adapts its own $s_t$ toward the standard MALA target acceptance rate $0.574$.
+\end{itemize}
+
+\vspace{0.4em}
+\begin{center}
+\resizebox{0.95\textwidth}{!}{%
+\begin{tikzpicture}[>=Stealth, font=\small,
+    stp/.style={draw=accent, thick, rounded corners=3pt, fill=white,
+                 minimum width=3.0cm, minimum height=1.0cm, align=center}]
+  \node[stp] (tT) at (0,0) {$a_T\sim\mathcal{N}(0,I)$};
+  \node[stp] (mT) at (3.8,0) {MALA\\corrector};
+  \node[stp] (pT) at (7.6,0) {guided DDIM\\predictor};
+  \node at (10.3,0) {$\cdots$};
+  \node[stp] (m1) at (13.0,0) {MALA\\corrector};
+  \node[stp, draw=orangeaccent, fill=orangeaccent!10] (a0) at (16.8,0) {$a_0\sim\pi_{k+1}(\cdot\mid s)$};
+  \draw[->, thick] (tT) -- (mT);
+  \draw[->, thick] (mT) -- (pT);
+  \draw[->, thick] (pT) -- (10.8,0);
+  \draw[->, thick] (11.2,0) -- (m1);
+  \draw[->, thick] (m1) -- (a0);
+\end{tikzpicture}%
+}
+\end{center}
+\end{block}
+
+\vspace{0.8cm}
+
+\begin{block}{\Large Algorithm: SampleFromTiltedPolicy}
+\footnotesize
+\begin{algorithmic}[1]
+\STATE Sample $a_T\sim\mathcal{N}(0,I)$
+\FOR{$t=T,T-1,\ldots,1$}
+  \STATE Build $\hat a_0(a_t)$ from the current denoiser
+  \STATE Form $E_t^{\mathrm{guided}}(a_t,s)=E_\theta(a_t,s,t)-\eta\,\bar Q(s,\hat a_0(a_t))$
+  \FOR{$m=1,\ldots,M$}
+    \STATE Propose a MALA move using $\nabla_a E_t^{\mathrm{guided}}$
+    \STATE Accept or reject with the MH ratio and adapt $s_t$
+  \ENDFOR
+  \STATE Take a deterministic guided DDIM step to level $t-1$
+\ENDFOR
+\STATE Return $\mathrm{clip}(a_0,-1,1)$ and the updated per-level step sizes
+\end{algorithmic}
+
+\vspace{0.4em}
+The same sampler is used both for \textbf{environment actions} and for the \textbf{next-action samples} inside TD targets.
+\end{block}
+
+\vspace{0.8cm}
+
+\begin{block}{\Large Online Training Loop}
+\small
+\begin{algorithmic}[1]
+\STATE Sample rollout action with $\tfrac{1}{2}(Q_{\phi_1}+Q_{\phi_2})$ for a strong guidance signal
+\STATE Store $(s,a,r,s',d)$ in replay
+\STATE Sample next-state action with $\min(Q_{\phi_1},Q_{\phi_2})$ for clipped double-$Q$ TD targets
+\STATE Update each critic with a Huber TD loss
+\STATE Fit the policy to guided actions with the standard denoising objective
+\end{algorithmic}
+\[
+\mathcal{L}_{\mathrm{diff}}(\theta)=\E\bigl[\|\epsilon_\theta(a_t,s,t)-\epsilon\|^2\bigr].
+\]
+Because replay stores \textbf{guided actions}, inference-time improvement is continuously amortized back into the base diffusion policy.
+\end{block}
+\end{column}
+
+\begin{column}{\colwidth}
+\begin{block}{\Large Why MGMD Differs from Prior Diffusion RL}
+\small
+\begin{itemize}
+    \item \textbf{DPMD-style weighted regression:} changes the diffusion training loss to approximate the mirror-descent tilt indirectly.
+    \item \textbf{Naive Tweedie guidance:} gives a strong clean-$Q$ signal but does not target the correct noisy marginals.
+    \item \textbf{MGMD:} keeps the strong clean-$Q$ guidance, adds MALA corrections at every level, and leaves policy training as ordinary denoising score matching.
+\end{itemize}
+
+\vspace{0.3em}
+This reframes policy extraction as a \textbf{sampling problem}: better inference-time computation produces better action targets, which are then easy to distill.
+\end{block}
+
+\vspace{0.8cm}
+
+\begin{block}{\Large Adaptive Guidance Strength}
+\small
+The repository also supports choosing a single global guidance strength from a KL budget,
+\[
+\eta_{\mathrm{KL}}=\sqrt{\frac{2\Delta}{\E_{s\sim d_{\pi_k}}\![\Var_{\pi_k}(A_k)]}},
+\]
+and capping it with a distribution-shift-aware estimate when stronger tilting would make the critic stale.
+
+\vspace{0.3em}
+\begin{itemize}
+    \item \textbf{Scale invariant:} rescaling rewards rescales $\eta$ in the opposite direction.
+    \item \textbf{Self-regulating:} large guidance is used only when the critic statistics support it.
+    \item \textbf{Practical role:} guidance is no longer just a brittle hand-tuned constant.
+\end{itemize}
+\end{block}
+
+\vspace{0.8cm}
+
+\begin{block}{\Large Results: MuJoCo Online RL}
+\begin{center}
+\includegraphics[width=0.98\textwidth]{eta45_vs_baselines.png}
+\end{center}
+
+\vspace{0.2em}
+\small
+\textbf{Setup:} six MuJoCo environments, 1M environment steps, multiple random seeds, and comparisons against SAC, TD3, PPO, TRPO, DIPO, and DPMD.
+
+\vspace{0.2em}
+\textbf{Takeaways from the plot:}
+\begin{itemize}
+    \item MGMD is especially strong on \textbf{Ant}, \textbf{HalfCheetah}, and \textbf{Swimmer}.
+    \item It remains competitive on the other MuJoCo tasks while staying fully model-free.
+    \item The gains come from \textbf{better inference-time policy extraction}, not a more complicated policy-training loss.
+\end{itemize}
+\end{block}
+
+\vspace{0.8cm}
+
+\begin{block}{\Large Main Takeaways}
+\small
+\begin{itemize}
+    \item \textbf{Mirror descent} defines the desired policy update.
+    \item \textbf{Diffusion} gives an expressive policy class for multimodal actions.
+    \item \textbf{MALA} corrects clean-$Q$ guidance into a principled sampler for the level-wise tilted energies.
+    \item \textbf{Uniform diffusion training} stays simple because all value optimization happens at inference time.
+    \item \textbf{Inference-time compute} becomes a real scaling axis: more corrector steps can improve the realized update.
+\end{itemize}
+\end{block}
+\end{column}
+\end{columns}
+\end{frame}
+\end{document}

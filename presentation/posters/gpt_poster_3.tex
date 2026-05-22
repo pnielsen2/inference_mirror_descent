@@ -1,0 +1,234 @@
+\documentclass[final,hyperref={pdfpagelabels=false}]{beamer}
+\usepackage[orientation=landscape,size=custom,width=121.92,height=91.44,scale=1.50]{beamerposter}
+\usetheme{default}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,shapes.geometric}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{algorithmic}
+\graphicspath{{../../figures/}{../figures/}{figures/}}
+\definecolor{harvardcrimson}{RGB}{165,28,48}
+\definecolor{accent}{HTML}{2171B5}
+\definecolor{greenaccent}{HTML}{2E7D32}
+\definecolor{orangeaccent}{HTML}{E65100}
+\definecolor{lightgray}{RGB}{245,245,245}
+\definecolor{darkgray}{RGB}{60,60,60}
+\setbeamercolor{headline}{bg=harvardcrimson,fg=white}
+\setbeamercolor{block title}{bg=harvardcrimson,fg=white}
+\setbeamercolor{block body}{bg=lightgray,fg=darkgray}
+\setbeamerfont{block title}{size=\Large,series=\bfseries}
+\setbeamerfont{headline title}{size=\Huge,series=\bfseries}
+\setbeamertemplate{navigation symbols}{}
+\newlength{\sepwidth}
+\newlength{\colwidth}
+\setlength{\sepwidth}{0.02\paperwidth}
+\setlength{\colwidth}{0.30\paperwidth}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\Var}{\mathrm{Var}}
+\DeclareMathOperator{\clip}{clip}
+\begin{document}
+\begin{frame}[t]
+\begin{beamercolorbox}[wd=\paperwidth,ht=10cm]{headline}
+\vspace{1cm}
+\centering
+{\fontsize{72}{80}\selectfont\bfseries MALA-Guided Mirror Descent}\\[0.8cm]
+{\fontsize{40}{48}\selectfont Inference-Time Policy Extraction for Diffusion Reinforcement Learning}\\[1cm]
+{\fontsize{34}{40}\selectfont Philp Nielsen}\\[0.5cm]
+\end{beamercolorbox}
+\vspace{1cm}
+\begin{columns}[t]
+\begin{column}{\colwidth}
+\begin{block}{\Large Motivation: Mirror Descent for Diffusion Policies}
+\small
+Mirror descent says the next policy should be an exponential tilt of the current one:
+\[
+\pi_{\mathrm{new}}(a\mid s)\propto \pi_{\mathrm{old}}(a\mid s)\exp\!\bigl(\eta Q(s,a)\bigr).
+\]
+For diffusion policies, the hard part is sampling from this target when actions are produced by iterative denoising rather than a single analytic draw.
+
+\vspace{0.3em}
+\textbf{MGMD strategy:}
+\begin{itemize}
+  \item keep policy training as standard denoising,
+  \item improve actions at inference time with guided sampling,
+  \item write those better actions back into replay.
+\end{itemize}
+\end{block}
+
+\vspace{0.8cm}
+
+\begin{block}{\Large Diffusion Policies and Tweedie Guidance}
+\small
+A diffusion policy denoises Gaussian noise into an action:
+\[
+q(a_t\mid a_0)=\mathcal{N}\!\bigl(\sqrt{\bar\alpha_t}\,a_0,(1-\bar\alpha_t)I\bigr),
+\qquad a_T\sim\mathcal{N}(0,I).
+\]
+The denoiser gives a clean estimate via Tweedie's formula,
+\[
+\hat a_0(a_t)=\frac{a_t-\sqrt{1-\bar\alpha_t}\,\hat\epsilon_\theta(a_t,s,t)}{\sqrt{\bar\alpha_t}}.
+\]
+A clean critic can then guide the reverse process:
+\[
+\hat\epsilon_t^{\mathrm{Tw}}(a_t)=\hat\epsilon_\theta(a_t,s,t)-\eta\sqrt{1-\bar\alpha_t}\,\nabla_{a_t}\bar Q\!\bigl(s,\hat a_0(a_t)\bigr).
+\]
+
+\vspace{0.3em}
+\begin{itemize}
+  \item guidance is evaluated on clean actions rather than noisy ones,
+  \item as $t\to 0$, the endpoint approaches the mirror-descent tilt.
+\end{itemize}
+\end{block}
+
+\vspace{0.8cm}
+
+\begin{block}{\Large Why Naive Tweedie Guidance Is Not Enough}
+\small
+Clean-$Q$ Tweedie guidance is strong in practice, but for $t>0$ it does \textbf{not} match the exact noisy marginals of a valid tilted diffusion.
+
+\vspace{0.3em}
+MGMD therefore inserts MCMC corrections between predictor steps so each diffusion level still targets a principled distribution.
+
+\vspace{0.5em}
+\begin{center}
+\resizebox{0.95\textwidth}{!}{%
+\begin{tikzpicture}[>=Stealth, font=\small,
+    flowbox/.style={draw=accent, thick, rounded corners=3pt, fill=white,
+                 minimum width=3.2cm, minimum height=1.0cm, align=center}]
+  \node[flowbox] (nT) at (0,0) {$a_T\sim\mathcal{N}(0,I)$};
+  \node[flowbox] (corr) at (4.2,0) {MALA\\corrector};
+  \node[flowbox] (pred) at (8.4,0) {guided DDIM\\predictor};
+  \node at (11.1,0) {$\cdots$};
+  \node[flowbox] (corr2) at (13.8,0) {MALA\\corrector};
+  \node[flowbox, draw=orangeaccent, fill=orangeaccent!10] (a0) at (18.0,0) {$a_0$ for action\\selection};
+  \draw[->, thick] (nT) -- (corr);
+  \draw[->, thick] (corr) -- (pred);
+  \draw[->, thick] (pred) -- (11.6,0);
+  \draw[->, thick] (12.0,0) -- (corr2);
+  \draw[->, thick] (corr2) -- (a0);
+\end{tikzpicture}%
+}
+\end{center}
+\end{block}
+\end{column}
+
+\begin{column}{\colwidth}
+\begin{block}{\Large Energy Parameterization and the Level-Wise Target}
+\small
+MGMD uses an energy-based policy network, so
+\[
+\nabla_{a_t}\log p_\theta(a_t\mid s,t)=-\nabla_{a_t}E_\theta(a_t,s,t).
+\]
+At each diffusion level, the guided target is
+\[
+q_t(a_t\mid s)\propto \exp\!\Bigl(-E_\theta(a_t,s,t)+\eta\,\bar Q\bigl(s,\hat a_0(a_t)\bigr)\Bigr).
+\]
+These targets bridge the Gaussian prior at high noise and the mirror-descent policy update near $t=0$.
+
+\vspace{0.3em}
+\begin{itemize}
+  \item $\nabla E$ gives Langevin proposal directions,
+  \item energy differences give the Metropolis correction.
+\end{itemize}
+\end{block}
+
+\vspace{0.8cm}
+
+\begin{block}{\Large MALA Corrector at Each Noise Level}
+\small
+After each predictor step, MGMD runs MALA:
+\[
+a_t' = a_t-s_t\nabla_{a_t}E_t^{\mathrm{guided}}(a_t,s)+\sqrt{2s_t}\,z,
+\qquad z\sim\mathcal{N}(0,I).
+\]
+Metropolis--Hastings removes finite-step Langevin bias, and each diffusion level adapts its own step size toward the standard acceptance target $0.574$.
+
+\vspace{0.3em}
+\begin{itemize}
+  \item gradients steer proposals toward high-value actions,
+  \item MH preserves the desired level-wise target distribution.
+\end{itemize}
+\end{block}
+
+\vspace{0.8cm}
+
+\begin{block}{\Large Online RL Training Loop}
+\small
+\begin{algorithmic}[1]
+\STATE Sample an environment action with MGMD and the mean critic
+\STATE Store $(s,a,r,s',d)$ in replay
+\STATE Sample next-state actions with clipped double-$Q$ targets
+\STATE Update critics with off-policy TD learning
+\STATE Refit the policy with the standard denoising loss
+\end{algorithmic}
+\[
+\mathcal{L}_{\mathrm{diff}}(\theta)=\E\bigl[\|\epsilon_\theta(a_t,s,t)-\epsilon\|^2\bigr].
+\]
+Guided actions in replay are gradually distilled back into the base diffusion policy.
+\end{block}
+
+\vspace{0.8cm}
+
+\begin{block}{\Large Adaptive Guidance Strength}
+\small
+A KL budget gives a scale-invariant starting point for the global guidance strength:
+\[
+\eta_{\mathrm{KL}}=\sqrt{\frac{2\Delta}{\E_s[\Var_{\pi}(Q(s,\cdot))]}}.
+\]
+The presentation then adds a distribution-shift correction so $\eta$ decreases when stronger tilting would make the critic unreliable.
+
+\vspace{0.3em}
+\begin{itemize}
+  \item larger steps when the value signal is trustworthy,
+  \item smaller steps when aggressive tilting risks stale-$Q$ errors.
+\end{itemize}
+\end{block}
+\end{column}
+
+\begin{column}{\colwidth}
+\begin{block}{\Large Why MGMD Is Different}
+\small
+\begin{itemize}
+  \item \textbf{Simple training:} no DPMD-style $Q$-weighted diffusion loss.
+  \item \textbf{Clean critic:} no need to learn a noisy-input $Q_t(s,a_t)$.
+  \item \textbf{Direct improvement:} extra inference-time compute improves sampled actions immediately.
+\end{itemize}
+\end{block}
+
+\vspace{0.8cm}
+
+\begin{block}{\Large Results on MuJoCo Online RL}
+\begin{center}
+\includegraphics[width=\textwidth]{eta45_vs_baselines.png}
+\end{center}
+
+\vspace{0.2em}
+\small
+The requested plot compares MGMD against DPMD and standard baselines across six MuJoCo tasks.
+
+\vspace{0.3em}
+\begin{itemize}
+  \item MGMD is especially strong on Ant, HalfCheetah, and Swimmer.
+  \item Performance remains competitive on the harder tasks while keeping the method fully model-free.
+  \item The gains come from better inference-time policy extraction, not from a more elaborate diffusion training loss.
+\end{itemize}
+\end{block}
+
+\vspace{0.8cm}
+
+\begin{block}{\Large Takeaway}
+\small
+MGMD turns expensive diffusion sampling into an optimization procedure:
+\begin{itemize}
+  \item mirror descent specifies the target policy update,
+  \item Tweedie guidance supplies a strong clean-$Q$ signal,
+  \item MALA makes the sampler target a principled distribution.
+\end{itemize}
+The result is a model-free diffusion RL method with simple training and a meaningful inference-time compute knob.
+\end{block}
+\end{column}
+\end{columns}
+\end{frame}
+\end{document}
