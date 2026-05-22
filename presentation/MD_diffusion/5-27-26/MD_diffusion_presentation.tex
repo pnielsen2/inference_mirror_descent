@@ -48,7 +48,7 @@
   height=210pt,
 }
 
-\graphicspath{{figures/}{../figures/}}
+\graphicspath{{../../figures/}{../../../figures/}}
 
 \newcommand{\E}{\mathbb{E}}
 \newcommand{\KL}{\mathrm{KL}}
@@ -74,17 +74,17 @@
 \begin{fitcenter}
 \begin{algorithmic}[1]
 \REQUIRE Policy $\pi_\theta$ (diffusion), critics $Q_{\phi_k}$, replay buffer $\mathcal{D}$
-\REQUIRE Guidance $\eta$, discount $\gamma$, target update rate $\tau_Q$
+\REQUIRE Energy scale $\alpha$, guidance $\beta$, discount $\gamma$, target update rate $\tau_Q$
 \STATE Initialize target network parameters: $\bar{\phi}_k \leftarrow \phi_k$
 \FOR{each environment step}
   \STATE \textcolor{gray}{\textit{// Sample action}}
-  \STATE $a \leftarrow \textsc{SampleFromTiltedPolicy}(s,\, \pi_\theta,\, \tfrac{1}{2}(Q_{\phi_1}{+}Q_{\phi_2}),\, \eta)$ \COMMENT{Alg.~2; mean Q for env}
+  \STATE $a \leftarrow \textsc{SampleFromTiltedPolicy}(s,\, \pi_\theta,\, \tfrac{1}{2}(Q_{\phi_1}{+}Q_{\phi_2}),\, \alpha,\,\beta)$ \COMMENT{Alg.~2; mean Q for env}
   \STATE \textcolor{gray}{\textit{// Collect experience}}
   \STATE Execute $a$; observe reward $r$, next state $s'$, termination flag $d$
   \STATE $\mathcal{D} \leftarrow \mathcal{D} \cup \{(s, a, r, s', d)\}$
   \STATE \textcolor{gray}{\textit{// Critic update}}
   \STATE Sample minibatch $\{(s_j, a_j, r_j, s'_j, d_j)\}_{j=1}^B \sim \mathcal{D}$
-  \STATE $a'_j \leftarrow \textsc{SampleFromTiltedPolicy}(s'_j,\, \pi_\theta,\, \min(Q_{\phi_1},Q_{\phi_2}),\, \eta)$ \COMMENT{min Q for TD}
+  \STATE $a'_j \leftarrow \textsc{SampleFromTiltedPolicy}(s'_j,\, \pi_\theta,\, \min(Q_{\phi_1},Q_{\phi_2}),\, \alpha,\,\beta)$ \COMMENT{min Q for TD}
   \STATE $y_j \leftarrow r_j + \gamma\,(1{-}d_j)\,\min_k(Q_{\bar{\phi}_k}(s'_j, a'_j))$
   \STATE Update each $Q_{\phi_k}$ by minimizing $\frac{1}{B}\sum_j \textsc{Huber}_{30}(Q_{\phi_k}(s_j, a_j) - y_j)$
   \STATE $\bar{\phi}_k \leftarrow \tau_Q\,\phi_k + (1{-}\tau_Q)\,\bar{\phi}_k$ for $k{=}1,2$ \COMMENT{Polyak averaging}
@@ -164,11 +164,11 @@ which gives the Tweedie reconstruction
 \small
 Our clean mirror-descent target is the tilted policy
 \[
-\pi'(a\mid s)\propto \pi_\theta(a\mid s)\,\exp\!\bigl(\eta\,Q(s,a)\bigr).
+\pi_{\mathrm{new}}(a\mid s)\propto \pi_{\mathrm{old}}(a\mid s)^\alpha\,\exp\!\bigl(\beta\,Q(s,a)\bigr).
 \]
 At intermediate noise levels, a natural idea is to define a noise-conditional guided predictor,
 \[
-\hat\epsilon_t^{\mathrm{guided}}(x_t) = \hat\epsilon_\theta(x_t,s,t) - \eta\sqrt{1-\bar\alpha_t}\,\nabla_{x_t}Q_t(s,x_t),
+\hat\epsilon_t^{\mathrm{guided}}(x_t) = \alpha\,\hat\epsilon_\theta(x_t,s,t) - \beta\sqrt{1-\bar\alpha_t}\,\nabla_{x_t}Q_t(s,x_t),
 \qquad
 Q_t(s,x_t) \approx \mathbb{E}[Q(s,x_0)\mid x_t,s].
 \]
@@ -176,7 +176,7 @@ Q_t(s,x_t) \approx \mathbb{E}[Q(s,x_0)\mid x_t,s].
 \medskip
 If $Q_t$ is perfectly trained, then replacing $\hat\epsilon_\theta$ with $\hat\epsilon_t^{\mathrm{guided}}$ in standard diffusion samplers yields
 \[
-p_t^{\mathrm{tilt}}(x_t\mid s)\propto p_t(x_t\mid s)\,\exp\!\bigl(\eta\,Q_t(s,x_t)\bigr),
+p_t^{\mathrm{tilt}}(x_t\mid s)\propto p_t(x_t\mid s)^\alpha\,\exp\!\bigl(\beta\,Q_t(s,x_t)\bigr),
 \]
 
 \medskip
@@ -188,7 +188,7 @@ The difficulty is that $Q_t(s,x_t)$ is itself a hard object: it must summarize h
 \small
 Instead of learning a noise-conditional critic, we can guide with a clean critic evaluated at the Tweedie estimate:
 \[
-\hat\epsilon_t^{\mathrm{Tw}}(x_t) = \hat\epsilon_\theta(x_t,s,t) - \eta\sqrt{1-\bar\alpha_t}\,\nabla_{x_t}Q\bigl(s,\hat x_0(x_t,t)\bigr).
+\hat\epsilon_t^{\mathrm{Tw}}(x_t) = \alpha\,\hat\epsilon_\theta(x_t,s,t) - \beta\sqrt{1-\bar\alpha_t}\,\nabla_{x_t}Q\bigl(s,\hat x_0(x_t,t)\bigr).
 \]
 This is attractive in practice because the critic only needs to model clean actions and the guidance signal is typically much stronger, but this changes the level-wise score fields. In general,
 \[
@@ -197,7 +197,7 @@ This is attractive in practice because the critic only needs to model clean acti
 so Tweedie guidance is no longer the exact reverse process of a prescribed tilted diffusion model. That is, matching the distribution implied by a score field at a particular noise level doesn't imply matching the distribution at the next cleaner noise level under standard diffusion samplers. Still, the sequence has the right endpoints:
 \begin{itemize}
   \item at the highest noise level it starts near the Gaussian base distribution,
-  \item as $t\to 0$, $\hat x_0(x_t,t)\to x_0$, so the clean tilted density $\pi'(a\mid s)\propto \pi_\theta(a\mid s)e^{\eta Q(s,a)}$ is recovered.
+  \item as $t\to 0$, $\hat x_0(x_t,t)\to x_0$, so the clean composite target $\pi_{\mathrm{new}}(a\mid s)\propto \pi_{\mathrm{old}}(a\mid s)^\alpha e^{\beta Q(s,a)}$ is recovered.
 \end{itemize}
 This motivates MGMD: use clean-$Q$ Tweedie guidance for a strong practical signal, but correct the induced level-wise distributions so the guided actions are still theoretically sampled from a principled policy update distribution in functional space (Mirror Descent).
 \end{frame}
@@ -233,15 +233,15 @@ So there is a tradeoff: smaller $s$ improves asymptotic accuracy, but slows conv
 Metropolis--Hastings is useful when we already have a Markov chain $q(y\mid x)$ whose stationary distribution is close to the desired sampling distribution.
 
 \medskip
-If moves from $x$ to $y$ happen too often relative to the reverse moves, we restrict some of them using an acceptance probability $\alpha(x,y)$ so that detailed balance holds:
+If moves from $x$ to $y$ happen too often relative to the reverse moves, we restrict some of them using an acceptance probability $A(x,y)$ so that detailed balance holds:
 \[
-\rho(x)\,q(y\mid x)\,\alpha(x,y)
+\rho(x)\,q(y\mid x)\,A(x,y)
 =
-\rho(y)\,q(x\mid y)\,\alpha(y,x).
+\rho(y)\,q(x\mid y)\,A(y,x).
 \]
 One choice that handles both directions at once is
 \[
-\alpha(x,y)=\min\!\left\{1,\frac{\rho(y)\,q(x\mid y)}{\rho(x)\,q(y\mid x)}\right\}.
+A(x,y)=\min\!\left\{1,\frac{\rho(y)\,q(x\mid y)}{\rho(x)\,q(y\mid x)}\right\}.
 \]
 
 \medskip
@@ -376,14 +376,14 @@ This is why MGMD uses an energy-based policy network. Now both ingredients are a
  \mathcal{L}_{\mathrm{diff}}(\theta)=\mathbb{E}_{x_0,\epsilon,t}\left[\left\lVert \hat\epsilon_\theta\!\left(s,\sqrt{\bar\alpha_t}x_0+\sqrt{1-\bar\alpha_t}\,\epsilon,t\right)-\epsilon\right\rVert^2\right].
  \]
 
- define the guided energy
+ define the composite guided energy
  \[
- E_t^{\mathrm{guided}}(x_t)=E_\theta(s,x_t,t)-\eta\,Q\bigl(s,\hat x_0(x_t,t)\bigr).
+ E_t^{\mathrm{guided}}(x_t)=\alpha\,E_\theta(s,x_t,t)-\beta\,Q\bigl(s,\hat x_0(x_t,t)\bigr).
  \]
  Therefore,
  \[
  \sqrt{1-\bar\alpha_t}\,\nabla_{x_t}E_t^{\mathrm{guided}}(x_t)
- = \hat\epsilon_\theta(s,x_t,t)-\eta\sqrt{1-\bar\alpha_t}\,\nabla_{x_t}Q\bigl(s,\hat x_0(x_t,t)\bigr)
+ = \alpha\,\hat\epsilon_\theta(s,x_t,t)-\beta\sqrt{1-\bar\alpha_t}\,\nabla_{x_t}Q\bigl(s,\hat x_0(x_t,t)\bigr)
  = \hat\epsilon_t^{\mathrm{Tw}}(x_t).
  \]
  \end{frame}
@@ -402,7 +402,7 @@ This is why MGMD uses an energy-based policy network. Now both ingredients are a
  where $s_t$ is the MALA step size at that noise level. Applying MH to this proposal gives MALA, with acceptance probability
  \[
  \begin{aligned}
-\alpha(x,x')&=\min\!\left\{1,\exp\!\left(E_t^{\mathrm{guided}}(x)-E_t^{\mathrm{guided}}(x')\right.
+A(x,x')&=\min\!\left\{1,\exp\!\left(E_t^{\mathrm{guided}}(x)-E_t^{\mathrm{guided}}(x')\right.
  + \left.\frac{\|x'-\mu(x)\|^2-\|x-\mu(x')\|^2}{4s_t}\right)\right\}.
 \end{aligned}
 \]
@@ -410,24 +410,51 @@ So MALA removes the need to send $s_t\to 0$ for correctness. We can take reasona
 \end{frame}
 
 % ═══════════════════════════════════════════════════════════════════════════════
+\begin{frame}{Why Parameterize by $(\alpha,T)$ Instead of $(\alpha,\beta)$?}
+\small
+Start from the composite update
+\[
+\pi_{k+1}(a\mid s)\propto \pi_k(a\mid s)^\alpha\,\exp\!\bigl(\beta\,Q(s,a)\bigr).
+\]
+Set
+\[
+\beta=\frac{1-\alpha}{T}.
+\]
+So in log-density form,
+\[
+\log \pi_{k+1}(a\mid s)
+= \alpha\log \pi_k(a\mid s) + (1-\alpha)\frac{Q(s,a)}{T} - \log Z_k(s).
+\]
+At a fixed point,
+\[
+\pi_*(a\mid s)\propto \exp\!\bigl(Q(s,a)/T\bigr).
+\]
+\begin{itemize}
+  \item $\alpha$: memory / relaxation rate,
+  \item $T$: asymptotic Boltzmann temperature (analogous to SAC's entropy temperature $\alpha$, since SAC has $\pi^*(a\mid s)\propto e^{Q(s,a)/\alpha}$),
+  \item sweeping $(\alpha,T)$ separates update timescale from exploitation sharpness.
+\end{itemize}
+\end{frame}
+
+% ═══════════════════════════════════════════════════════════════════════════════
 \begin{frame}{Algorithm 2: \textsc{SampleFromTiltedPolicy} (MALA $+$ DDIM)}
 \small
 \begin{fitcenter}
 \begin{algorithmic}[1]
-\REQUIRE State $s$, energy policy $E_\theta$, aggregated critic $\bar Q(s,a)$, guidance $\eta$
+\REQUIRE State $s$, energy policy $E_\theta$, aggregated critic $\bar Q(s,a)$, energy scale $\alpha$, guidance $\beta$
 \REQUIRE Schedule $\{\bar\alpha_t\}$, per-level step sizes $\{s_t\}$.
 \REQUIRE Q-eval clip $r_Q$, MALA steps $M$
 \STATE $\hat\epsilon_\theta(x,t)\coloneqq\sqrt{1{-}\bar\alpha_t}\,\nabla_x E_\theta(s,x,t)$
 \STATE $\hat x_{0,r_Q}(x,t)\coloneqq \mathrm{clip}\!\left(\tfrac{x-\sqrt{1{-}\bar\alpha_t}\,\hat\epsilon_\theta(x,t)}{\sqrt{\bar\alpha_t}},\;{-}r_Q,\;r_Q\right)$
-\STATE $E_t^{\mathrm{guided}}(x)\coloneqq E_\theta(s,x,t)-\eta\,\bar Q\bigl(s,\hat x_{0,r_Q}(x,t)\bigr)$
+\STATE $E_t^{\mathrm{guided}}(x)\coloneqq \alpha\,E_\theta(s,x,t)-\beta\,\bar Q\bigl(s,\hat x_{0,r_Q}(x,t)\bigr)$
 \STATE Sample $x_T\sim\mathcal{N}(0,I)$
 \FOR{$t=T,\dots,1$}
   \STATE \textcolor{gray}{\textit{// corrector step}}
   \FOR{$m=1,\dots,M$}
     \STATE $\mu\leftarrow x_t-s_t\nabla E_t^{\mathrm{guided}}(x_t)$;\quad Sample proposal $x'\sim\mathcal{N}(\mu,2s_tI)$ \COMMENT{Langevin proposal}
     \STATE $\mu'\leftarrow x'-s_t\nabla E_t^{\mathrm{guided}}(x')$ \COMMENT{reverse proposal mean}
-    \STATE $\alpha\leftarrow\min\!\left\{1,\exp\!\bigl(E_t^{\mathrm{guided}}(x_t)-E_t^{\mathrm{guided}}(x')\bigr)\tfrac{\mathcal{N}(x_t;\mu',2s_tI)}{\mathcal{N}(x';\mu,2s_tI)}\right\}$ \COMMENT{MH accept prob.}
-    \STATE Set $x_t\leftarrow x'$  with probability $\alpha$ \COMMENT{accept/reject}
+    \STATE $A\leftarrow\min\!\left\{1,\exp\!\bigl(E_t^{\mathrm{guided}}(x_t)-E_t^{\mathrm{guided}}(x')\bigr)\tfrac{\mathcal{N}(x_t;\mu',2s_tI)}{\mathcal{N}(x';\mu,2s_tI)}\right\}$ \COMMENT{MH accept prob.}
+    \STATE Set $x_t\leftarrow x'$  with probability $A$ \COMMENT{accept/reject}
     \STATE Update $s_t$ online using the current accept/reject outcome \COMMENT{adapt toward target rate}
   \ENDFOR
   \STATE \textcolor{gray}{\textit{// predictor step}}
