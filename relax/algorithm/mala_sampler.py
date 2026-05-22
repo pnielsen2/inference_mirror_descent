@@ -76,7 +76,7 @@ def build_mala_sampler(
         # min(η_KL, η*) (one-step dist-shift), depending on run config.
         def energy_total(t, x):
             E_mod = energy_multiplier * model.energy_fn(policy_params, obs, x, t)
-            noise_pred = model.policy(policy_params, obs, x, t)
+            noise_pred = model.eps_pred(policy_params, obs, x, t)
             x0_hat = reconstruct_x0_from_noise(x, t, noise_pred)
             clip_frac = jnp.mean((jnp.abs(x0_hat) > x0_hat_clip_radius).astype(jnp.float32))
             return E_mod - tfg_eta_current * q_aggregated_at_clipped_x0_hat(x0_hat), clip_frac
@@ -84,7 +84,7 @@ def build_mala_sampler(
         def guidance_value_from_x(x_in, t_idx):
             # Tweedie-clean prediction with energy_multiplier-tempered base
             # score; guidance component is NOT scaled.
-            eps_pred = model.policy(policy_params, obs, x_in, t_idx)
+            eps_pred = model.eps_pred(policy_params, obs, x_in, t_idx)
             x0_hat = reconstruct_x0_from_noise(x_in, t_idx, eps_pred)
             q = q_aggregated_at_clipped_x0_hat(x0_hat)
 
@@ -98,7 +98,7 @@ def build_mala_sampler(
         # ---- DDIM predictor step (guided or unguided, chosen at build time) ----
         if mala_guided_predictor:
             def ddim_step(t_idx, x_in):
-                noise_pred_scaled = energy_multiplier * model.policy(policy_params, obs, x_in, t_idx)
+                noise_pred_scaled = energy_multiplier * model.eps_pred(policy_params, obs, x_in, t_idx)
                 grad_q = compute_guidance_gradient(x_in, t_idx)
                 sigma_t = schedule.sqrt_one_minus_alphas_cumprod[t_idx]
                 eps_pred = noise_pred_scaled - tfg_eta_current * sigma_t * grad_q
@@ -107,7 +107,7 @@ def build_mala_sampler(
                 return x0_hat * schedule.posterior_mean_coef1[t_idx] + x_in * schedule.posterior_mean_coef2[t_idx]
         else:
             def ddim_step(t_idx, x_in):
-                noise_pred_scaled = energy_multiplier * model.policy(policy_params, obs, x_in, t_idx)
+                noise_pred_scaled = energy_multiplier * model.eps_pred(policy_params, obs, x_in, t_idx)
                 x0_hat = jnp.clip(reconstruct_x0_from_noise(x_in, t_idx, noise_pred_scaled),
                                    -x_recon_clip_radius, x_recon_clip_radius)
                 return x0_hat * schedule.posterior_mean_coef1[t_idx] + x_in * schedule.posterior_mean_coef2[t_idx]

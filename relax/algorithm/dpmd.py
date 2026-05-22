@@ -170,7 +170,7 @@ class DPMD:
                 )
                 noise = jax.random.normal(diffusion_noise_key, tilted_action.shape)
                 tilted_action_noisy = self.model.q_sample(t, tilted_action, noise)
-                noise_pred = self.model.policy(policy_params, next_obs, tilted_action_noisy, t)
+                noise_pred = self.model.eps_pred(policy_params, next_obs, tilted_action_noisy, t)
                 return optax.squared_error(noise_pred, noise).mean()
 
             total_loss, policy_grads = jax.value_and_grad(policy_loss_fn)(policy_params)

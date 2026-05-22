@@ -76,6 +76,8 @@ def build_per_seed_state(
         num_q_networks=args.num_q_networks,
         x_recon_clip_radius=1.0,
         snr_max=args.snr_max,
+        policy_parameterization=args.policy_parameterization,
+        policy_final_layer=args.policy_final_layer,
     )
     params_list = [model.init_params(k) for k in seeds.init_keys]
     return model, params_list, buffers_list
