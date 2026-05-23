@@ -15,22 +15,33 @@ from relax.utils.seeding import SeedBundle
 
 
 def resolve_kl_budget(args, act_dim: int) -> None:
-    """Mutate ``args`` in place to apply the KL-budget → η / V-net promotion.
+    """Mutate ``args`` in place to resolve the composite MD guidance parameters.
+
+    Resolution order (later steps override earlier ones):
 
     * ``--kl_budget_per_dim`` is converted to a total ``args.kl_budget``
       (multiplied by ``act_dim``).
-    * When a KL budget is set (either flag), ``tfg_eta`` is derived as
-      ``sqrt(2 * δ)`` and the V-network / on-policy advantage EMA path is
-      enabled downstream (DPMD reads ``cfg.kl_budget is not None``).
+    * ``--T`` derives ``args.beta = (1 - args.alpha) / T``.
+    * When a KL budget is set (either flag), ``beta`` is overridden as
+      the initial KL-budget coefficient ``sqrt(2 * δ / M_0)`` with
+      ``M_0 = args.initial_advantage_second_moment_ema``; the V-network /
+      on-policy advantage EMA path is enabled downstream (DPMD reads
+      ``cfg.kl_budget is not None``).
+    * If ``beta`` is still ``None`` after the above (neither ``--beta``,
+      ``--T``, nor ``--kl_budget`` was supplied), it defaults to ``0.0``.
 
-    The mutual-exclusion check between ``--kl_budget`` and
-    ``--kl_budget_per_dim`` is enforced upstream in
+    Mutual-exclusion checks between ``--kl_budget`` / ``--kl_budget_per_dim``
+    and between ``--beta`` / ``--T`` are enforced upstream in
     :func:`relax.cli.train_args.validate_args`.
     """
     if args.kl_budget_per_dim is not None:
         args.kl_budget = args.kl_budget_per_dim * act_dim
+    if args.T is not None:
+        args.beta = (1.0 - args.alpha) / args.T
     if args.kl_budget is not None:
-        args.tfg_eta = float((2.0 * args.kl_budget) ** 0.5)
+        args.beta = float((2.0 * args.kl_budget / max(args.initial_advantage_second_moment_ema, 1e-6)) ** 0.5)
+    if args.beta is None:
+        args.beta = 0.0
 
 
 def _mish(x: jax.Array) -> jax.Array:

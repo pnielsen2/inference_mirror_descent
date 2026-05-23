@@ -3,7 +3,7 @@
 Trains `num_runs` independent RL runs in parallel on a single device via ``jax.vmap``
 over the algorithm's ``stateless_update`` and ``stateless_get_action``.
 Currently supports the DPMD packed multi-run path for both the
-KL-budget/on-policy-EMA setting and fixed-tfg_eta mode. Unsupported features
+KL-budget/on-policy-EMA setting and fixed-beta mode. Unsupported features
 still raise at construction time so failures are loud, not silent.
 
 Layout (Option B):
@@ -168,10 +168,10 @@ class VmapOffPolicyTrainer:
         # Pick the on-policy EMA update path once at construction time. Off
         # by default; the rollout block in sample() invokes this only when
         # the algorithm advertises on_policy_ema=True (i.e. --kl_budget set).
-        if bool(getattr(self.algorithm, "one_step_dist_shift_eta", False)):
-            self._update_eta = self._ema_update_one_step
+        if bool(getattr(self.algorithm, "one_step_dist_shift_beta", False)):
+            self._update_beta = self._ema_update_one_step
         else:
-            self._update_eta = self._ema_update_kl_only
+            self._update_beta = self._ema_update_kl_only
 
     # ------------------------------------------------------------------
     # Setup
@@ -239,12 +239,12 @@ class VmapOffPolicyTrainer:
         term_nm  = term_flat.reshape(self.num_runs, self.envs_per_run)
         trunc_nm = trunc_flat.reshape(self.num_runs, self.envs_per_run)
 
-        # Update η + moment EMAs in algorithm.state.
+        # Update β + moment EMAs in algorithm.state.
         # When using one-step dist-shift, also save raw A = Q-V and the done mask
         # for the next step's cross-step covariance estimator ĉ = mean((A')²·A).
         if getattr(self.algorithm, "on_policy_ema", False) and v_per_env is not None:
-            self._update_eta(q_per_env, v_per_env)
-            if bool(getattr(self.algorithm, "one_step_dist_shift_eta", False)):
+            self._update_beta(q_per_env, v_per_env)
+            if bool(getattr(self.algorithm, "one_step_dist_shift_beta", False)):
                 self._prev_adv_per_env = (q_per_env - v_per_env).copy()
                 self._prev_valid = ~(term_nm | trunc_nm)
 
@@ -259,7 +259,7 @@ class VmapOffPolicyTrainer:
         return obs_flat
 
     # ------------------------------------------------------------------
-    # On-policy EMA + adaptive-η update (host-side, run-axis-vectorized).
+    # On-policy EMA + adaptive-β update (host-side, run-axis-vectorized).
     # The two pure paths live in ``relax.algorithm.ema_eta``; we just
     # dispatch and replace the train state.
     # ------------------------------------------------------------------

@@ -52,16 +52,16 @@ class DPMD:
         self._hidden_dim = int(hidden_dim)
         # Derived/exposed flags. Everything else lives on ``self.cfg``; the
         # two attributes below are also read off the algorithm by the
-        # trainer (``algorithm.on_policy_ema`` / ``algorithm.one_step_dist_shift_eta``).
+        # trainer (``algorithm.on_policy_ema`` / ``algorithm.one_step_dist_shift_beta``).
         self.on_policy_ema = (cfg.kl_budget is not None)
-        self.one_step_dist_shift_eta = bool(cfg.one_step_dist_shift_eta)
+        self.one_step_dist_shift_beta = bool(cfg.one_step_dist_shift_beta)
         self.policy_loss_key = "losses/Policy_epsilon_MSE"
 
         # --- Optimizers: unscaled Adam; per-seed state.lr_{q,policy} is applied at update time. ---
         self.optim = optax.scale_by_adam()
         self.policy_optim = optax.scale_by_adam()
 
-        # --- Optional V(s) network for normalized-advantage guidance (KL-budget / on-policy-EMA mode). ---
+        # --- Optional V(s) network for KL-budget / on-policy-EMA beta adaptation and logging. ---
         value_params_init, value_opt_state_init = self._setup_value_network(params)
 
         self._timesteps = int(self.model.num_timesteps)
@@ -75,19 +75,17 @@ class DPMD:
 
         # --- Stateless update / sampler closures (jit-able, vmap-able). ---
         # Build the MALA sampler; body lives in relax.algorithm.mala_sampler.
-        sampler = build_mala_sampler(
-            model=self.model,
-            value_head=self.value_head,
-            timesteps=self._timesteps,
-            energy_multiplier=self.cfg.energy_multiplier,
+        _sampler_kw = dict(
+            model=self.model, value_head=self.value_head, timesteps=self._timesteps,
             batch_independent_guidance=self.cfg.batch_independent_guidance,
             mala_guided_predictor=self.cfg.mala_guided_predictor,
             mala_no_predictor=self.cfg.mala_no_predictor,
         )
+        sampler = build_mala_sampler(**_sampler_kw)
         # Both sampling paths (rollout + TD next-action) use --q_agg_sample aggregation.
         # The TD-backup target itself remains hardcoded to 'min' (clipped double-Q).
         agg_critic = lambda qm: _aggregate_q(qm, self.cfg.q_agg_sample)
-        updater = self._stateless_update(sampler, agg_critic)
+        updater = self._stateless_update(build_mala_sampler(**_sampler_kw, compute_final_q=False), agg_critic)
         stateless_get_action = lambda key, state, obs: sampler(key, state, obs, agg_critic)
         self._jit_vmap_update = jax.jit(jax.vmap(updater))
         self._jit_vmap_get_action = jax.jit(jax.vmap(stateless_get_action))
@@ -152,7 +150,7 @@ class DPMD:
                 state, obs, action, q_params, q_opt_states, q_backup_per_q
             )
 
-            # No-op when not doing adaptive eta
+            # No-op when not doing adaptive beta
             value_params_updated, value_opt_state_updated, value_loss_log = \
                 self._value_update_step(state, per_q_target_values, next_obs)
 
@@ -173,13 +171,13 @@ class DPMD:
                 noise_pred = self.model.eps_pred(policy_params, next_obs, tilted_action_noisy, t)
                 return optax.squared_error(noise_pred, noise).mean()
 
-            total_loss, policy_grads = jax.value_and_grad(policy_loss_fn)(policy_params)
-
-            # Policy + target-Q updates, both gated by step % delay_update == 0.
-            policy_params, policy_opt_state = delayed_param_update(
-                self.policy_optim, policy_params, policy_grads, policy_opt_state,
-                state.hp.lr_policy, step, self.cfg.delay_update,
-            )
+            def _do(_):
+                loss, grads = jax.value_and_grad(policy_loss_fn)(policy_params)
+                return (loss,) + delayed_param_update(
+                    self.policy_optim, policy_params, grads, policy_opt_state, state.hp.lr_policy, step, 1)
+            total_loss, policy_params, policy_opt_state = jax.lax.cond(
+                step % self.cfg.delay_update == 0, _do,
+                lambda _: (state.policy_loss, policy_params, policy_opt_state), None)
 
 
 
@@ -189,6 +187,7 @@ class DPMD:
                 step=step + 1,
                 log_eta_scales=mala_result.log_eta_scales,
                 value_params=value_params_updated,
+                policy_loss=total_loss,
             )
 
             # --- Losses ---
@@ -313,7 +312,7 @@ class DPMD:
         cfg = self.cfg
         # In-graph kl_budget sentinel: when --kl_budget is disabled (None),
         # store 1.0 so the value can still be a jnp.float32 in the vmappable
-        # HParams; the host-side η cap reads ``cfg.kl_budget`` directly.
+        # HParams; the host-side β cap reads ``cfg.kl_budget`` directly.
         kl_budget_val = 1.0 if cfg.kl_budget is None else cfg.kl_budget
         return Diffv2TrainState(
             params=params,
@@ -324,7 +323,7 @@ class DPMD:
             ),
             step=jnp.int32(0),
             log_eta_scales=jnp.zeros((self._timesteps,), dtype=jnp.float32),
-            tfg_eta=jnp.float32(cfg.tfg_eta),
+            beta=jnp.float32(cfg.beta),
             value_params=value_params_init,
             advantage_second_moment_ema=jnp.float32(cfg.initial_advantage_second_moment_ema),
             advantage_third_moment_ema=jnp.float32(0.0),
@@ -343,6 +342,7 @@ class DPMD:
                 x0_hat_clip_radius=jnp.float32(cfg.x0_hat_clip_radius),
                 mala_adapt_rate=jnp.float32(cfg.mala_adapt_rate),
                 q_td_huber_width=jnp.float32(cfg.q_td_huber_width),
+                alpha=jnp.float32(cfg.alpha),
             ),
         )
 

@@ -102,6 +102,7 @@ class WandbMultiSeedLogger:
         self.snr = None
 
     def init_runs(self):
+        os.environ.setdefault("WANDB__SERVICE_WAIT", "120")
         base_name = self.log_path.name
         # Keep group = env name (its original semantics). sweep_id is logged
         # as a regular config field so filtering in wandb is

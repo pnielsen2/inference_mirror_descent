@@ -10,13 +10,13 @@ Usage examples:
     python scripts/launch.py --cmd "python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4" --seeds 0 1 2 3 4
 
     # Ablation sweep (changes from base command)
-    python scripts/launch.py --cmd "python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4 --tfg_eta 16" \\
-        --ablate tfg_eta 8 16 32
+    python scripts/launch.py --cmd "python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4 --beta 16" \\
+        --ablate beta 8 16 32
 
     # Multiple ablations with seeds
     python scripts/launch.py --cmd "python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4" \\
         --seeds 100 101 102 \\
-        --ablate tfg_eta 8 16 32 \\
+        --ablate beta 8 16 32 \\
         --ablate num_particles 1 64 128
 
     # One-at-a-time (non-Cartesian) local sweep around the base command.
@@ -86,12 +86,14 @@ FLAG_TO_HP_KEY = {f: f for f in (
     "initial_advantage_second_moment_ema",
     "initial_dist_shift_shape_ema",
     "guidance_strength_multiplier",
-    "tfg_eta",
+    "beta",
     "kl_budget",
     "reward_scale",
     "x0_hat_clip_radius",
     "mala_adapt_rate",
     "q_td_huber_width",
+    "alpha",
+    "T",
 )}
 
 
@@ -208,6 +210,12 @@ def parse_args():
     # Sweep options
     parser.add_argument("--seeds", type=int, nargs="+", default=None,
                         help="List of seeds to run (adds --seed X to command)")
+    parser.add_argument("--seeds-per-config", "--seeds_per_config", type=int, default=0,
+                        dest="seeds_per_config",
+                        help="Assign N globally unique seeds per (hard, easy) config pair. "
+                             "Run i (0-indexed across the full sweep) gets seeds "
+                             "[i*N, ..., i*N+N-1], so no two runs in the sweep share a seed. "
+                             "Mutually exclusive with --seeds.")
     parser.add_argument("--ablate", action="append", nargs="+", metavar=("FLAG", "VALUES"),
                         help="Ablation: --ablate flag_name val1 val2 val3. Can be used multiple times.")
     parser.add_argument("--oat-ablate", "--oat_ablate", action="append", nargs="+",
@@ -289,6 +297,10 @@ def parse_args():
                             "runs).")
     parser.add_argument("--log-dir", type=str, default=None,
                         help="Directory for logs (default: logs/slurm/<timestamp>)")
+    parser.add_argument("--no-snapshot", dest="no_snapshot", action="store_true",
+                        help="Do not snapshot the codebase at submission time. Jobs will run "
+                             "from the live project directory, so edits made while jobs are "
+                             "pending will affect those runs. Useful for quick smoke tests.")
     
     args = parser.parse_args()
     if args.seas:
@@ -448,7 +460,7 @@ def _classify_ablations(ablations):
 
 
 def _generate_run_specs(base_cmd: str, seeds: list, ablations: list,
-                        oat_ablations: list) -> list:
+                        oat_ablations: list, seeds_per_config: int = 0) -> list:
     """Generate concrete run specs before vmap chunking.
 
     Each spec has fully resolved hard/easy overrides for one logical run
@@ -512,7 +524,7 @@ def _generate_run_specs(base_cmd: str, seeds: list, ablations: list,
             f"flags explicitly to --cmd: {missing}"
         )
 
-    seed_axis = list(seeds) if seeds else [None]
+    seed_axis = [None] if seeds_per_config > 0 else (list(seeds) if seeds else [None])
     runs = []
     seen = set()
     for hard_combo in regular_hard_combos:
@@ -550,11 +562,20 @@ def _generate_run_specs(base_cmd: str, seeds: list, ablations: list,
                         "seed": seed,
                         "desc_parts": desc_parts + ([f"seed={seed}"] if seed is not None else []),
                     })
+    if seeds_per_config > 0:
+        expanded = []
+        for i, run in enumerate(runs):
+            for j in range(seeds_per_config):
+                s = i * seeds_per_config + j
+                desc = run["desc_parts"] + ([f"seed={s}"] if s is not None else [])
+                expanded.append(dict(run, seed=s, desc_parts=desc))
+        runs = expanded
     return runs, base_values
 
 
 def generate_packs(base_cmd: str, seeds: list, ablations: list,
-                   oat_ablations: list, max_runs_per_gpu: int) -> list:
+                   oat_ablations: list, max_runs_per_gpu: int,
+                   seeds_per_config: int = 0) -> list:
     """Generate vmap packs.
 
     Each pack represents one SLURM job. A pack has either ``pack_size == 1``
@@ -580,7 +601,8 @@ def generate_packs(base_cmd: str, seeds: list, ablations: list,
       ``desc``    -- short human-readable description for logging.
       ``pack_size`` -- K (number of parallel vmap entries).
     """
-    runs, base_values = _generate_run_specs(base_cmd, seeds, ablations, oat_ablations)
+    runs, base_values = _generate_run_specs(base_cmd, seeds, ablations, oat_ablations,
+                                             seeds_per_config=seeds_per_config)
 
     grouped = OrderedDict()
     for run in runs:
@@ -747,6 +769,59 @@ def next_unused_sweep_id(project="pnielsen2-harvard/diffusion_online_rl"):
         return int(datetime.now().timestamp() // 60)
 
 
+def _snapshot_codebase(project_dir: Path, log_dir: Path) -> Path:
+    """Create a lightweight git worktree snapshot of the current codebase.
+
+    Uses ``git stash create`` to capture staged + unstaged changes as a
+    commit object without touching HEAD, the index, or the stash list. If the
+    working tree is already clean, snapshots HEAD directly.
+
+    The worktree shares the git object store with the source repo so no files
+    are copied. To clean up stale worktree entries after deleting old sweep
+    log directories, run ``git worktree prune`` in the project root.
+
+    Note: untracked files are not captured by ``git stash create``. Run
+    ``git add <file>`` before launching if any new untracked files are needed.
+
+    Returns the snapshot directory, or ``project_dir`` on failure.
+    """
+    snapshot_dir = log_dir / "codebase"
+
+    stash_result = subprocess.run(
+        ["git", "-C", str(project_dir), "stash", "create"],
+        capture_output=True, text=True,
+    )
+    snap_hash = stash_result.stdout.strip()
+
+    if not snap_hash:
+        snap_hash = subprocess.run(
+            ["git", "-C", str(project_dir), "rev-parse", "HEAD"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        if not snap_hash:
+            print("[launch.py] WARNING: could not determine git HEAD; "
+                  "falling back to live project dir.")
+            return project_dir
+        dirty = False
+    else:
+        dirty = True
+
+    wt_result = subprocess.run(
+        ["git", "-C", str(project_dir), "worktree", "add",
+         "--detach", str(snapshot_dir), snap_hash],
+        capture_output=True, text=True,
+    )
+    if wt_result.returncode != 0:
+        print(f"[launch.py] WARNING: git worktree snapshot failed: "
+              f"{wt_result.stderr.strip()}\n  Falling back to live project dir.")
+        return project_dir
+
+    dirty_marker = "+uncommitted" if dirty else ""
+    print(f"[launch.py] git worktree snapshot: {snapshot_dir}  "
+          f"(commit: {snap_hash[:12]}{dirty_marker})")
+    return snapshot_dir
+
+
 def main():
     args = parse_args()
 
@@ -760,6 +835,9 @@ def main():
         log_dir = project_dir / "logs" / "slurm" / timestamp
 
     log_dir.mkdir(parents=True, exist_ok=True)
+
+    if not args.no_snapshot and not args.dry_run:
+        project_dir = _snapshot_codebase(project_dir, log_dir)
 
     # Resolve sweep_id. Explicit --sweep-id > --no-sweep-id > auto-query wandb.
     if args.no_sweep_id:
@@ -782,6 +860,8 @@ def main():
     # Infer job name if not provided
     job_name_base = args.job_name or infer_job_name(args.cmd)
 
+    if args.seeds and args.seeds_per_config:
+        sys.exit("launch.py: --seeds and --seeds-per-config are mutually exclusive")
     if args.max_runs_per_gpu < 1:
         sys.exit(f"launch.py: --max-runs-per-gpu must be >= 1, got {args.max_runs_per_gpu}")
 
@@ -810,7 +890,7 @@ def main():
 
     # Generate all packs (each pack = one SLURM job).
     packs = generate_packs(base_cmd, args.seeds, args_ablate, args_oat_ablate,
-                           args.max_runs_per_gpu)
+                           args.max_runs_per_gpu, seeds_per_config=args.seeds_per_config)
 
     total_runs = sum(p["pack_size"] for p in packs)
     print(f"Generated {len(packs)} job(s) covering {total_runs} run(s) "

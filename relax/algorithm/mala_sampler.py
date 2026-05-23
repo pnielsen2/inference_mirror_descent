@@ -4,11 +4,10 @@ One full pass of the sampler:
 
 * Sample x_T ~ N(0, I), then for t = T-1 .. 0:
     1. ``mala_steps`` MALA correction steps targeting
-       ``E_total(t, x) = energy_multiplier * E_θ(s, x, t) - tfg_eta * Q_agg(s, x_0_hat)``.
-       (Q_agg is omitted when ``tfg_eta == 0`` so the eta-sweep
-       no-budget runs are unbiased.)
-    2. A deterministic DDIM-style predictor step (``--ddim_predictor`` is
-       hardcoded on). Skipped when ``--mala_no_predictor`` is set.
+       ``E_total(t, x) = alpha * E_θ(s, x, t) - beta * Q_agg(s, x_0_hat)``.
+       (Q_agg is omitted when ``beta == 0`` so zero-guidance
+       runs are unbiased.)
+    2. A deterministic DDIM-style predictor step. Skipped when ``--mala_no_predictor`` is set.
 * Return ``MalaSampleResult(action, q, log_eta_scales, per_level_acc,
   per_level_clip)`` with the per-level acceptance / clip arrays the trainer
   logs to wandb.
@@ -27,8 +26,8 @@ def build_mala_sampler(
     model: ActorCritic,
     value_head,                    # ValueHead | None — supplied iff on-policy-EMA / KL-budget mode
     timesteps: int,
-    energy_multiplier: float,
     batch_independent_guidance: bool,
+    compute_final_q: bool = True,
     mala_guided_predictor: bool,
     mala_no_predictor: bool,
 ) -> Callable:
@@ -48,7 +47,7 @@ def build_mala_sampler(
         policy_params = state.params.policy
         q_params_tuple = state.params.q
         log_eta_scales_in = state.log_eta_scales
-        tfg_eta_current = state.tfg_eta
+        beta_current = state.beta
         value_params = state.value_params
         x0_hat_clip_radius = state.hp.x0_hat_clip_radius
         mala_adapt_rate = state.hp.mala_adapt_rate
@@ -72,24 +71,26 @@ def build_mala_sampler(
             x0_clipped = jnp.clip(x0_hat, -x0_hat_clip_radius, x0_hat_clip_radius)
             return aggregate_q_fn([model.q(qp, obs, x0_clipped) for qp in q_params_tuple])
 
-        # tfg_eta_current = η: fixed constant, sqrt(2δ/M) (KL-budget), or
-        # min(η_KL, η*) (one-step dist-shift), depending on run config.
+        # beta_current = β: fixed constant, sqrt(2δ/M) (KL-budget), or
+        # min(β_KL, β*) (one-step dist-shift), depending on run config.
         def energy_total(t, x):
-            E_mod = energy_multiplier * model.energy_fn(policy_params, obs, x, t)
-            noise_pred = model.eps_pred(policy_params, obs, x, t)
+            E_vals, vjp_fn = jax.vjp(lambda a: model.energy_fn(policy_params, obs, a, t), x)
+            (e_grad,) = vjp_fn(jnp.ones_like(E_vals))
+            noise_pred = schedule.sqrt_one_minus_alphas_cumprod[t] * e_grad  # ε̂ = σ_t ∇_x E_θ
             x0_hat = reconstruct_x0_from_noise(x, t, noise_pred)
             clip_frac = jnp.mean((jnp.abs(x0_hat) > x0_hat_clip_radius).astype(jnp.float32))
-            return E_mod - tfg_eta_current * q_aggregated_at_clipped_x0_hat(x0_hat), clip_frac
+            return state.hp.alpha * E_vals - beta_current * q_aggregated_at_clipped_x0_hat(x0_hat), clip_frac
 
         def guidance_value_from_x(x_in, t_idx):
-            # Tweedie-clean prediction with energy_multiplier-tempered base
+            # Tweedie-clean prediction with alpha-scaled base
             # score; guidance component is NOT scaled.
             eps_pred = model.eps_pred(policy_params, obs, x_in, t_idx)
             x0_hat = reconstruct_x0_from_noise(x_in, t_idx, eps_pred)
             q = q_aggregated_at_clipped_x0_hat(x0_hat)
 
-            # KL-budget mode: guide on advantage A = Q - V.
-            # tfg_eta already encodes 1/sqrt(M) so A is used unnormalized.
+            # KL-budget mode adapts beta from advantage-moment statistics,
+            # but the sampling objective here still uses the same clipped-Q
+            # guidance term as the fixed-beta path.
             return guidance_multiplier * reduce_over_batch(q)
 
         def compute_guidance_gradient(x_in, t_idx):
@@ -98,16 +99,16 @@ def build_mala_sampler(
         # ---- DDIM predictor step (guided or unguided, chosen at build time) ----
         if mala_guided_predictor:
             def ddim_step(t_idx, x_in):
-                noise_pred_scaled = energy_multiplier * model.eps_pred(policy_params, obs, x_in, t_idx)
+                noise_pred_scaled = state.hp.alpha * model.eps_pred(policy_params, obs, x_in, t_idx)
                 grad_q = compute_guidance_gradient(x_in, t_idx)
                 sigma_t = schedule.sqrt_one_minus_alphas_cumprod[t_idx]
-                eps_pred = noise_pred_scaled - tfg_eta_current * sigma_t * grad_q
+                eps_pred = noise_pred_scaled - beta_current * sigma_t * grad_q
                 x0_hat = jnp.clip(reconstruct_x0_from_noise(x_in, t_idx, eps_pred),
                                    -x_recon_clip_radius, x_recon_clip_radius)
                 return x0_hat * schedule.posterior_mean_coef1[t_idx] + x_in * schedule.posterior_mean_coef2[t_idx]
         else:
             def ddim_step(t_idx, x_in):
-                noise_pred_scaled = energy_multiplier * model.eps_pred(policy_params, obs, x_in, t_idx)
+                noise_pred_scaled = state.hp.alpha * model.eps_pred(policy_params, obs, x_in, t_idx)
                 x0_hat = jnp.clip(reconstruct_x0_from_noise(x_in, t_idx, noise_pred_scaled),
                                    -x_recon_clip_radius, x_recon_clip_radius)
                 return x0_hat * schedule.posterior_mean_coef1[t_idx] + x_in * schedule.posterior_mean_coef2[t_idx]
@@ -212,8 +213,10 @@ def build_mala_sampler(
         )
 
         act_final = jnp.clip(x_0, -1.0, 1.0)
-        final_q_values = [model.q(qp, obs, act_final) for qp in q_params_tuple]
-        final_q = aggregate_q_fn(final_q_values)
+        if compute_final_q:
+            final_q = aggregate_q_fn([model.q(qp, obs, act_final) for qp in q_params_tuple])
+        else:
+            final_q = jnp.zeros(obs.shape[:-1])
         return MalaSampleResult(
             action=act_final, q=final_q, log_eta_scales=log_eta_scales_out,
             per_level_acc=per_level_acc_out, per_level_clip=per_level_clip_frac_out,

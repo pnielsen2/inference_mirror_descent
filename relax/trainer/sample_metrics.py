@@ -8,7 +8,7 @@ does":
   q_var) computed from the rollout outputs, buffer.add_batch, SampleLog.add;
 * per-run episode-return drain (wandb scalar + local CSV mirror that
   survives wandb rate-limit drops);
-* periodic ``Global_EMAs/*`` flush of η / advantage moments / one-step
+* periodic ``Global_EMAs/*`` flush of β / advantage moments / one-step
   dist-shift estimates;
 * the per-step Q-ensemble variance diagnostic (vmapped+jitted across
   runs, lazily compiled on first call).
@@ -160,27 +160,24 @@ class SampleMetricsRecorder:
             self.sample_logs[s].log_accumulator(
                 lambda k, v, _step, _s=s, _sstep=sstep: log(_s, k, v, step=_sstep)
             )
-            tfg_eta = float(np.asarray(state.tfg_eta)[s])
-            log(s, "Global_EMAs/tfg_eta", tfg_eta, step=sstep)
+            beta = float(np.asarray(state.beta)[s])
+            log(s, "Global_EMAs/beta", beta, step=sstep)
             if getattr(alg, "on_policy_ema", False):
                 m2 = float(np.asarray(state.advantage_second_moment_ema)[s])
                 kl_budget = float(np.asarray(state.hp.kl_budget_val)[s])
                 m3 = float(np.asarray(state.advantage_third_moment_ema)[s])
                 cov = float(np.asarray(state.dist_shift_covariance_ema)[s])
                 shape = float(np.asarray(state.dist_shift_shape_ema)[s])
-                eta_kl = float(np.sqrt(2.0 * kl_budget / max(m2, 1e-8)))
+                beta_kl = float(np.sqrt(2.0 * kl_budget / max(m2, 1e-8)))
                 log(s, "Global_EMAs/Advantage_second_moment", m2, step=sstep)
                 log(s, "Global_EMAs/Advantage_third_moment", m3, step=sstep)
                 log(s, "Global_EMAs/Distribution_shift_covariance", cov, step=sstep)
                 log(s, "Global_EMAs/Distribution_shift_shape", shape, step=sstep)
-                log(s, "Global_EMAs/eta", tfg_eta, step=sstep)
-                log(s, "Global_EMAs/eta_kl_ceiling", eta_kl, step=sstep)
-                log(s, "Global_EMAs/eta_kl_budget", eta_kl, step=sstep)
-                if bool(getattr(alg, "one_step_dist_shift_eta", False)):
-                    eta_one_step = -1.0 / (float(np.sqrt(max(m2, 1e-8))) * shape) if shape < -1e-8 else float("nan")
-                    if not np.isnan(eta_one_step):
-                        log(s, "Global_EMAs/eta_quadratic", eta_one_step, step=sstep)
-                        log(s, "Global_EMAs/eta_one_step_dist_shift", eta_one_step, step=sstep)
-            else:
-                log(s, "Global_EMAs/eta", tfg_eta, step=sstep)
+                log(s, "Global_EMAs/beta_kl_ceiling", beta_kl, step=sstep)
+                log(s, "Global_EMAs/beta_kl_budget", beta_kl, step=sstep)
+                if bool(getattr(alg, "one_step_dist_shift_beta", False)):
+                    beta_one_step = -1.0 / (float(np.sqrt(max(m2, 1e-8))) * shape) if shape < -1e-8 else float("nan")
+                    if not np.isnan(beta_one_step):
+                        log(s, "Global_EMAs/beta_quadratic", beta_one_step, step=sstep)
+                        log(s, "Global_EMAs/beta_one_step_dist_shift", beta_one_step, step=sstep)
         self.logger.flush_all()

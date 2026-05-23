@@ -64,11 +64,12 @@ class HParams(NamedTuple):
     guidance_mult: jax.Array = 1.0      # guidance strength multiplier
     adv_ema_tau: jax.Array = 0.0005     # advantage-moment EMA rate
     shape_ema_tau: jax.Array = 0.0001   # dimensionless shape EMA rate
-    kl_budget_val: jax.Array = 1.0      # KL budget δ (host uses for η cap)
+    kl_budget_val: jax.Array = 1.0      # KL budget δ (host uses for β cap)
     reward_scale: jax.Array = 1.0       # reward scaling for TD / huber δ
     x0_hat_clip_radius: jax.Array = 1.0  # clip radius for x0 prediction
     mala_adapt_rate: jax.Array = 0.05   # MALA step-size adaptation rate
     q_td_huber_width: jax.Array = float("inf")  # Q TD huber loss width (in reward units)
+    alpha: jax.Array = 1.0              # composite MD energy scale α: π_new ∝ π_old^α · exp(β·Q)
 
 
 class Diffv2TrainState(NamedTuple):
@@ -76,13 +77,14 @@ class Diffv2TrainState(NamedTuple):
     opt_state: Diffv2OptStates
     step: int
     log_eta_scales: jax.Array
-    tfg_eta: jax.Array                          # guidance step size η (paper's η_k); applied to raw advantage A in the sampler
+    beta: jax.Array                              # composite MD guidance strength β; scales Q in E_total = α·E_θ - β·Q
     # Normalized advantage guidance state
     value_params: hk.Params = None             # V(s) network params (optional)
-    advantage_second_moment_ema: float = 1.0   # M = EMA(E[A²]); used by ema_eta.py to compute η = sqrt(2δ/M)
+    advantage_second_moment_ema: float = 1.0   # M = EMA(E[A²]); used by ema_eta.py to compute β = sqrt(2δ/M)
     advantage_third_moment_ema: float = 0.0
     dist_shift_covariance_ema: float = 0.0
     dist_shift_shape_ema: float = -1.0        # EMA of s₂ = (2γc + κ₃) / v^(3/2), dimensionless shape
+    policy_loss: jax.Array = 0.0             # last computed policy loss; held constant on non-update steps
     hp: HParams = HParams()
 
 
@@ -101,7 +103,7 @@ class DPMDConfig:
     delay_update: int = 2
     reward_scale: float = 0.2
     q_agg_sample: str = "min"
-    tfg_eta: float = 0.0
+    beta: float = 0.0
     x0_hat_clip_radius: float = 1.0
     mala_adapt_rate: float = 0.05
     mala_guided_predictor: bool = False
@@ -109,13 +111,13 @@ class DPMDConfig:
     q_td_huber_width: float = float("inf")
     batch_independent_guidance: bool = False
     guidance_strength_multiplier: float = 1.0
-    energy_multiplier: float = 1.0
+    alpha: float = 1.0
     advantage_ema_tau: float = 0.0005
     shape_ema_tau: float = 0.0001
     initial_advantage_second_moment_ema: float = 1.0
     initial_dist_shift_shape_ema: float = -1.0
     kl_budget: Optional[float] = None
-    one_step_dist_shift_eta: bool = False
+    one_step_dist_shift_beta: bool = False
 
     @classmethod
     def from_args(cls, args) -> "DPMDConfig":
@@ -134,7 +136,7 @@ class DPMDConfig:
             delay_update=args.delay_update,
             reward_scale=args.reward_scale,
             q_agg_sample=args.q_agg_sample,
-            tfg_eta=args.tfg_eta,
+            beta=args.beta,
             x0_hat_clip_radius=args.x0_hat_clip_radius,
             mala_adapt_rate=args.mala_adapt_rate,
             mala_guided_predictor=args.mala_guided_predictor,
@@ -142,11 +144,11 @@ class DPMDConfig:
             q_td_huber_width=args.q_td_huber_width,
             batch_independent_guidance=args.batch_independent_guidance,
             guidance_strength_multiplier=args.guidance_strength_multiplier,
-            energy_multiplier=args.energy_multiplier,
+            alpha=args.alpha,
             advantage_ema_tau=args.advantage_ema_tau,
             shape_ema_tau=args.shape_ema_tau,
             initial_advantage_second_moment_ema=args.initial_advantage_second_moment_ema,
             initial_dist_shift_shape_ema=args.initial_dist_shift_shape_ema,
             kl_budget=args.kl_budget,
-            one_step_dist_shift_eta=args.one_step_dist_shift_eta,
+            one_step_dist_shift_beta=args.one_step_dist_shift_beta,
         )

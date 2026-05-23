@@ -36,7 +36,7 @@ if __name__ == "__main__":
         per_entry_action_seeds=seeds.per_entry_action_seeds,
     )
 
-    # Apply --kl_budget / --kl_budget_per_dim promotion to tfg_eta + V-net.
+    # Apply --kl_budget / --kl_budget_per_dim / --T promotion to beta + V-net.
     resolve_kl_budget(args, act_dim)
 
     print(f"Algorithm: {args.alg}")

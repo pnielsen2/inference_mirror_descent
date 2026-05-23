@@ -78,15 +78,15 @@
 \STATE Initialize target network parameters: $\bar{\phi}_k \leftarrow \phi_k$
 \FOR{each environment step}
   \STATE \textcolor{gray}{\textit{// Sample action}}
-  \STATE $a \leftarrow \textsc{SampleFromTiltedPolicy}(s,\, \pi_\theta,\, \tfrac{1}{2}(Q_{\phi_1}{+}Q_{\phi_2}),\, \alpha,\,\beta)$ \COMMENT{Alg.~2; mean Q for env}
+  \STATE $a \leftarrow \textsc{SampleFromTiltedPolicy}(s,\, \pi_\theta,\, \tfrac{1}{2}(Q_{\phi_1}{+}Q_{\phi_2}),\, \alpha,\,\beta)$ \COMMENT{Alg.~2}
   \STATE \textcolor{gray}{\textit{// Collect experience}}
   \STATE Execute $a$; observe reward $r$, next state $s'$, termination flag $d$
   \STATE $\mathcal{D} \leftarrow \mathcal{D} \cup \{(s, a, r, s', d)\}$
   \STATE \textcolor{gray}{\textit{// Critic update}}
   \STATE Sample minibatch $\{(s_j, a_j, r_j, s'_j, d_j)\}_{j=1}^B \sim \mathcal{D}$
-  \STATE $a'_j \leftarrow \textsc{SampleFromTiltedPolicy}(s'_j,\, \pi_\theta,\, \min(Q_{\phi_1},Q_{\phi_2}),\, \alpha,\,\beta)$ \COMMENT{min Q for TD}
+  \STATE $a'_j \leftarrow \textsc{SampleFromTiltedPolicy}(s'_j,\, \pi_\theta,\, \tfrac{1}{2}(Q_{\phi_1}+Q_{\phi_2}),\, \alpha,\,\beta)$
   \STATE $y_j \leftarrow r_j + \gamma\,(1{-}d_j)\,\min_k(Q_{\bar{\phi}_k}(s'_j, a'_j))$
-  \STATE Update each $Q_{\phi_k}$ by minimizing $\frac{1}{B}\sum_j \textsc{Huber}_{30}(Q_{\phi_k}(s_j, a_j) - y_j)$
+  \STATE Update each $Q_{\phi_k}$ by minimizing $\frac{1}{B}\sum_j (Q_{\phi_k}(s_j, a_j) - y_j)^2$
   \STATE $\bar{\phi}_k \leftarrow \tau_Q\,\phi_k + (1{-}\tau_Q)\,\bar{\phi}_k$ for $k{=}1,2$ \COMMENT{Polyak averaging}
   \STATE \textcolor{gray}{\textit{// Policy update}}
   \STATE Fit $\pi_\theta(s'_j)$ to $a'_j$ by minimizing diffusion loss
