@@ -1,7 +1,7 @@
 """V(s) network used in KL-budget / on-policy-EMA mode.
 
 Owns the haiku-transformed value network and three small utilities used by
-DPMD:
+MGMD:
 
 * ``init_params(key)`` / ``init_opt_state(params)`` for vmap-mode setup.
 * ``apply(params, obs)`` for the in-jit ``q_mean_from_x`` advantage normalization.
@@ -10,7 +10,7 @@ DPMD:
 * ``update_step(state, q_for_v, next_obs, lr_q, optim)`` for the on-policy V TD
   update inside ``stateless_update``.
 
-Behavior is byte-identical to the previous in-DPMD implementation:
+Behavior is byte-identical to the previous in-MGMD implementation:
 ``init`` uses ``jax.random.PRNGKey(42)`` exactly; the MLP is three hidden
 layers of ``hidden_dim`` with ReLU; loss is ``mean((V - sg(Q_for_V))^2)``
 with the same per-seed ``lr_q`` scaling and ``optax.scale_by_adam`` updates.

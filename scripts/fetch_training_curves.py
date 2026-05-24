@@ -179,7 +179,7 @@ def main():
         print(f"\nFinal Return: {mean_return:.1f} ± {se:.1f} (n={len(final_returns)})")
     
     # Plot
-    curves_dict = {f"MALA-Guided DPMD (λ={tfg_eta})": curves}
+    curves_dict = {f"MALA-Guided MGMD (λ={tfg_eta})": curves}
     output_path = os.path.join(figures_dir, f"model_free_training_curve_{env_name.replace('-','_')}.png")
     plot_training_curve(curves_dict, env_name, output_path)
     

@@ -1,4 +1,4 @@
-"""Actor-critic bundle used by DPMD.
+"""Actor-critic bundle used by MGMD.
 
 Holds the haiku-applied callables for:
 

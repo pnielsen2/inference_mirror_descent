@@ -73,7 +73,7 @@ def get_event_host(event_path):
 def scan_runs():
     """Scan recent run directories. For collision directories, split into
     separate runs per event file with correct config overrides."""
-    dirs = sorted(glob.glob(os.path.join(LOG_BASE, 'dpmd_*')))
+    dirs = sorted(glob.glob(os.path.join(LOG_BASE, 'dpmd_*')) + glob.glob(os.path.join(LOG_BASE, 'mgmd_*')))
     runs = []
     for d in dirs:
         bname = os.path.basename(d)

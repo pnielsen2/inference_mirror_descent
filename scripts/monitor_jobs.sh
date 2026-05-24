@@ -9,7 +9,7 @@ shift
 JOB_IDS=("$@")
 JOBS_CSV=$(IFS=,; echo "${JOB_IDS[*]}")
 
-echo "=== DPMD JOB MONITOR STARTED $(date) ==="
+echo "=== MGMD JOB MONITOR STARTED $(date) ==="
 echo "Tracking ${#JOB_IDS[@]} jobs: $JOBS_CSV"
 echo "Log dir: $LOG_DIR"
 echo ""

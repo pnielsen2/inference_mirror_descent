@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Plot training curves for model-free DPMD experiments across MuJoCo environments.
+Plot training curves for model-free MGMD experiments across MuJoCo environments.
 Queries wandb for runs matching specific command patterns and generates training curve plots.
 """
 
@@ -22,7 +22,7 @@ MUJOCO_ENVS = [
     "Humanoid-v4",
 ]
 
-# Target command pattern for model-free MALA-guided DPMD
+# Target command pattern for model-free MALA-guided MGMD
 # (without seed and tfg_eta which may vary)
 MODEL_FREE_TARGET_ARGS = {
     "alg": "dpmd",

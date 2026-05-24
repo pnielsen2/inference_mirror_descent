@@ -13,7 +13,7 @@ import wandb
 
 # Define the 6 configurations with identifiable parameters (used for wandb filtering)
 CONFIGS = {
-    "DPMD baseline (long LR)": {
+    "MGMD baseline (long LR)": {
         "alg": "dpmd",
         "dpmd_constant_weight": False,
         "dpmd_long_lr_schedule": True,
@@ -73,7 +73,7 @@ def identify_config(run_config: dict) -> str:
         if (run_config.get("dpmd_long_lr_schedule") and 
             not run_config.get("dpmd_constant_weight") and
             not run_config.get("fix_q_norm_bug")):
-            return "DPMD baseline (long LR)"
+            return "MGMD baseline (long LR)"
         
         if (run_config.get("dpmd_constant_weight") and 
             run_config.get("dpmd_no_entropy_tuning") and
@@ -183,7 +183,7 @@ def main():
     
     # Define order and colors for better visualization
     config_order = [
-        "DPMD baseline (long LR)",
+        "MGMD baseline (long LR)",
         "MALA-guided (const. weight)",
         "Boltzmann selection (N=128)",
         "MB-PC (determ. dyn)",
@@ -192,7 +192,7 @@ def main():
     ]
     
     colors = {
-        "DPMD baseline (long LR)": "#1f77b4",
+        "MGMD baseline (long LR)": "#1f77b4",
         "MALA-guided (const. weight)": "#ff7f0e",
         "Boltzmann selection (N=128)": "#2ca02c",
         "MB-PC (determ. dyn)": "#d62728",

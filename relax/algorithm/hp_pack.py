@@ -1,4 +1,4 @@
-"""Per-seed hyperparameter pack overrides for the vmapped DPMD train state.
+"""Per-seed hyperparameter pack overrides for the vmapped MGMD train state.
 
 A "hp_pack" is the per-vmap-slot override dict produced by
 ``scripts/launch.py`` (from the ``--ablate`` "easy" axes plus ``--seeds``)
@@ -25,7 +25,6 @@ import jax.numpy as jnp
 # argparse attribute name -> Diffv2TrainState field name. Identity mapping
 # is implicit (e.g. "lr_q" stays "lr_q").
 CLI_TO_FIELD = {
-    "tau": "polyak_tau",
     "advantage_ema_tau": "adv_ema_tau",
     "guidance_strength_multiplier": "guidance_mult",
     "kl_budget": "kl_budget_val",
@@ -36,7 +35,7 @@ CLI_TO_FIELD = {
 
 
 ALLOWED_KEYS = {
-    "lr_q", "lr_policy", "gamma", "tau", "advantage_ema_tau",
+    "lr_q", "lr_policy", "gamma", "polyak_tau", "advantage_ema_tau",
     "guidance_strength_multiplier", "shape_ema_tau", "beta", "kl_budget",
     "initial_advantage_second_moment_ema", "initial_dist_shift_shape_ema",
     "reward_scale", "x0_hat_clip_radius", "mala_adapt_rate",

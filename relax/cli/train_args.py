@@ -11,20 +11,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
 
     # ----- env / run control -------------------------------------------------
-    parser.add_argument("--alg", type=str, default="dpmd", choices=["dpmd"])
+    parser.add_argument("--alg", type=str, default="mgmd", choices=["mgmd"])
     parser.add_argument("--env", type=str, default="HalfCheetah-v3")
     parser.add_argument("--suffix", type=str, default="")
     parser.add_argument("--num_vec_envs", type=int, default=5)
     parser.add_argument("--seed", type=int, default=100)
     parser.add_argument("--start_step", type=int, default=int(3e4)) # other envs 3e4
     parser.add_argument("--total_step", type=int, default=int(1e6))
-    parser.add_argument("--cluster", default=False, action="store_true")
     parser.add_argument("--debug", action='store_true', default=False)
-    parser.add_argument("--timing_log_every", type=int, default=0)
 
     # ----- vmap / sweep plumbing --------------------------------------------
-    parser.add_argument("--parallel_runs", type=int, default=1, help="If > 1, train N independent DPMD runs in parallel on a single device via jax.vmap. Env layout uses a single VectorEnv of size parallel_runs * num_vec_envs. Current packed support covers the KL-budget/on-policy-EMA path and fixed-beta mode.")
-    parser.add_argument("--hp_pack_inline", type=str, default=None, help="Inline JSON with per-run hyperparameter overrides. Each key is an argparse attribute name of this script (e.g. 'tau', 'beta', 'advantage_ema_tau', 'guidance_strength_multiplier', 'kl_budget', 'shape_ema_tau', 'seed') mapped to a list of length parallel_runs. Applied after vmap state construction; internally translated to Diffv2TrainState field names via _CLI_TO_FIELD.")
+    parser.add_argument("--parallel_runs", type=int, default=1, help="If > 1, train N independent MGMD runs in parallel on a single device via jax.vmap. Env layout uses a single VectorEnv of size parallel_runs * num_vec_envs. Current packed support covers the KL-budget/on-policy-EMA path and fixed-beta mode.")
+    parser.add_argument("--hp_pack_inline", type=str, default=None, help="Inline JSON with per-run hyperparameter overrides. Each key is an argparse attribute name of this script (e.g. 'polyak_tau', 'beta', 'advantage_ema_tau', 'guidance_strength_multiplier', 'kl_budget', 'shape_ema_tau', 'seed') mapped to a list of length parallel_runs. Applied after vmap state construction; internally translated to Diffv2TrainState field names via _CLI_TO_FIELD.")
     parser.add_argument("--sweep_id", type=int, default=None, help="Launcher-assigned integer identifying this sweep. When set, every wandb run from this invocation is placed in wandb group 'sweep_<sweep_id>', and each per-vmap-slot run's config includes a 'config_tag' field built from sweep_id + the per-slot hyperparameters (excluding seed/env) so a single tag value filters wandb to all runs across envs/seeds that share this hp configuration.")
     parser.add_argument("--config_tag_keys", type=str, default=None, help="Comma-separated list of argparse attribute names whose values should be included in the per-slot config_tag. Typically set automatically by scripts/launch.py to the union of all --ablate hard+easy flags (minus env and seed). Values come from the hp_pack (per-slot) when the key is a pack key, else from this script's CLI args (shared across all vmap slots within the job).")
 
@@ -47,13 +45,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr_q", type=float, default=None)
     parser.add_argument("--update_per_iteration", type=int, default=1)
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor for the Q critic. Default 0.99.")
-    parser.add_argument("--tau", type=float, default=0.005, help="Polyak averaging coefficient for target network updates. Default 0.005.")
+    parser.add_argument("--polyak_tau", type=float, default=0.005, help="Polyak averaging coefficient for target network updates. Default 0.005.")
     parser.add_argument("--delay_update", type=int, default=2, help="Update policy and target networks every delay_update steps. Default 2.")
-    parser.add_argument("--reward_scale", type=float, default=1, help="Scale factor applied to rewards before Q/value learning. Default 0.2 matches original DPMD. Set to 1.0 for clarity when using inference-time guidance (adjust --beta accordingly).")
+    parser.add_argument("--reward_scale", type=float, default=1, help="Scale factor applied to rewards before Q/value learning. Default 0.2 matches original MGMD. Set to 1.0 for clarity when using inference-time guidance (adjust --beta accordingly).")
 
     # ----- Q learning -------------------------------------------------------
     parser.add_argument("--q_agg_sample", type=str, default="min", choices=["min", "mean"], help="Aggregation for Q used in sampling, both for rollout and for the TD next-action sample. The TD-backup target itself is hardcoded to 'min' (clipped double-Q).")
-    parser.add_argument("--q_td_huber_width", type=float, default=float("inf"), help="Huber width (delta) for critic TD error in DPMD. Default inf recovers the current MSE TD loss. Effective width is scaled by reward_scale internally.")
+    parser.add_argument("--q_td_huber_width", type=float, default=float("inf"), help="Huber width (delta) for critic TD error in MGMD. Default inf recovers the current MSE TD loss. Effective width is scaled by reward_scale internally.")
 
     # ----- guidance + KL budget --------------------------------------------
     parser.add_argument("--alpha", type=float, default=1.0, help="Composite mirror descent energy scale α: controls how much the previous policy π_old is retained in π_new ∝ π_old^α·exp(β·Q). α=1 leaves the base distribution unchanged; α<1 tempers (flattens) it. Default 1.0.")

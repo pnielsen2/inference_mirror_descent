@@ -1,8 +1,8 @@
 import json
 import time
 
-from relax.algorithm.dpmd import DPMD
-from relax.algorithm.dpmd_types import DPMDConfig
+from relax.algorithm.mgmd import MGMD
+from relax.algorithm.mgmd_types import MGMDConfig
 from relax.env import create_vector_env
 from relax.utils.experience import Experience
 from relax.utils.fs import PROJECT_ROOT
@@ -40,13 +40,13 @@ if __name__ == "__main__":
     resolve_kl_budget(args, act_dim)
 
     print(f"Algorithm: {args.alg}")
-    model, dpmd_params_list, buffers_list = build_per_seed_state(args, seeds, obs_dim, act_dim)
-    params = dpmd_params_list[0]
+    model, params_list, buffers_list = build_per_seed_state(args, seeds, obs_dim, act_dim)
+    params = params_list[0]
 
-    cfg = DPMDConfig.from_args(args)
-    algorithm = DPMD(model, params, cfg, obs_dim=obs_dim, hidden_dim=args.hidden_dim)
+    cfg = MGMDConfig.from_args(args)
+    algorithm = MGMD(model, params, cfg, obs_dim=obs_dim, hidden_dim=args.hidden_dim)
 
-    algorithm.state = algorithm.make_vmapped_state(dpmd_params_list)
+    algorithm.state = algorithm.make_vmapped_state(params_list)
     if _hp_loaded is not None:
         from relax.algorithm import hp_pack
         algorithm.state = hp_pack.apply(algorithm.state, _hp_loaded, args.parallel_runs)

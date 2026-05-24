@@ -6,11 +6,11 @@ import optax
 import haiku as hk
 
 from relax.algorithm.mala_sampler import build_mala_sampler
-from relax.algorithm.dpmd_types import (
+from relax.algorithm.mgmd_types import (
     Diffv2OptStates,
     HParams,
     Diffv2TrainState,
-    DPMDConfig,
+    MGMDConfig,
 )
 from relax.algorithm.value_head import ValueHead
 from relax.network.actor_critic import ActorCritic, ActorCriticParams
@@ -42,9 +42,9 @@ def _split_info_vmap(info):
     return scalar_info, array_info
 
 
-class DPMD:
+class MGMD:
 
-    def __init__(self, model: ActorCritic, params: ActorCriticParams, cfg: DPMDConfig,
+    def __init__(self, model: ActorCritic, params: ActorCriticParams, cfg: MGMDConfig,
                  *, obs_dim: int, hidden_dim: int):
         self.model = model
         self.cfg = cfg
@@ -331,7 +331,7 @@ class DPMD:
             dist_shift_shape_ema=jnp.float32(cfg.initial_dist_shift_shape_ema),
             hp=HParams(
                 gamma=jnp.float32(cfg.gamma),
-                polyak_tau=jnp.float32(cfg.tau),
+                polyak_tau=jnp.float32(cfg.polyak_tau),
                 lr_q=jnp.float32(cfg.lr_q),
                 lr_policy=jnp.float32(cfg.lr_policy),
                 guidance_mult=jnp.float32(cfg.guidance_strength_multiplier),
@@ -378,9 +378,9 @@ class DPMD:
 
 
 # ---------------------------------------------------------------------------
-# DPMD-specific Q-ensemble aggregation. Lives at module scope so the closures
-# inside ``DPMD._build_*`` can capture it cheaply; kept at the bottom of the
-# file so the reader sees ``class DPMD`` first.
+# MGMD-specific Q-ensemble aggregation. Lives at module scope so the closures
+# inside ``MGMD._build_*`` can capture it cheaply; kept at the bottom of the
+# file so the reader sees ``class MGMD`` first.
 # ---------------------------------------------------------------------------
 def _aggregate_q(q_means, mode: str):
     """Aggregate a list of N Q-network outputs (same shape) elementwise.

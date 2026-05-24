@@ -18,17 +18,17 @@ import plot_sweep_6env_training_curves as six_env
 
 ENVS = list(six_env.ENVS)
 SWEEP45_LABEL = "MGMD"
-DPMD_LABEL = "DPMD"
+OLD_ALG_LABEL = "DPMD"
 SWEEP45_COLOR = base.METHOD_COLORS["MGMD"]
-DPMD_COLOR = "C6"
-DEFAULT_DPMD_ROOT = Path("/n/netscratch/kdbrantley_lab/Lab/pnielsen/dpmd_full_sweep/20260512_004424_individual/logs")
+OLD_ALG_COLOR = "C6"
+DEFAULT_OLD_ALG_ROOT = Path("/n/netscratch/kdbrantley_lab/Lab/pnielsen/dpmd_full_sweep/20260512_004424_individual/logs")
 
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--sweep-id", "--sweep_id", type=int, default=45)
     ap.add_argument("--config-tag", "--config_tag", type=str, default="sweep45_kl_budget=1024")
-    ap.add_argument("--dpmd-root", type=Path, default=DEFAULT_DPMD_ROOT)
+    ap.add_argument("--old-alg-root", type=Path, default=DEFAULT_OLD_ALG_ROOT)
     ap.add_argument("--num-points", type=int, default=200)
     ap.add_argument("--ci-level", type=float, default=0.90)
     ap.add_argument("--max-steps", type=int, default=1_000_000)
@@ -112,7 +112,7 @@ def load_sweep45_histories():
     return dict(histories)
 
 
-def load_dpmd_histories(root: Path):
+def load_old_alg_histories(root: Path):
     histories = defaultdict(list)
     for csv_path in sorted(root.rglob("episode_returns.csv")):
         try:
@@ -204,7 +204,7 @@ def main() -> None:
     six_env.configure_plot_style()
 
     sweep45_histories = load_sweep45_histories()
-    dpmd_histories = load_dpmd_histories(args.dpmd_root)
+    old_alg_histories = load_old_alg_histories(args.old_alg_root)
 
     if "Humanoid-v3" in sweep45_histories:
         sweep45_histories["Humanoid-v3"] = rescale_to_target_max(
@@ -212,7 +212,7 @@ def main() -> None:
         )
 
     verify_env_coverage(args.config_tag, sweep45_histories)
-    verify_env_coverage(DPMD_LABEL, dpmd_histories)
+    verify_env_coverage(OLD_ALG_LABEL, old_alg_histories)
 
     fig, axes = plt.subplots(2, 3, figsize=(15, 7))
     axes = axes.flatten()
@@ -237,9 +237,9 @@ def main() -> None:
         plot_interpolated_series(
             ax,
             env,
-            dpmd_histories[env],
-            DPMD_LABEL,
-            DPMD_COLOR,
+            old_alg_histories[env],
+            OLD_ALG_LABEL,
+            OLD_ALG_COLOR,
             args.num_points,
             args.ci_level,
             y_parts,

@@ -1,7 +1,7 @@
 # Bit-Exact Baseline Test (sweep58)
 
 This directory captures a **frozen, byte-level reference** for a specific
-DPMD launch, used to verify that future simplifications of this codebase
+MGMD launch, used to verify that future simplifications of this codebase
 do not change numerical behavior.
 
 The reference run produced these baselines at git commit
@@ -64,7 +64,7 @@ This wraps `python scripts/launch.py` with:
 
 Each of the 6 submitted jobs runs one env and produces:
 ```
-logs/<env>/dpmd_<timestamp>_s0_/episode_returns.csv
+logs/<env>/mgmd_<timestamp>_s0_/episode_returns.csv
 ```
 
 ## Baselines captured
@@ -116,7 +116,7 @@ whether the change is intentional (then re-record baselines) or a bug
 | `env_versions.txt`        | Frozen Python package versions + system info. |
 | `launch_baseline.sh`      | Exports determinism vars and submits the 6-env x 5-kl_budget x 8-seed ablation. |
 | `csv_hashes.sha256`       | SHA-256 of each baseline CSV. Run `sha256sum -c csv_hashes.sha256` to verify integrity. |
-| `verify.py`               | Compares latest run CSV in `logs/<env>/dpmd_*_s0_/` against the baseline. |
+| `verify.py`               | Compares latest run CSV in `logs/<env>/mgmd_*_s0_/` against the baseline. |
 | `baselines/<env>/episode_returns.csv` | Frozen reference CSVs. |
 | `launch_scripts/`         | The 6 actual sbatch scripts produced by `launch_baseline.sh` on the recording day, kept for forensic reproducibility. |
 

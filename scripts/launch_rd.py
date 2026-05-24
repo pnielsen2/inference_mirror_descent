@@ -51,7 +51,7 @@ FLAG_TO_HP_KEY = {f"--{k}": k for k in (
     "lr_q",
     "lr_policy",
     "gamma",
-    "tau",
+    "polyak_tau",
     "advantage_ema_tau",
     "shape_ema_tau",
     "guidance_strength_multiplier",

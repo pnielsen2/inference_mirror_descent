@@ -18,16 +18,16 @@ Strategy:
 
 Example usage:
     ./scripts/sweep_thompson.py \\
-        --cmd "python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4 ..." \\
-        --var lr --var num_particles --var dpmd_long_lr_schedule flag \\
+        --cmd "python scripts/train_mujoco.py --alg mgmd --env HalfCheetah-v4 ..." \\
+        --var lr --var num_particles --var mgmd_long_lr_schedule flag \\
         --factor 2 \\
         --sweep-name thompson_sweep
 
 Parallel sweeps (run multiple base configs):
     ./scripts/sweep_thompson.py \\
-        --cmd "python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4 ..." \\
+        --cmd "python scripts/train_mujoco.py --alg mgmd --env HalfCheetah-v4 ..." \\
         --var lr --var num_particles \\
-        --split dpmd_long_lr_schedule flag \\
+        --split mgmd_long_lr_schedule flag \\
         --sweep-name parallel_sweep
 """
 

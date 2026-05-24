@@ -6,7 +6,7 @@ For each wandb run that matches the legacy launch timestamp prefix, we:
   1. Read its recorded ``hp_pack`` path + ``seed_index`` from wandb config.
   2. Load the local pack JSON (old key names).
   3. Translate pack keys to CLI/argparse names (adv_ema_tau -> advantage_ema_tau,
-     polyak_tau -> tau, guidance_mult -> guidance_strength_multiplier,
+     polyak_tau -> tau (historical CLI name), guidance_mult -> guidance_strength_multiplier,
      kl_budget_val -> kl_budget).
   4. Write per-slot scalars for every hp under their CLI name, per-slot
      ``seed``, plus ``sweep_id`` and ``config_tag``, into ``run.config``.
@@ -37,7 +37,7 @@ NAME_PREFIX = "dpmd_2026-04-21_2"
 NAME_MIN = "dpmd_2026-04-21_22-44-40"
 
 _OLD_TO_NEW_PACK_KEY = {
-    "polyak_tau": "tau",
+    "polyak_tau": "tau",  # these runs used --tau (old CLI name)
     "adv_ema_tau": "advantage_ema_tau",
     "guidance_mult": "guidance_strength_multiplier",
     "kl_budget_val": "kl_budget",

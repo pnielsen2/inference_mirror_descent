@@ -10,11 +10,11 @@ Usage:
     python tests/bit_exact_baseline/verify.py
 
     # Verify a specific run dir tree (the script will look for matching
-    # logs/<env>/dpmd_*_s0_/episode_returns.csv under it)
+    # logs/<env>/mgmd_*_s0_/episode_returns.csv under it)
     python tests/bit_exact_baseline/verify.py --logs-root /path/to/some/logs
 
     # Verify a single CSV against its baseline
-    python tests/bit_exact_baseline/verify.py --csv logs/Ant-v3/dpmd_.../episode_returns.csv
+    python tests/bit_exact_baseline/verify.py --csv logs/Ant-v3/mgmd_.../episode_returns.csv
 
 Exit code 0 if all checked envs are bit-exact (or skipped because no new
 run was found), 1 otherwise.
@@ -89,11 +89,11 @@ def compare(baseline_csv: Path, new_csv: Path) -> tuple[bool, str]:
 
 
 def latest_run_csv(logs_root: Path, env: str) -> Path | None:
-    """Find the most recent dpmd_*_s0_/episode_returns.csv under logs/<env>/."""
+    """Find the most recent mgmd_*_s0_/episode_returns.csv under logs/<env>/."""
     env_dir = logs_root / env
     if not env_dir.is_dir():
         return None
-    runs = sorted(env_dir.glob("dpmd_*_s0_"), key=lambda p: p.name, reverse=True)
+    runs = sorted(env_dir.glob("mgmd_*_s0_"), key=lambda p: p.name, reverse=True)
     for r in runs:
         csv = r / "episode_returns.csv"
         if csv.exists() and csv.stat().st_size > 0:
@@ -104,7 +104,7 @@ def latest_run_csv(logs_root: Path, env: str) -> Path | None:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--logs-root", type=Path, default=DEFAULT_LOGS_ROOT,
-                   help="Directory whose <env>/dpmd_*_s0_/episode_returns.csv "
+                   help="Directory whose <env>/mgmd_*_s0_/episode_returns.csv "
                         "files will be checked (default: repo logs/).")
     p.add_argument("--csv", type=Path, default=None,
                    help="Compare a single CSV against its baseline (env inferred "
@@ -119,7 +119,7 @@ def main() -> int:
     checked = 0
 
     if args.csv is not None:
-        env = args.csv.parents[1].name  # logs/<env>/dpmd_.../episode_returns.csv
+        env = args.csv.parents[1].name  # logs/<env>/mgmd_.../episode_returns.csv
         baseline = BASELINE_DIR / env / "episode_returns.csv"
         ok, msg = compare(baseline, args.csv)
         print(f"\n[{env}] new={args.csv}")

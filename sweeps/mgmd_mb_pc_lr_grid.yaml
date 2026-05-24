@@ -6,7 +6,7 @@ metric:
   goal: maximize
 
 project: diffusion_online_rl
-name: dpmd_mb_pc_halfcheetah_lr_random
+name: mgmd_mb_pc_halfcheetah_lr_random
 
 parameters:
   seed:
@@ -25,7 +25,7 @@ command:
   - ${env:PYTHON}
   - scripts/train_mujoco.py
   - --alg
-  - dpmd_mb_pc
+  - mgmd_mb_pc
   - --env
   - HalfCheetah-v4
   - --tfg_lambda

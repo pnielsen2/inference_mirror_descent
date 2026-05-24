@@ -163,7 +163,7 @@ def main():
     ax.set_xscale('log')
     ax.set_xlabel('tfg_eta', fontsize=12)
     ax.set_ylabel('Average Final Episode Return', fontsize=12)
-    ax.set_title('HalfCheetah-v4: DPMD with Constant Weight\nFinal Return vs. TFG Lambda', fontsize=14)
+    ax.set_title('HalfCheetah-v4: MGMD with Constant Weight\nFinal Return vs. TFG Lambda', fontsize=14)
     ax.grid(True, alpha=0.3)
     
     # Add sample size annotations

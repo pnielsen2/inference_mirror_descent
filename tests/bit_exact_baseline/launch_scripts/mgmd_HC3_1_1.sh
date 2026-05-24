@@ -7,7 +7,7 @@
 #SBATCH -t 2-00:00
 #SBATCH -o /n/home09/pnielsen/inference_mirror_descent/logs/slurm/20260515_173427/%j.out
 #SBATCH -e /n/home09/pnielsen/inference_mirror_descent/logs/slurm/20260515_173427/%j.err
-#SBATCH --job-name=dpmd_HC3_5
+#SBATCH --job-name=mgmd_HC3_1
 
 set -euo pipefail
 # Venv selected by launch.py based on the gymnasium env version in the
@@ -22,7 +22,7 @@ cd /n/home09/pnielsen/inference_mirror_descent
 
 echo "Job ID: $SLURM_JOB_ID"
 echo "Venv: $VIRTUAL_ENV"
-echo "Running: python scripts/train_mujoco.py --alg dpmd --num_vec_envs 5 --dpmd_constant_weight --tfg_eta 8.0 --num_particles 1 --mala_steps 2 --q_critic_agg mean --beta_schedule_type cosine --beta_schedule_scale 1 --dpmd_no_entropy_tuning --buffer_size 400000 --x0_hat_clip_radius 3.0 --mala_adapt_rate 0.2 --mala_per_level_eta --q_td_huber_width 30.0 --update_per_iteration 4 --lr_q 0.00015 --lr_policy 0.0003 --mala_guided_predictor --ddim_predictor --kl_budget 1024 --polyak_tau 0.005 --advantage_ema_tau 0.001 --shape_ema_tau 0.0002 --initial_advantage_second_moment_ema 1.0 --gamma 0.99 --sweep_id 58 --config_tag_keys kl_budget --env Swimmer-v3 --seed 0 --parallel_seeds 40 --hp_pack_inline '{"kl_budget":[16.0,16.0,16.0,16.0,16.0,16.0,16.0,16.0,64.0,64.0,64.0,64.0,64.0,64.0,64.0,64.0,256.0,256.0,256.0,256.0,256.0,256.0,256.0,256.0,1024.0,1024.0,1024.0,1024.0,1024.0,1024.0,1024.0,1024.0,4096.0,4096.0,4096.0,4096.0,4096.0,4096.0,4096.0,4096.0],"seed":[0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7]}'"
+echo "Running: python scripts/train_mujoco.py --alg mgmd --num_vec_envs 5 --mgmd_constant_weight --tfg_eta 8.0 --num_particles 1 --mala_steps 2 --q_critic_agg mean --beta_schedule_type cosine --beta_schedule_scale 1 --mgmd_no_entropy_tuning --buffer_size 400000 --x0_hat_clip_radius 3.0 --mala_adapt_rate 0.2 --mala_per_level_eta --q_td_huber_width 30.0 --update_per_iteration 4 --lr_q 0.00015 --lr_policy 0.0003 --mala_guided_predictor --ddim_predictor --kl_budget 1024 --polyak_tau 0.005 --advantage_ema_tau 0.001 --shape_ema_tau 0.0002 --initial_advantage_second_moment_ema 1.0 --gamma 0.99 --sweep_id 58 --config_tag_keys kl_budget --env Humanoid-v3 --seed 0 --parallel_seeds 40 --hp_pack_inline '{"kl_budget":[16.0,16.0,16.0,16.0,16.0,16.0,16.0,16.0,64.0,64.0,64.0,64.0,64.0,64.0,64.0,64.0,256.0,256.0,256.0,256.0,256.0,256.0,256.0,256.0,1024.0,1024.0,1024.0,1024.0,1024.0,1024.0,1024.0,1024.0,4096.0,4096.0,4096.0,4096.0,4096.0,4096.0,4096.0,4096.0],"seed":[0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7]}'"
 echo "Started at: $(date)"
 
 export WANDB_MODE=offline
@@ -53,6 +53,6 @@ _wandb_cleanup() {
 }
 trap _wandb_cleanup EXIT INT TERM
 
-python scripts/train_mujoco.py --alg dpmd --num_vec_envs 5 --dpmd_constant_weight --tfg_eta 8.0 --num_particles 1 --mala_steps 2 --q_critic_agg mean --beta_schedule_type cosine --beta_schedule_scale 1 --dpmd_no_entropy_tuning --buffer_size 400000 --x0_hat_clip_radius 3.0 --mala_adapt_rate 0.2 --mala_per_level_eta --q_td_huber_width 30.0 --update_per_iteration 4 --lr_q 0.00015 --lr_policy 0.0003 --mala_guided_predictor --ddim_predictor --kl_budget 1024 --polyak_tau 0.005 --advantage_ema_tau 0.001 --shape_ema_tau 0.0002 --initial_advantage_second_moment_ema 1.0 --gamma 0.99 --sweep_id 58 --config_tag_keys kl_budget --env Swimmer-v3 --seed 0 --parallel_seeds 40 --hp_pack_inline '{"kl_budget":[16.0,16.0,16.0,16.0,16.0,16.0,16.0,16.0,64.0,64.0,64.0,64.0,64.0,64.0,64.0,64.0,256.0,256.0,256.0,256.0,256.0,256.0,256.0,256.0,1024.0,1024.0,1024.0,1024.0,1024.0,1024.0,1024.0,1024.0,4096.0,4096.0,4096.0,4096.0,4096.0,4096.0,4096.0,4096.0],"seed":[0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7]}'
+python scripts/train_mujoco.py --alg mgmd --num_vec_envs 5 --mgmd_constant_weight --tfg_eta 8.0 --num_particles 1 --mala_steps 2 --q_critic_agg mean --beta_schedule_type cosine --beta_schedule_scale 1 --mgmd_no_entropy_tuning --buffer_size 400000 --x0_hat_clip_radius 3.0 --mala_adapt_rate 0.2 --mala_per_level_eta --q_td_huber_width 30.0 --update_per_iteration 4 --lr_q 0.00015 --lr_policy 0.0003 --mala_guided_predictor --ddim_predictor --kl_budget 1024 --polyak_tau 0.005 --advantage_ema_tau 0.001 --shape_ema_tau 0.0002 --initial_advantage_second_moment_ema 1.0 --gamma 0.99 --sweep_id 58 --config_tag_keys kl_budget --env Humanoid-v3 --seed 0 --parallel_seeds 40 --hp_pack_inline '{"kl_budget":[16.0,16.0,16.0,16.0,16.0,16.0,16.0,16.0,64.0,64.0,64.0,64.0,64.0,64.0,64.0,64.0,256.0,256.0,256.0,256.0,256.0,256.0,256.0,256.0,1024.0,1024.0,1024.0,1024.0,1024.0,1024.0,1024.0,1024.0,4096.0,4096.0,4096.0,4096.0,4096.0,4096.0,4096.0,4096.0],"seed":[0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7]}'
 
 echo "Finished at: $(date)"

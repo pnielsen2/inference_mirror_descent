@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -J dpmdmbpc_lr_grid
+#SBATCH -J mgmdmbpc_lr_grid
 #SBATCH -p seas_gpu
 #SBATCH --gres=gpu:nvidia_h200:1
 #SBATCH -c 2

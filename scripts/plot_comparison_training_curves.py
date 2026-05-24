@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Plot training curves comparing MALA-guided DPMD with baseline methods (SAC, DPMD, LSAC).
+Plot training curves comparing MALA-guided MGMD with baseline methods (SAC, DPMD, LSAC).
 Supports all MuJoCo environments and can incorporate external baseline data.
 
 Usage:
@@ -26,7 +26,7 @@ MUJOCO_ENVS = [
     "Humanoid-v4",
 ]
 
-# Target hyperparameters for MALA-guided DPMD
+# Target hyperparameters for MALA-guided MGMD
 MALA_GUIDED_CONFIG = {
     "alg": "dpmd",
     "dpmd_constant_weight": True,
@@ -64,7 +64,7 @@ BASELINE_DATA = {
 
 
 def fetch_mala_guided_runs(api, env_name, seeds=[0, 1, 2, 3, 4]):
-    """Fetch MALA-guided DPMD runs from wandb."""
+    """Fetch MALA-guided MGMD runs from wandb."""
     filters = {
         "config.alg": "dpmd",
         "config.env": env_name,
@@ -287,7 +287,7 @@ def main():
     
     # Print summary table
     print("\n" + "="*60)
-    print("RESULTS SUMMARY (MALA-Guided DPMD)")
+    print("RESULTS SUMMARY (MALA-Guided MGMD)")
     print("="*60)
     print(f"{'Environment':<20} {'Return':<25} {'n':<5}")
     print("-"*50)

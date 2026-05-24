@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 CLEANRL_WORKTREE = Path("/n/home09/pnielsen/inference_mirror_descent")
-DPMD_WORKTREE = Path("/n/home09/pnielsen/diffusion_policy_online_rl_baseline_a50cf41")
+MGMD_WORKTREE = Path("/n/home09/pnielsen/diffusion_policy_online_rl_baseline_a50cf41")
 PYTHON = Path("/n/home09/pnielsen/.venvs/general/bin/python")
 SCRATCH_PARENT = Path("/n/netscratch/kdbrantley_lab/Lab/pnielsen/mujoco_v5_standard_baselines")
 ACCOUNT = "kempner_kdbrantley_lab"
@@ -48,9 +48,9 @@ class TaskSpec:
 
 
 ALGO_SPECS = {
-    "dpmd": AlgoSpec(
-        key="dpmd",
-        worktree=DPMD_WORKTREE,
+    "mgmd": AlgoSpec(
+        key="mgmd",
+        worktree=MGMD_WORKTREE,
         script_relpath="scripts/train_mujoco.py",
         env_flag="--env",
         cpus=24,
@@ -95,9 +95,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--submission-mode", choices=("array", "individual"), default="array")
     parser.add_argument("--max-concurrent", type=int, default=16)
     parser.add_argument("--total-timesteps", type=int, default=int(1e6))
-    parser.add_argument("--dpmd-start-step", type=int, default=int(3e4))
-    parser.add_argument("--dpmd-num-vec-envs", type=int, default=5)
-    parser.add_argument("--dpmd-mem-fraction", default="0.04")
+    parser.add_argument("--mgmd-start-step", type=int, default=int(3e4))
+    parser.add_argument("--mgmd-num-vec-envs", type=int, default=5)
+    parser.add_argument("--mgmd-mem-fraction", default="0.04")
     return parser.parse_args()
 
 
@@ -202,7 +202,7 @@ def cleanrl_sbatch_text(spec: AlgoSpec, tasks: list[TaskSpec], root: Path, args:
     return "\n".join(lines) + "\n"
 
 
-def dpmd_sbatch_text(spec: AlgoSpec, tasks: list[TaskSpec], root: Path, args: argparse.Namespace) -> str:
+def mgmd_sbatch_text(spec: AlgoSpec, tasks: list[TaskSpec], root: Path, args: argparse.Namespace) -> str:
     slurm_dir = root / "slurm"
     lines = [
         "#!/bin/bash",
@@ -222,10 +222,10 @@ def dpmd_sbatch_text(spec: AlgoSpec, tasks: list[TaskSpec], root: Path, args: ar
         f"PYTHON={shell_quote(PYTHON)}",
         f"ROOT={shell_quote(root)}",
         f"TASK_FILE={shell_quote(root / 'tasks.tsv')}",
-        f"NUM_VEC_ENVS={args.dpmd_num_vec_envs}",
-        f"START_STEP={args.dpmd_start_step}",
+        f"NUM_VEC_ENVS={args.mgmd_num_vec_envs}",
+        f"START_STEP={args.mgmd_start_step}",
         f"TOTAL_TIMESTEPS={args.total_timesteps}",
-        f"MEM_FRACTION={shell_quote(args.dpmd_mem_fraction)}",
+        f"MEM_FRACTION={shell_quote(args.mgmd_mem_fraction)}",
         f"SLURM_DIR={shell_quote(slurm_dir)}",
         'task_line=$(sed -n "$((SLURM_ARRAY_TASK_ID + 2))p" "$TASK_FILE")',
         'IFS=$'"'"'\t'"'"' read -r TASK_NAME ALGORITHM ENV_NAME ENV_SLUG SEED0 SEED1 <<< "$task_line"',
@@ -243,7 +243,7 @@ def dpmd_sbatch_text(spec: AlgoSpec, tasks: list[TaskSpec], root: Path, args: ar
         '  (',
         '    cd "$WORKTREE"',
         '    WANDB_MODE=offline WANDB_DIR="$wandb_dir" "$PYTHON" scripts/train_mujoco.py \\',
-        '      --alg dpmd \\',
+        '      --alg mgmd \\',
         '      --env "$ENV_NAME" \\',
         '      --seed "$seed" \\',
         '      --num_vec_envs "$NUM_VEC_ENVS" \\',
@@ -337,7 +337,7 @@ def cleanrl_task_sbatch_text(spec: AlgoSpec, task: TaskSpec, root: Path, args: a
     return "\n".join(lines) + "\n"
 
 
-def dpmd_task_sbatch_text(spec: AlgoSpec, task: TaskSpec, root: Path, args: argparse.Namespace) -> str:
+def mgmd_task_sbatch_text(spec: AlgoSpec, task: TaskSpec, root: Path, args: argparse.Namespace) -> str:
     slurm_dir = root / "slurm"
     task_root = root / "runs" / task.task_name
     wandb_root = root / "wandb" / task.task_name
@@ -362,10 +362,10 @@ def dpmd_task_sbatch_text(spec: AlgoSpec, task: TaskSpec, root: Path, args: argp
         f"WAND_ROOT={shell_quote(wandb_root)}",
         f"SEED0={task.seed0}",
         f"SEED1={task.seed1}",
-        f"NUM_VEC_ENVS={args.dpmd_num_vec_envs}",
-        f"START_STEP={args.dpmd_start_step}",
+        f"NUM_VEC_ENVS={args.mgmd_num_vec_envs}",
+        f"START_STEP={args.mgmd_start_step}",
         f"TOTAL_TIMESTEPS={args.total_timesteps}",
-        f"MEM_FRACTION={shell_quote(args.dpmd_mem_fraction)}",
+        f"MEM_FRACTION={shell_quote(args.mgmd_mem_fraction)}",
         f"SLURM_DIR={shell_quote(slurm_dir)}",
         'mkdir -p "$TASK_ROOT" "$WAND_ROOT" "$SLURM_DIR"',
         'export OMP_NUM_THREADS=1',
@@ -379,7 +379,7 @@ def dpmd_task_sbatch_text(spec: AlgoSpec, task: TaskSpec, root: Path, args: argp
         '  (',
         '    cd "$WORKTREE"',
         '    WANDB_MODE=offline WANDB_DIR="$wandb_dir" "$PYTHON" scripts/train_mujoco.py \\',
-        '      --alg dpmd \\',
+        '      --alg mgmd \\',
         '      --env "$ENV_NAME" \\',
         '      --seed "$seed" \\',
         '      --num_vec_envs "$NUM_VEC_ENVS" \\',
@@ -439,8 +439,8 @@ def write_artifacts(root: Path, algorithms: list[str], args: argparse.Namespace)
         }
         if args.submission_mode == "array":
             sbatch_path = algo_root / "sbatch" / f"{algorithm}_v5_pack2.sbatch"
-            if algorithm == "dpmd":
-                sbatch_path.write_text(dpmd_sbatch_text(spec, tasks, algo_root, args))
+            if algorithm == "mgmd":
+                sbatch_path.write_text(mgmd_sbatch_text(spec, tasks, algo_root, args))
             else:
                 sbatch_path.write_text(cleanrl_sbatch_text(spec, tasks, algo_root, args))
             payload_entry["sbatch"] = str(sbatch_path)
@@ -448,8 +448,8 @@ def write_artifacts(root: Path, algorithms: list[str], args: argparse.Namespace)
             sbatch_paths: list[str] = []
             for task in tasks:
                 sbatch_path = algo_root / "sbatch" / f"{task.task_name}.sbatch"
-                if algorithm == "dpmd":
-                    sbatch_path.write_text(dpmd_task_sbatch_text(spec, task, algo_root, args))
+                if algorithm == "mgmd":
+                    sbatch_path.write_text(mgmd_task_sbatch_text(spec, task, algo_root, args))
                 else:
                     sbatch_path.write_text(cleanrl_task_sbatch_text(spec, task, algo_root, args))
                 sbatch_paths.append(str(sbatch_path))
@@ -467,9 +467,9 @@ def write_artifacts(root: Path, algorithms: list[str], args: argparse.Namespace)
         "submission_mode": args.submission_mode,
         "max_concurrent": args.max_concurrent,
         "total_timesteps": args.total_timesteps,
-        "dpmd_start_step": args.dpmd_start_step,
-        "dpmd_num_vec_envs": args.dpmd_num_vec_envs,
-        "dpmd_mem_fraction": args.dpmd_mem_fraction,
+        "mgmd_start_step": args.mgmd_start_step,
+        "mgmd_num_vec_envs": args.mgmd_num_vec_envs,
+        "mgmd_mem_fraction": args.mgmd_mem_fraction,
         "algorithms": payload,
     }
     with open(root / "manifest.json", "w") as f:

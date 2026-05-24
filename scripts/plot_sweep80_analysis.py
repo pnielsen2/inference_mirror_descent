@@ -31,7 +31,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import numpy as np
 import pandas as pd
-import plot_sweep45_kl1024_vs_baselines_vs_dpmd as sweep45_plot
+import plot_sweep45_kl1024_vs_baselines as sweep45_plot
 from scipy import stats
 
 # ---------------------------------------------------------------------------

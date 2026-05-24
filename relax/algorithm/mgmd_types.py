@@ -1,21 +1,21 @@
-"""Type definitions for the DPMD algorithm.
+"""Type definitions for the MGMD algorithm.
 
-Split out from ``dpmd.py`` so a walkthrough reader opening that file lands
-directly on ``class DPMD`` without paging past ~100 lines of NamedTuples
+Split out from ``mgmd.py`` so a walkthrough reader opening that file lands
+directly on ``class MGMD`` without paging past ~100 lines of NamedTuples
 and dataclass declarations. The types here are:
 
 * :class:`Diffv2OptStates`        — per-network optax states.
 * :class:`MalaSampleResult`       — output bundle of one MALA sampler pass.
 * :class:`HParams`                — per-seed vmappable hyperparameter block,
                                     lives at ``Diffv2TrainState.hp``.
-* :class:`Diffv2TrainState`       — full DPMD train state (a single pytree).
-* :class:`DPMDConfig`             — frozen container of every scalar
+* :class:`Diffv2TrainState`       — full MGMD train state (a single pytree).
+* :class:`MGMDConfig`             — frozen container of every scalar
                                     hyperparameter, built once in
                                     ``scripts/train_mujoco.py``.
 
-``DPMD._build_initial_state`` materialises ``HParams`` from a ``DPMDConfig``
+``MGMD._build_initial_state`` materialises ``HParams`` from a ``MGMDConfig``
 with an explicit field-by-field ``HParams(gamma=cfg.gamma, ...)`` literal,
-so the cfg→state name mapping (e.g. ``cfg.tau`` → ``hp.polyak_tau``) lives
+so the cfg→state name mapping (e.g. ``cfg.advantage_ema_tau`` → ``hp.adv_ema_tau``) lives
 at the call site rather than in a separate translation table.
 """
 from dataclasses import dataclass
@@ -89,15 +89,15 @@ class Diffv2TrainState(NamedTuple):
 
 
 @dataclass(frozen=True)
-class DPMDConfig:
-    """All scalar hyperparameters of the DPMD algorithm, frozen at construction.
+class MGMDConfig:
+    """All scalar hyperparameters of the MGMD algorithm, frozen at construction.
 
     Constructed once in ``scripts/train_mujoco.py`` from CLI args and handed
-    to :class:`DPMD`. Field names match argparse attribute names so the
+    to :class:`MGMD`. Field names match argparse attribute names so the
     walkthrough has a single source of truth for what each knob controls.
     """
     gamma: float = 0.99
-    tau: float = 0.005
+    polyak_tau: float = 0.005
     lr_policy: float = 1e-4
     lr_q: float = 1e-4
     delay_update: int = 2
@@ -120,8 +120,8 @@ class DPMDConfig:
     one_step_dist_shift_beta: bool = False
 
     @classmethod
-    def from_args(cls, args) -> "DPMDConfig":
-        """Build a frozen DPMDConfig from the argparse ``Namespace`` produced
+    def from_args(cls, args) -> "MGMDConfig":
+        """Build a frozen MGMDConfig from the argparse ``Namespace`` produced
         by :mod:`relax.cli.train_args`. Handles the ``--lr`` → ``--lr_q`` /
         ``--lr_policy`` fallback so the single source of truth for the
         config-from-CLI mapping lives here, not in ``train_mujoco.py``.
@@ -130,7 +130,7 @@ class DPMDConfig:
         lr_q = args.lr if args.lr_q is None else args.lr_q
         return cls(
             gamma=args.gamma,
-            tau=args.tau,
+            polyak_tau=args.polyak_tau,
             lr_policy=float(lr_policy),
             lr_q=float(lr_q),
             delay_update=args.delay_update,

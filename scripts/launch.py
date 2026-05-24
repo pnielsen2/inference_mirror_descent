@@ -4,17 +4,17 @@ SLURM job launcher for experiment sweeps.
 
 Usage examples:
     # Single job
-    python scripts/launch.py --cmd "python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4"
+    python scripts/launch.py --cmd "python scripts/train_mujoco.py --alg mgmd --env HalfCheetah-v4"
 
     # Multiple seeds
-    python scripts/launch.py --cmd "python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4" --seeds 0 1 2 3 4
+    python scripts/launch.py --cmd "python scripts/train_mujoco.py --alg mgmd --env HalfCheetah-v4" --seeds 0 1 2 3 4
 
     # Ablation sweep (changes from base command)
-    python scripts/launch.py --cmd "python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4 --beta 16" \\
+    python scripts/launch.py --cmd "python scripts/train_mujoco.py --alg mgmd --env HalfCheetah-v4 --beta 16" \\
         --ablate beta 8 16 32
 
     # Multiple ablations with seeds
-    python scripts/launch.py --cmd "python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4" \\
+    python scripts/launch.py --cmd "python scripts/train_mujoco.py --alg mgmd --env HalfCheetah-v4" \\
         --seeds 100 101 102 \\
         --ablate beta 8 16 32 \\
         --ablate num_particles 1 64 128
@@ -23,11 +23,11 @@ Usage examples:
     # Regular --ablate axes still form their usual Cartesian product
     # (here: env), while each --oat-ablate axis contributes its values one
     # at a time on top of the base config.
-    python scripts/launch.py --cmd "python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v3 --lr_q 0.00015 --tau 0.005" \\
+    python scripts/launch.py --cmd "python scripts/train_mujoco.py --alg mgmd --env HalfCheetah-v3 --lr_q 0.00015 --polyak_tau 0.005" \\
         --seeds 0 1 \\
         --ablate env HalfCheetah-v3 Ant-v3 Walker2d-v3 Humanoid-v3 \\
         --oat-ablate lr_q 0.000075 0.0003 \\
-        --oat-ablate tau 0.0025 0.01
+        --oat-ablate polyak_tau 0.0025 0.01
 
     # Dry run (print commands without submitting)
     python scripts/launch.py --cmd "..." --dry-run
@@ -80,7 +80,7 @@ FLAG_TO_HP_KEY = {f: f for f in (
     "lr_q",
     "lr_policy",
     "gamma",
-    "tau",
+    "polyak_tau",
     "advantage_ema_tau",
     "shape_ema_tau",
     "initial_advantage_second_moment_ema",

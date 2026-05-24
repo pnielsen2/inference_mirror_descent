@@ -2,7 +2,7 @@
 
 Trains `num_runs` independent RL runs in parallel on a single device via ``jax.vmap``
 over the algorithm's ``stateless_update`` and ``stateless_get_action``.
-Currently supports the DPMD packed multi-run path for both the
+Currently supports the MGMD packed multi-run path for both the
 KL-budget/on-policy-EMA setting and fixed-beta mode. Unsupported features
 still raise at construction time so failures are loud, not silent.
 
@@ -22,7 +22,7 @@ import numpy as np
 from gymnasium import Env
 from tqdm import tqdm
 
-from relax.algorithm.dpmd import DPMD
+from relax.algorithm.mgmd import MGMD
 from relax.algorithm import ema_eta
 from relax.buffer import TreeBuffer
 from relax.env.vector import VectorEnv
@@ -61,7 +61,7 @@ class VmapOffPolicyTrainer:
     def __init__(
         self,
         env: Env,
-        algorithm: DPMD,
+        algorithm: MGMD,
         buffers: List[TreeBuffer],
         log_path: Path,
         *,

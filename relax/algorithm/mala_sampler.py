@@ -1,4 +1,4 @@
-"""MALA-corrected reverse-diffusion sampler used by DPMD.
+"""MALA-corrected reverse-diffusion sampler used by MGMD.
 
 One full pass of the sampler:
 
@@ -17,7 +17,7 @@ from typing import Callable
 import jax
 import jax.numpy as jnp
 
-from relax.algorithm.dpmd_types import Diffv2TrainState, MalaSampleResult
+from relax.algorithm.mgmd_types import Diffv2TrainState, MalaSampleResult
 from relax.network.actor_critic import ActorCritic
 
 

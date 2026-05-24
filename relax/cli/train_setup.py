@@ -25,7 +25,7 @@ def resolve_kl_budget(args, act_dim: int) -> None:
     * When a KL budget is set (either flag), ``beta`` is overridden as
       the initial KL-budget coefficient ``sqrt(2 * δ / M_0)`` with
       ``M_0 = args.initial_advantage_second_moment_ema``; the V-network /
-      on-policy advantage EMA path is enabled downstream (DPMD reads
+      on-policy advantage EMA path is enabled downstream (MGMD reads
       ``cfg.kl_budget is not None``).
     * If ``beta`` is still ``None`` after the above (neither ``--beta``,
       ``--T``, nor ``--kl_budget`` was supplied), it defaults to ``0.0``.

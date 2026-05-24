@@ -8,12 +8,12 @@ moves to the next variable. Loops back to the first variable with new seeds unti
 a previously-seen configuration is encountered.
 
 Usage:
-    ./scripts/sweep.py --cmd "python scripts/train_mujoco.py --alg dpmd --env HalfCheetah-v4 ..." \
+    ./scripts/sweep.py --cmd "python scripts/train_mujoco.py --alg mgmd --env HalfCheetah-v4 ..." \
         --num-seeds 5 \
-        --ablate dpmd_no_entropy_tuning flag \
+        --ablate mgmd_no_entropy_tuning flag \
         --ablate num_particles 32 64 128 256 \
         --ablate particle_selection_lambda 8 16 32 64 128 \
-        --ablate dpmd_long_lr_schedule flag \
+        --ablate mgmd_long_lr_schedule flag \
         --sweep-name my_ablation_study
 
     # Resume a previous sweep
@@ -55,7 +55,7 @@ class AblationVar:
     """An ablation variable to sweep over."""
     name: str
     values: List[str]  # For flags, ["on", "off"]; for params, ["8", "16", "32"]
-    is_flag: bool = False  # True for boolean flags like --dpmd_no_entropy_tuning
+    is_flag: bool = False  # True for boolean flags like --mgmd_no_entropy_tuning
 
 
 @dataclass 
@@ -419,7 +419,7 @@ def extract_final_return_from_wandb(suffix_pattern: str, project: str = "diffusi
     try:
         api = wandb.Api()
         # Get recent runs and filter by name containing the suffix
-        # W&B run names are like: dpmd_2025-12-19_02-46-42_s0_sweep_boltzman_ablation_r0_...
+        # W&B run names are like: mgmd_2025-12-19_02-46-42_s0_sweep_boltzman_ablation_r0_...
         runs = api.runs(project, order="-created_at")
         
         for run in runs:

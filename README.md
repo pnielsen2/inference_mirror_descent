@@ -42,7 +42,7 @@ export CPATH="$HOME/.local/glew/glew-2.1.0/include:${CPATH:-}"
 
 ## Optional extras not included in `requirements.txt`
 
-- `pandas`, `seaborn`, `tbparse`, `tensorboard`, `tensorboardX`, and `pyyaml` for analysis / plotting utilities that are not needed for the packed DPMD launch path
+- `pandas`, `seaborn`, `tbparse`, `tensorboard`, `tensorboardX`, and `pyyaml` for analysis / plotting utilities that are not needed for the packed MGMD launch path
 
 ## Sanity checks after install
 
@@ -54,7 +54,7 @@ python scripts/launch.py --help >/dev/null
 
 ## Example: `packed_q` launch command
 
-The command below is a validated `scripts/launch.py --dry-run` example for the packed DPMD / Q-guided sweep path. It packs seeds and easy one-at-a-time ablations up to `8` runs per GPU.
+The command below is a validated `scripts/launch.py --dry-run` example for the packed MGMD / Q-guided sweep path. It packs seeds and easy one-at-a-time ablations up to `8` runs per GPU.
 
 ```bash
 python scripts/launch.py \
@@ -63,18 +63,18 @@ python scripts/launch.py \
   --job-name packed_q \
   --wandb-offline-base "$PWD/wandb_offline" \
   --cmd "python scripts/train_mujoco.py \
-    --alg dpmd \
+    --alg mgmd \
     --env HalfCheetah-v3 \
     --suffix packed_q \
     --num_vec_envs 5 \
-    --dpmd_constant_weight \
+    --mgmd_constant_weight \
     --tfg_eta 8.0 \
     --num_particles 1 \
     --mala_steps 2 \
     --q_critic_agg mean \
     --beta_schedule_type cosine \
     --beta_schedule_scale 1 \
-    --dpmd_no_entropy_tuning \
+    --mgmd_no_entropy_tuning \
     --buffer_size 400000 \
     --x0_hat_clip_radius 3.0 \
     --mala_adapt_rate 0.2 \
@@ -87,7 +87,7 @@ python scripts/launch.py \
     --ddim_predictor \
     --kl_budget 1024 \
     --one_step_dist_shift_eta \
-    --tau 0.005 \
+    --polyak_tau 0.005 \
     --advantage_ema_tau 0.0005 \
     --shape_ema_tau 0.0001 \
     --initial_advantage_second_moment_ema 1.0 \
@@ -101,7 +101,7 @@ python scripts/launch.py \
   --oat-ablate shape_ema_tau 0.00005 0.0002 \
   --oat-ablate advantage_ema_tau 0.00025 0.001 \
   --oat-ablate kl_budget 512 2048 \
-  --oat-ablate tau 0.0025 0.01 \
+  --oat-ablate polyak_tau 0.0025 0.01 \
   --oat-ablate gamma 0.998 0.999 \
   --oat-ablate initial_advantage_second_moment_ema 10 \
   --max-runs-per-gpu 8 \

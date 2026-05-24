@@ -1,5 +1,5 @@
 """Host-side EMA + adaptive guidance-strength β update for the KL-budget /
-on-policy path of DPMD.
+on-policy path of MGMD.
 
 Two pure functions, one per sampler dispatch mode in ``VmapOffPolicyTrainer``:
 
