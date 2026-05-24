@@ -191,12 +191,11 @@ class MGMD:
             )
 
             # --- Losses ---
-            # Q_MSE: average loss across ensemble members
             q_loss = jnp.mean(all_q_losses)
 
             info = {
                 self.policy_loss_key: total_loss,
-                "losses/Q_MSE": q_loss, # Actually Huber. needs to be renamed to just Q_loss
+                "losses/Q_loss": q_loss,
             }
 
             # V_MSE: only when V network exists
