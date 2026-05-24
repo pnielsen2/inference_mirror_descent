@@ -1,11 +1,10 @@
 """Master-seed -> per-site RNG derivation for ``scripts/train_mujoco.py``.
 
-A single integer master seed is expanded into the six independent RNG sites
-needed downstream: env, env-action, a legacy-eval slot (kept to preserve PRNG
-layout against earlier code), buffer, network init, and training. When an
+A single integer master seed is expanded into the five independent RNG sites
+needed downstream: env, env-action, buffer, network init, and training. When an
 ``hp_pack`` supplies per-vmap-entry master seeds, every per-seed site is
-re-derived from its entry's master so packed multi-seed runs are byte-identical
-to the corresponding standalone ``--seed S_i`` runs.
+re-derived from its entry's master so packed multi-seed runs reproduce the
+corresponding standalone ``--seed S_i`` runs exactly.
 """
 from dataclasses import dataclass
 from typing import List, Optional
@@ -18,9 +17,9 @@ from relax.utils.random_utils import seeding
 
 def _derive_seeds(master: int):
     """Map a master int seed to the tuple (env_seed, env_action_seed,
-    legacy_eval_env_seed, buffer_seed, init_network_seed, train_seed)."""
+    buffer_seed, init_network_seed, train_seed)."""
     rng, _ = seeding(int(master))
-    return tuple(int(x) for x in rng.integers(0, 2**32 - 1, 6))
+    return tuple(int(x) for x in rng.integers(0, 2**32 - 1, 5))
 
 
 @dataclass
@@ -49,9 +48,9 @@ def derive_seed_bundle(master_seed: int, N_seeds: int,
     training key) from ``master_seed``, plus optional per-vmap-entry
     masters from ``hp_pack["seed"]``. When per-entry masters are present,
     every seed site is derived from its entry's master so the pack matches
-    standalone --seed S_i runs byte-for-byte.
+    standalone --seed S_i runs exactly.
     """
-    env_seed, env_action_seed, _legacy, buffer_seed, init_network_seed, train_seed = _derive_seeds(master_seed)
+    env_seed, env_action_seed, buffer_seed, init_network_seed, train_seed = _derive_seeds(master_seed)
 
     per_entry_masters = None
     if hp_pack is not None and "seed" in hp_pack:
@@ -66,14 +65,12 @@ def derive_seed_bundle(master_seed: int, N_seeds: int,
         derived = [_derive_seeds(m) for m in per_entry_masters]
         per_entry_env_seeds = [t[0] for t in derived]
         per_entry_action_seeds = [t[1] for t in derived]
-        buffer_seeds = [t[3] for t in derived]
-        init_keys = jnp.stack([jax.random.key(t[4]) for t in derived])
-        train_keys = jnp.stack([jax.random.key(t[5]) for t in derived])
+        buffer_seeds = [t[2] for t in derived]
+        init_keys = jnp.stack([jax.random.key(t[3]) for t in derived])
+        train_keys = jnp.stack([jax.random.key(t[4]) for t in derived])
     else:
         per_entry_env_seeds = None
         per_entry_action_seeds = None
-        # Match the previous per-buffer derivation: buffer 0 uses
-        # buffer_seed, buffer s uses buffer_seed + s for s >= 1.
         buffer_seeds = [buffer_seed + i for i in range(N_seeds)]
         init_keys = jax.random.split(jax.random.key(init_network_seed), N_seeds)
         train_keys = jax.random.split(jax.random.key(train_seed), N_seeds)

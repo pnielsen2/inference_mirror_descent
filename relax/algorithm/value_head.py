@@ -10,10 +10,9 @@ MGMD:
 * ``update_step(state, q_for_v, next_obs, lr_q, optim)`` for the on-policy V TD
   update inside ``stateless_update``.
 
-Behavior is byte-identical to the previous in-MGMD implementation:
-``init`` uses ``jax.random.PRNGKey(42)`` exactly; the MLP is three hidden
+``init`` uses a fixed ``jax.random.PRNGKey(42)``; the MLP is three hidden
 layers of ``hidden_dim`` with ReLU; loss is ``mean((V - sg(Q_for_V))^2)``
-with the same per-seed ``lr_q`` scaling and ``optax.scale_by_adam`` updates.
+with per-seed ``lr_q`` scaling and ``optax.scale_by_adam`` updates.
 """
 from dataclasses import dataclass
 from typing import Callable, Optional

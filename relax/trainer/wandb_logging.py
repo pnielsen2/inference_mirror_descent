@@ -1,10 +1,9 @@
 """Multi-run wandb logging plumbing for VmapOffPolicyTrainer.
 
 Owns one wandb.Run per vmap run, plus the host-side per-run pending-scalar
-buffers and the update-step array accumulator. The trainer itself is now
+buffers and the update-step array accumulator. The trainer itself is
 RL-focused; it just calls ``logger.add_scalar_per_run(...)`` /
-``logger.flush_all()`` etc. Behavior (PRNG, log keys, log values, log steps,
-config_tag strings) is byte-identical to the old in-trainer implementation.
+``logger.flush_all()`` etc.
 """
 import os
 import random

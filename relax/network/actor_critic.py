@@ -196,8 +196,7 @@ class ActorCritic:
         Builds the Q-ensemble params (and a deepcopy as the target-Q
         params) plus the scalar policy params. The PRNG split is
         ``num_q_networks + 1`` keys: one per Q net, plus one for the
-        policy. Mirrors the original ``create_actor_critic`` init layout
-        for bit-exact PRNG compatibility.
+        policy.
         """
         @jax.jit
         def _init(k):
