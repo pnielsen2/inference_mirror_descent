@@ -70,6 +70,8 @@ class HParams(NamedTuple):
     mala_adapt_rate: jax.Array = 0.05   # MALA step-size adaptation rate
     q_td_huber_width: jax.Array = float("inf")  # Q TD huber loss width (in reward units)
     alpha: jax.Array = 1.0              # composite MD energy scale α: π_new ∝ π_old^α · exp(β·Q)
+    T: jax.Array = 0.0                  # composite MD entropy temperature T
+    eta: jax.Array = 0.0                # composite MD step size η
 
 
 class Diffv2TrainState(NamedTuple):
@@ -106,12 +108,14 @@ class MGMDConfig:
     beta: float = 0.0
     x0_hat_clip_radius: float = 1.0
     mala_adapt_rate: float = 0.05
-    mala_guided_predictor: bool = False
-    mala_no_predictor: bool = False
+    denoising_predictor: str = "DDPM_mean"
     q_td_huber_width: float = float("inf")
     batch_independent_guidance: bool = False
     guidance_strength_multiplier: float = 1.0
     alpha: float = 1.0
+    T: float = 0.0
+    eta: float = 0.0
+    advantage_normalization: bool = False
     advantage_ema_tau: float = 0.0005
     shape_ema_tau: float = 0.0001
     initial_advantage_second_moment_ema: float = 1.0
@@ -139,12 +143,14 @@ class MGMDConfig:
             beta=args.beta,
             x0_hat_clip_radius=args.x0_hat_clip_radius,
             mala_adapt_rate=args.mala_adapt_rate,
-            mala_guided_predictor=args.mala_guided_predictor,
-            mala_no_predictor=args.mala_no_predictor,
+            denoising_predictor=args.denoising_predictor,
             q_td_huber_width=args.q_td_huber_width,
             batch_independent_guidance=args.batch_independent_guidance,
             guidance_strength_multiplier=args.guidance_strength_multiplier,
             alpha=args.alpha,
+            T=args.T,
+            eta=args.eta,
+            advantage_normalization=args.advantage_normalization,
             advantage_ema_tau=args.advantage_ema_tau,
             shape_ema_tau=args.shape_ema_tau,
             initial_advantage_second_moment_ema=args.initial_advantage_second_moment_ema,

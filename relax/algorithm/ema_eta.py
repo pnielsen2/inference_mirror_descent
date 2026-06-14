@@ -3,6 +3,9 @@ on-policy path of MGMD.
 
 Two pure functions, one per sampler dispatch mode in ``VmapOffPolicyTrainer``:
 
+* :func:`update_state_m2_only` -- advantage-normalization path.
+  Updates M = EMA(E[A²]) only, leaving β unchanged.
+
 * :func:`update_state_kl_only` -- KL-budget-only β selection.
   β = sqrt(2δ/M) where M = EMA(E[A²]).  (Paper §5.1, eq. 2.)
 
@@ -21,6 +24,14 @@ import numpy as np
 
 def _ema(cur, batch, tau):
     return (1 - tau) * cur + tau * batch
+
+
+def update_state_m2_only(state, q_per_env: np.ndarray, v_per_env: np.ndarray) -> Tuple[object, np.ndarray]:
+    """Advantage-normalization path: update M = EMA(E[A²]) only."""
+    adv_per_env = q_per_env - v_per_env
+    m2_hat = np.mean(adv_per_env ** 2, axis=1)
+    new_m2_ema = _ema(state.advantage_second_moment_ema, m2_hat, state.hp.adv_ema_tau)
+    return state._replace(advantage_second_moment_ema=new_m2_ema), adv_per_env
 
 
 def update_state_kl_only(state, q_per_env: np.ndarray, v_per_env: np.ndarray) -> Tuple[object, np.ndarray]:

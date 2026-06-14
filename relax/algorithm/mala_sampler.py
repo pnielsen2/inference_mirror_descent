@@ -7,7 +7,7 @@ One full pass of the sampler:
        ``E_total(t, x) = alpha * E_θ(s, x, t) - beta * Q_agg(s, x_0_hat)``.
        (Q_agg is omitted when ``beta == 0`` so zero-guidance
        runs are unbiased.)
-    2. A deterministic DDIM-style predictor step. Skipped when ``--mala_no_predictor`` is set.
+    2. The selected denoising predictor step.
 * Return ``MalaSampleResult(action, q, log_eta_scales, per_level_acc,
   per_level_clip)`` with the per-level acceptance / clip arrays the trainer
   logs to wandb.
@@ -28,8 +28,8 @@ def build_mala_sampler(
     timesteps: int,
     batch_independent_guidance: bool,
     compute_final_q: bool = True,
-    mala_guided_predictor: bool,
-    mala_no_predictor: bool,
+    advantage_normalization: bool,
+    denoising_predictor: str,
 ) -> Callable:
     """Return ``stateless_get_action_mala_full(key, state, obs, aggregate_q_fn)``.
 
@@ -47,7 +47,7 @@ def build_mala_sampler(
         policy_params = state.params.policy
         q_params_tuple = state.params.q
         log_eta_scales_in = state.log_eta_scales
-        beta_current = state.beta
+        beta_cmd = state.beta
         value_params = state.value_params
         x0_hat_clip_radius = state.hp.x0_hat_clip_radius
         mala_adapt_rate = state.hp.mala_adapt_rate
@@ -59,6 +59,10 @@ def build_mala_sampler(
         schedule = model.schedule
         x_recon_clip_radius = model.x_recon_clip_radius
         reduce_over_batch = jnp.sum if batch_independent_guidance else jnp.mean
+        if advantage_normalization:
+            beta_current = beta_cmd / jnp.sqrt(jnp.maximum(state.advantage_second_moment_ema, jnp.float32(1e-6)))
+        else:
+            beta_current = beta_cmd
 
         # ---- Shared Tweedie building blocks -------------------------
         def reconstruct_x0_from_noise(x_in, t_idx, noise_pred):
@@ -96,34 +100,45 @@ def build_mala_sampler(
         def compute_guidance_gradient(x_in, t_idx):
             return jax.grad(lambda x: guidance_value_from_x(x, t_idx))(x_in)
 
-        # ---- DDIM predictor step (guided or unguided, chosen at build time) ----
-        if mala_guided_predictor:
-            def ddim_step(t_idx, x_in):
-                noise_pred_scaled = state.hp.alpha * model.eps_pred(policy_params, obs, x_in, t_idx)
-                grad_q = compute_guidance_gradient(x_in, t_idx)
-                sigma_t = schedule.sqrt_one_minus_alphas_cumprod[t_idx]
-                eps_pred = noise_pred_scaled - beta_current * sigma_t * grad_q
-                x0_hat = jnp.clip(reconstruct_x0_from_noise(x_in, t_idx, eps_pred),
-                                   -x_recon_clip_radius, x_recon_clip_radius)
-                return x0_hat * schedule.posterior_mean_coef1[t_idx] + x_in * schedule.posterior_mean_coef2[t_idx]
-        else:
-            def ddim_step(t_idx, x_in):
-                noise_pred_scaled = state.hp.alpha * model.eps_pred(policy_params, obs, x_in, t_idx)
-                x0_hat = jnp.clip(reconstruct_x0_from_noise(x_in, t_idx, noise_pred_scaled),
-                                   -x_recon_clip_radius, x_recon_clip_radius)
-                return x0_hat * schedule.posterior_mean_coef1[t_idx] + x_in * schedule.posterior_mean_coef2[t_idx]
+        # ---- Denoising predictor step (chosen at build time) -----------------
+        def guided_eps_pred(t_idx, x_in):
+            noise_pred_scaled = state.hp.alpha * model.eps_pred(policy_params, obs, x_in, t_idx)
+            grad_q = compute_guidance_gradient(x_in, t_idx)
+            sigma_t = schedule.sqrt_one_minus_alphas_cumprod[t_idx]
+            return noise_pred_scaled - beta_current * sigma_t * grad_q
 
-        if mala_no_predictor:
+        def ddpm_mean_step(t_idx, x_in):
+            eps_pred = guided_eps_pred(t_idx, x_in)
+            x0_hat = jnp.clip(reconstruct_x0_from_noise(x_in, t_idx, eps_pred),
+                               -x_recon_clip_radius, x_recon_clip_radius)
+            return x0_hat * schedule.posterior_mean_coef1[t_idx] + x_in * schedule.posterior_mean_coef2[t_idx]
+
+        def ddim_step(t_idx, x_in):
+            eps_pred = guided_eps_pred(t_idx, x_in)
+            sqrt_ab_t = schedule.sqrt_alphas_cumprod[t_idx]
+            sqrt_one_minus_ab_t = schedule.sqrt_one_minus_alphas_cumprod[t_idx]
+            sqrt_ab_prev = jnp.sqrt(schedule.alphas_cumprod_prev[t_idx])
+            sqrt_one_minus_ab_prev = jnp.sqrt(1.0 - schedule.alphas_cumprod_prev[t_idx])
+            return (
+                (sqrt_ab_prev / sqrt_ab_t) * x_in
+                + (sqrt_one_minus_ab_prev - (sqrt_ab_prev / sqrt_ab_t) * sqrt_one_minus_ab_t) * eps_pred
+            )
+
+        if denoising_predictor == "Identity":
             def denoising_step(t_idx, x_curr):
                 return x_curr
-        else:
+        elif denoising_predictor == "DDPM_mean":
+            denoising_step = ddpm_mean_step
+        elif denoising_predictor == "DDIM":
             denoising_step = ddim_step
+        else:
+            raise ValueError(f"Unknown denoising_predictor: {denoising_predictor}")
 
         # ---- MALA step-size scale clamp range (shared across all levels) -
         log_eta_min = jnp.log(jnp.float32(1e-8) / jnp.maximum(jnp.max(schedule.betas), jnp.float32(1e-8)))
         log_eta_max = jnp.log(jnp.float32(0.5) / jnp.maximum(jnp.min(schedule.betas), jnp.float32(1e-8)))
 
-        # ---- Per-diffusion-level MALA correction + DDIM predictor --------
+        # ---- Per-diffusion-level MALA correction + denoising predictor ----
         def run_mala_chain_at_level(t_idx, x_t, rng, log_eta_scales):
             eta_base_t = jnp.maximum(schedule.betas[t_idx], jnp.float32(1e-8))
             eta_upper = jnp.float32(0.5)

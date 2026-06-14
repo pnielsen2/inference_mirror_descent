@@ -86,3 +86,14 @@ paper/icml2026-official/
 runs/
 sweeps/
 figures/
+
+/analysis_cache/
+/build/
+/data/
+/figures/
+/paper/
+/presentation/
+/proposal/
+/results/
+/runs/
+/sweeps/

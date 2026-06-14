@@ -164,17 +164,20 @@ class SampleMetricsRecorder:
             log(s, "Global_EMAs/beta", beta, step=sstep)
             if getattr(alg, "on_policy_ema", False):
                 m2 = float(np.asarray(state.advantage_second_moment_ema)[s])
-                kl_budget = float(np.asarray(state.hp.kl_budget_val)[s])
                 m3 = float(np.asarray(state.advantage_third_moment_ema)[s])
                 cov = float(np.asarray(state.dist_shift_covariance_ema)[s])
                 shape = float(np.asarray(state.dist_shift_shape_ema)[s])
-                beta_kl = float(np.sqrt(2.0 * kl_budget / max(m2, 1e-8)))
+                effective_beta = beta / float(np.sqrt(max(m2, 1e-8)))
                 log(s, "Global_EMAs/Advantage_second_moment", m2, step=sstep)
+                log(s, "Global_EMAs/effective_beta", effective_beta, step=sstep)
                 log(s, "Global_EMAs/Advantage_third_moment", m3, step=sstep)
                 log(s, "Global_EMAs/Distribution_shift_covariance", cov, step=sstep)
                 log(s, "Global_EMAs/Distribution_shift_shape", shape, step=sstep)
-                log(s, "Global_EMAs/beta_kl_ceiling", beta_kl, step=sstep)
-                log(s, "Global_EMAs/beta_kl_budget", beta_kl, step=sstep)
+                if getattr(alg.cfg, "kl_budget", None) is not None:
+                    kl_budget = float(np.asarray(state.hp.kl_budget_val)[s])
+                    beta_kl = float(np.sqrt(2.0 * kl_budget / max(m2, 1e-8)))
+                    log(s, "Global_EMAs/beta_kl_ceiling", beta_kl, step=sstep)
+                    log(s, "Global_EMAs/beta_kl_budget", beta_kl, step=sstep)
                 if bool(getattr(alg, "one_step_dist_shift_beta", False)):
                     beta_one_step = -1.0 / (float(np.sqrt(max(m2, 1e-8))) * shape) if shape < -1e-8 else float("nan")
                     if not np.isnan(beta_one_step):

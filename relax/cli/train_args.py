@@ -15,6 +15,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--env", type=str, default="HalfCheetah-v3")
     parser.add_argument("--suffix", type=str, default="")
     parser.add_argument("--num_vec_envs", type=int, default=5)
+    parser.add_argument("--flatten_UTD", action="store_true", default=False)
     parser.add_argument("--seed", type=int, default=100)
     parser.add_argument("--start_step", type=int, default=int(3e4)) # other envs 3e4
     parser.add_argument("--total_step", type=int, default=int(1e6))
@@ -54,12 +55,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--q_td_huber_width", type=float, default=float("inf"), help="Huber width (delta) for critic TD error in MGMD. Default inf recovers the current MSE TD loss. Effective width is scaled by reward_scale internally.")
 
     # ----- guidance + KL budget --------------------------------------------
-    parser.add_argument("--alpha", type=float, default=1.0, help="Composite mirror descent energy scale α: controls how much the previous policy π_old is retained in π_new ∝ π_old^α·exp(β·Q). α=1 leaves the base distribution unchanged; α<1 tempers (flattens) it. Default 1.0.")
-    parser.add_argument("--beta", type=float, default=None, help="Composite mirror descent guidance strength β: scales Q in the tilted target π_new ∝ π_old^α·exp(β·Q). Mutually exclusive with --T. If neither --beta nor --T is set, defaults to 0 (no Q-guidance).")
-    parser.add_argument("--T", type=float, default=None, help="Asymptotic Boltzmann temperature; sets β = (1-α)/T. Mutually exclusive with --beta.")
+    parser.add_argument("--alpha", type=float, default=None, help="Composite mirror descent retained-policy exponent α in π_new ∝ π_old^α·exp(β·Q). Exactly two of --alpha, --beta, --T, --eta must be specified.")
+    parser.add_argument("--beta", type=float, default=None, help="Composite mirror descent Q coefficient β in π_new ∝ π_old^α·exp(β·Q). Exactly two of --alpha, --beta, --T, --eta must be specified.")
+    parser.add_argument("--T", type=float, default=None, help="Composite mirror descent entropy temperature T. Exactly two of --alpha, --beta, --T, --eta must be specified.")
+    parser.add_argument("--eta", type=float, default=None, help="Composite mirror descent step size η. Exactly two of --alpha, --beta, --T, --eta must be specified.")
     parser.add_argument("--kl_budget", type=float, default=None, help="Total KL divergence budget δ for guidance. Per-dimension budget is δ / act_dim. Initializes β as sqrt(2δ / M_0) with M_0 = --initial_advantage_second_moment_ema, then adapts β online from the advantage-moment EMA. Enables V network and on-policy advantage EMA. Default None (disabled).")
     parser.add_argument("--kl_budget_per_dim", type=float, default=None, help="Per-dimension KL divergence budget δ_d for guidance. Total budget δ = δ_d * act_dim. Initializes β as sqrt(2δ / M_0) with M_0 = --initial_advantage_second_moment_ema, then adapts β online from the advantage-moment EMA. Enables V network and on-policy advantage EMA. Default None (disabled).")
     parser.add_argument("--one_step_dist_shift_beta", action="store_true", default=False, help="Adaptive β from second-order expansion using one-step Monte Carlo covariance estimate. No D_ψ head; estimates c from consecutive (A_t, A_{t+1}) pairs. Requires --kl_budget or --kl_budget_per_dim (defaults to --kl_budget_per_dim=5.33 if neither set).")
+    parser.add_argument("--advantage_normalization", action="store_true", default=False)
     parser.add_argument("--advantage_ema_tau", type=float, default=0.0005, help="Per-step EMA rate for advantage second/third moments.")
     parser.add_argument("--shape_ema_tau", type=float, default=0.0001, help="Per-step EMA rate for dimensionless shape s2.")
     parser.add_argument("--initial_advantage_second_moment_ema", type=float, default=1.0, help="Initial value for the advantage second moment EMA E[A^2].")
@@ -73,8 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
     # ----- MALA -------------------------------------------------------------
     parser.add_argument("--mala_steps", type=int, default=0, help="Number of MALA correction steps per diffusion step.")
     parser.add_argument("--mala_adapt_rate", type=float, default=0.05, help="Robbins-Monro adaptation rate for MALA log_eta_scale updates.")
-    parser.add_argument("--mala_guided_predictor", action="store_true", default=False, help="If set, apply Q-guidance (composite-MD guided ε̂_g = α·ε̂_θ - β·σ_t·∇Q) in the DDIM predictor step after each MALA correction step.")
-    parser.add_argument("--mala_no_predictor", action="store_true", default=False, help="If set, remove predictor transitions entirely during MALA sampling so each lower-noise level initializes directly from the previous level's post-MALA state.")
+    parser.add_argument("--denoising_predictor", type=str, default="DDPM_mean", choices=["Identity", "DDPM_mean", "DDIM"], help="Predictor transition after each MALA correction level. Identity skips denoising; DDPM_mean uses the guided DDPM posterior mean; DDIM uses the guided deterministic DDIM update.")
 
     return parser
 
@@ -84,8 +86,32 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
     if args.kl_budget is not None and args.kl_budget_per_dim is not None:
         parser.error("--kl_budget and --kl_budget_per_dim are mutually exclusive")
 
-    if args.beta is not None and args.T is not None:
-        parser.error("--beta and --T are mutually exclusive; use --T to derive β=(1-α)/T, or set --beta directly")
+    cmd_params = {"--alpha": args.alpha, "--beta": args.beta, "--T": args.T, "--eta": args.eta}
+    specified_cmd_params = [name for name, value in cmd_params.items() if value is not None]
+    if args.hp_pack_inline is None and len(specified_cmd_params) != 2:
+        parser.error(
+            "Exactly two of --alpha, --beta, --T, --eta must be specified "
+            f"(got {specified_cmd_params or 'none'})."
+        )
+    if args.hp_pack_inline is not None and len(specified_cmd_params) > 2:
+        parser.error(
+            "At most two of --alpha, --beta, --T, --eta may be specified on the base CLI "
+            "when --hp_pack_inline is used."
+        )
+
+    if args.advantage_normalization and (
+        args.kl_budget is not None
+        or args.kl_budget_per_dim is not None
+        or args.one_step_dist_shift_beta
+    ):
+        parser.error(
+            "--advantage_normalization is mutually exclusive with --kl_budget, "
+            "--kl_budget_per_dim, and --one_step_dist_shift_beta"
+        )
+
+    if args.flatten_UTD:
+        args.num_vec_envs = 1
+        args.update_per_iteration = 1
 
     # --one_step_dist_shift_beta implies a KL budget (default 5.33 per dim)
     if args.one_step_dist_shift_beta and args.kl_budget is None and args.kl_budget_per_dim is None:

@@ -53,7 +53,8 @@ class MGMD:
         # Derived/exposed flags. Everything else lives on ``self.cfg``; the
         # two attributes below are also read off the algorithm by the
         # trainer (``algorithm.on_policy_ema`` / ``algorithm.one_step_dist_shift_beta``).
-        self.on_policy_ema = (cfg.kl_budget is not None)
+        self.use_advantage_stats = bool(cfg.advantage_normalization or cfg.kl_budget is not None)
+        self.on_policy_ema = self.use_advantage_stats
         self.one_step_dist_shift_beta = bool(cfg.one_step_dist_shift_beta)
         self.policy_loss_key = "losses/Policy_epsilon_MSE"
 
@@ -78,8 +79,8 @@ class MGMD:
         _sampler_kw = dict(
             model=self.model, value_head=self.value_head, timesteps=self._timesteps,
             batch_independent_guidance=self.cfg.batch_independent_guidance,
-            mala_guided_predictor=self.cfg.mala_guided_predictor,
-            mala_no_predictor=self.cfg.mala_no_predictor,
+            advantage_normalization=self.cfg.advantage_normalization,
+            denoising_predictor=self.cfg.denoising_predictor,
         )
         sampler = build_mala_sampler(**_sampler_kw)
         # Both sampling paths (rollout + TD next-action) use --q_agg_sample aggregation.
@@ -293,7 +294,7 @@ class MGMD:
         lives in :class:`relax.algorithm.value_head.ValueHead`; we just
         construct it here.
         """
-        if not self.on_policy_ema:
+        if not self.use_advantage_stats:
             self.value_head = None
             return None, None
 
@@ -342,6 +343,8 @@ class MGMD:
                 mala_adapt_rate=jnp.float32(cfg.mala_adapt_rate),
                 q_td_huber_width=jnp.float32(cfg.q_td_huber_width),
                 alpha=jnp.float32(cfg.alpha),
+                T=jnp.float32(cfg.T),
+                eta=jnp.float32(cfg.eta),
             ),
         )
 

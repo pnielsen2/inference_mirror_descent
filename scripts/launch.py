@@ -94,6 +94,7 @@ FLAG_TO_HP_KEY = {f: f for f in (
     "q_td_huber_width",
     "alpha",
     "T",
+    "eta",
 )}
 
 

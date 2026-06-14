@@ -148,6 +148,79 @@ def build_per_env_metrics(cell_df, benchmark_scores):
     return per_env
 
 
+def _values_differ(a, b):
+    """Treat two NaN/missing values as equal; otherwise compare directly."""
+    a_missing = a is None or (isinstance(a, float) and np.isnan(a))
+    b_missing = b is None or (isinstance(b, float) and np.isnan(b))
+    if a_missing and b_missing:
+        return False
+    if a_missing or b_missing:
+        return True
+    return a != b
+
+
+def build_h1_neighbor_map(config_tags, configs_df, hp_cols):
+    """Map each config_tag to the list of config_tags that differ in exactly
+    one swept hyperparameter (Hamming distance 1) in hp-value space."""
+    sub = configs_df.drop_duplicates("config_tag").set_index("config_tag")
+    hp_values = {}
+    for c in config_tags:
+        if c in sub.index:
+            hp_values[c] = tuple(sub.loc[c, hp_cols].tolist())
+        else:
+            hp_values[c] = None
+
+    neighbors = {}
+    for c in config_tags:
+        vc = hp_values[c]
+        nb = []
+        if vc is not None:
+            for c2 in config_tags:
+                if c2 == c:
+                    continue
+                v2 = hp_values[c2]
+                if v2 is None:
+                    continue
+                dist = sum(1 for a, b in zip(vc, v2) if _values_differ(a, b))
+                if dist == 1:
+                    nb.append(c2)
+        neighbors[c] = nb
+    return neighbors
+
+
+def add_h1_smoothed_log_scores(per_env, configs_df, hp_cols, envs):
+    """Add ``h1_smoothed_log_score``: for each (config, env), the mean of the
+    config's own log-score pooled with the log-scores of all configs at Hamming
+    distance 1 (exactly one differing swept hyperparameter) in the same env.
+    """
+    per_env = per_env.copy()
+    if not hp_cols:
+        per_env["h1_smoothed_log_score"] = per_env["log_score"]
+        return per_env
+
+    config_tags = sorted(per_env["config_tag"].unique())
+    neighbors = build_h1_neighbor_map(config_tags, configs_df, hp_cols)
+
+    log_by_cell = {
+        (c, e): v
+        for c, e, v in zip(per_env["config_tag"], per_env["env"], per_env["log_score"])
+    }
+
+    smoothed_col = []
+    for c, e, own in zip(per_env["config_tag"], per_env["env"], per_env["log_score"]):
+        vals = []
+        if own is not None and np.isfinite(own):
+            vals.append(float(own))
+        for nb in neighbors.get(c, []):
+            v = log_by_cell.get((nb, e))
+            if v is not None and np.isfinite(v):
+                vals.append(float(v))
+        smoothed_col.append(float(np.mean(vals)) if vals else own)
+
+    per_env["h1_smoothed_log_score"] = smoothed_col
+    return per_env
+
+
 def run_bootstrap(cell_df, rankable_keys, envs, benchmark_scores, n_iter=1000, seed=0):
     """Bootstrap seeds within each (config, env) cell with replacement.
 
@@ -510,6 +583,7 @@ def main():
 
     cell_df.to_csv(OUT_DIR / "per_cell_metrics.csv", index=False)
     per_env = build_per_env_metrics(cell_df, benchmark_scores)
+    per_env = add_h1_smoothed_log_scores(per_env, configs_df, hp_cols, ENVS)
     per_env.to_csv(OUT_DIR / "per_config_env_metrics.csv", index=False)
     print(f"Per-(config,env) seed-averaged metrics written (rows: {len(per_env)})")
 
@@ -574,8 +648,14 @@ def main():
         .rename("log_score")
     )
 
+    h1_smoothed_avg = (
+        per_env[per_env["config_tag"].isin(rankable_keys)]
+        .groupby("config_tag")["h1_smoothed_log_score"].mean()
+        .rename("h1_smoothed_log_score")
+    )
+
     ranking = (
-        pivot.join(topsis_score).join(joint_quantile).join(log_avg)
+        pivot.join(topsis_score).join(joint_quantile).join(log_avg).join(h1_smoothed_avg)
         .sort_values("topsis_score", ascending=False)
         .reset_index()
     )
@@ -584,7 +664,7 @@ def main():
     boot_df = run_bootstrap(cell_df, rankable_keys, ENVS, benchmark_scores)
     ranking = ranking.merge(boot_df, on="config_tag", how="left")
 
-    score_cols = [c for c in ("topsis_score", "quantile_score", "log_score")
+    score_cols = [c for c in ("topsis_score", "quantile_score", "log_score", "h1_smoothed_log_score")
                   if c in ranking.columns]
     p_best_map = {"topsis_score": "topsis_p_best",
                   "quantile_score": "quantile_p_best",

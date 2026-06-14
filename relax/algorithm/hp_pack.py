@@ -21,6 +21,8 @@ This module owns:
 """
 import jax.numpy as jnp
 
+from relax.cli.train_setup import resolve_cmd_params
+
 
 # argparse attribute name -> Diffv2TrainState field name. Identity mapping
 # is implicit (e.g. "lr_q" stays "lr_q").
@@ -39,7 +41,7 @@ ALLOWED_KEYS = {
     "guidance_strength_multiplier", "shape_ema_tau", "beta", "kl_budget",
     "initial_advantage_second_moment_ema", "initial_dist_shift_shape_ema",
     "reward_scale", "x0_hat_clip_radius", "mala_adapt_rate",
-    "q_td_huber_width", "alpha", "T",
+    "q_td_huber_width", "alpha", "T", "eta",
     "seed",
 }
 
@@ -58,20 +60,21 @@ def apply(state, hp_pack: dict, N_seeds: int):
     _TOPLEVEL_TARGETS = {"beta", "advantage_second_moment_ema", "dist_shift_shape_ema"}
     hp_overrides = {}
     top_overrides = {}
+    cmd_pack_keys = {k for k in ("alpha", "beta", "T", "eta") if k in hp_pack}
     for k, v in hp_pack.items():
         if k not in ALLOWED_KEYS:
             raise ValueError(
                 f"--hp_pack key '{k}' is not a per-seed vmappable hp. "
                 f"Allowed: {sorted(ALLOWED_KEYS)}"
             )
-        if k in ("seed", "T"):
+        if k in ("seed", "T", "eta") or (k in ("alpha", "beta") and cmd_pack_keys):
             continue
         arr = jnp.asarray(v, dtype=jnp.float32)
         if arr.shape != (N_seeds,):
             raise ValueError(f"--hp_pack '{k}' has shape {arr.shape}; expected ({N_seeds},)")
         target = CLI_TO_FIELD.get(k, k)
         (top_overrides if target in _TOPLEVEL_TARGETS else hp_overrides)[target] = arr
-    if not hp_overrides and not top_overrides and "T" not in hp_pack:
+    if not hp_overrides and not top_overrides and not cmd_pack_keys:
         return state
     if hp_overrides:
         state = state._replace(hp=state.hp._replace(**hp_overrides))
@@ -83,10 +86,46 @@ def apply(state, hp_pack: dict, N_seeds: int):
         state = state._replace(
             beta=jnp.sqrt(jnp.maximum(jnp.float32(0.0), jnp.float32(2.0) * kl_budget_v / m2_v))
         )
-    if "T" in hp_pack:
-        T_arr = jnp.asarray(hp_pack["T"], dtype=jnp.float32)
-        alpha_arr = jnp.asarray(state.hp.alpha, dtype=jnp.float32)
-        state = state._replace(beta=(jnp.float32(1.0) - alpha_arr) / T_arr)
+    if cmd_pack_keys:
+        values = {
+            "alpha": jnp.asarray(state.hp.alpha, dtype=jnp.float32),
+            "beta": jnp.asarray(state.beta, dtype=jnp.float32),
+            "T": jnp.asarray(state.hp.T, dtype=jnp.float32),
+            "eta": jnp.asarray(state.hp.eta, dtype=jnp.float32),
+        }
+        for name in cmd_pack_keys:
+            arr = jnp.asarray(hp_pack[name], dtype=jnp.float32)
+            if arr.shape != (N_seeds,):
+                raise ValueError(f"--hp_pack '{name}' has shape {arr.shape}; expected ({N_seeds},)")
+            values[name] = arr
+
+        resolved_alpha = []
+        resolved_beta = []
+        resolved_T = []
+        resolved_eta = []
+        for s in range(N_seeds):
+            alpha_s = float(values["alpha"][s])
+            beta_s = float(values["beta"][s])
+            T_s = float(values["T"][s])
+            eta_s = float(values["eta"][s])
+            alpha_s = None if jnp.isnan(alpha_s) else alpha_s
+            beta_s = None if jnp.isnan(beta_s) else beta_s
+            T_s = None if jnp.isnan(T_s) else T_s
+            eta_s = None if jnp.isnan(eta_s) else eta_s
+            a_res, b_res, T_res, e_res = resolve_cmd_params(alpha_s, beta_s, T_s, eta_s)
+            resolved_alpha.append(a_res)
+            resolved_beta.append(b_res)
+            resolved_T.append(T_res)
+            resolved_eta.append(e_res)
+
+        state = state._replace(
+            beta=jnp.asarray(resolved_beta, dtype=jnp.float32),
+            hp=state.hp._replace(
+                alpha=jnp.asarray(resolved_alpha, dtype=jnp.float32),
+                T=jnp.asarray(resolved_T, dtype=jnp.float32),
+                eta=jnp.asarray(resolved_eta, dtype=jnp.float32),
+            ),
+        )
     applied = list(hp_overrides.keys()) + list(top_overrides.keys())
     print(f"[hp_pack] applied per-seed overrides: {applied}")
     return state

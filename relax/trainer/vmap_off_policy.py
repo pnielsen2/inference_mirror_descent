@@ -165,13 +165,15 @@ class VmapOffPolicyTrainer:
         self._prev_adv_per_env = np.zeros((self.num_runs, self.envs_per_run), dtype=np.float32)
         self._prev_valid       = np.zeros((self.num_runs, self.envs_per_run), dtype=bool)
 
-        # Pick the on-policy EMA update path once at construction time. Off
-        # by default; the rollout block in sample() invokes this only when
-        # the algorithm advertises on_policy_ema=True (i.e. --kl_budget set).
+        # Pick the host-side advantage-state update path once at construction
+        # time. The rollout block invokes this only when the algorithm
+        # advertises on_policy_ema=True.
         if bool(getattr(self.algorithm, "one_step_dist_shift_beta", False)):
-            self._update_beta = self._ema_update_one_step
+            self._update_advantage_state = self._ema_update_one_step
+        elif bool(getattr(self.algorithm.cfg, "kl_budget", None) is not None):
+            self._update_advantage_state = self._ema_update_kl_only
         else:
-            self._update_beta = self._ema_update_kl_only
+            self._update_advantage_state = self._ema_update_m2_only
 
     # ------------------------------------------------------------------
     # Setup
@@ -243,7 +245,7 @@ class VmapOffPolicyTrainer:
         # When using one-step dist-shift, also save raw A = Q-V and the done mask
         # for the next step's cross-step covariance estimator ĉ = mean((A')²·A).
         if getattr(self.algorithm, "on_policy_ema", False) and v_per_env is not None:
-            self._update_beta(q_per_env, v_per_env)
+            self._update_advantage_state(q_per_env, v_per_env)
             if bool(getattr(self.algorithm, "one_step_dist_shift_beta", False)):
                 self._prev_adv_per_env = (q_per_env - v_per_env).copy()
                 self._prev_valid = ~(term_nm | trunc_nm)
@@ -265,6 +267,13 @@ class VmapOffPolicyTrainer:
     # ------------------------------------------------------------------
     def _ema_update_kl_only(self, q_per_env: np.ndarray, v_per_env: np.ndarray) -> np.ndarray:
         new_state, adv = ema_eta.update_state_kl_only(
+            self.algorithm.state, q_per_env, v_per_env,
+        )
+        self.algorithm.state = new_state
+        return adv
+
+    def _ema_update_m2_only(self, q_per_env: np.ndarray, v_per_env: np.ndarray) -> np.ndarray:
+        new_state, adv = ema_eta.update_state_m2_only(
             self.algorithm.state, q_per_env, v_per_env,
         )
         self.algorithm.state = new_state
