@@ -152,13 +152,10 @@ class MGMD:
             # Python loop is unrolled once during JIT tracing.
             value_params_updated = state.value_params
             value_opt_state_updated = state.opt_state.value
-            q_loss_logs = []
-            value_loss_logs = []
             for _ in range(self.cfg.critic_update_steps):
                 q_params, q_opt_states, q_losses = self._train_q_ensemble(
                     state, obs, action, q_params, q_opt_states, q_backup_per_q
                 )
-                q_loss_logs.append(jnp.mean(q_losses))
 
                 value_step_state = state._replace(
                     value_params=value_params_updated,
@@ -166,10 +163,9 @@ class MGMD:
                 )
                 value_params_updated, value_opt_state_updated, value_loss = \
                     self._value_update_step(value_step_state, per_q_target_values, next_obs)
-                value_loss_logs.append(value_loss)
 
-            q_loss = jnp.mean(jnp.stack(q_loss_logs))
-            value_loss_log = jnp.mean(jnp.stack(value_loss_logs))
+            q_loss = jnp.mean(q_losses)
+            value_loss_log = value_loss
 
             target_q_params = tuple(delayed_target_update(q_params[i], target_q_params[i], state.hp.polyak_tau, step, self.cfg.delay_update) for i in range(num_q))
 
@@ -191,7 +187,6 @@ class MGMD:
             def _do(_):
                 updated_policy_params = policy_params
                 updated_policy_opt_state = policy_opt_state
-                policy_loss_logs = []
                 for policy_step_idx in range(self.cfg.policy_update_steps):
                     # Preserve the exact old random stream for P=1; additional
                     # steps derive independent keys from the same base keys.
@@ -213,12 +208,7 @@ class MGMD:
                         step,
                         1,
                     )
-                    policy_loss_logs.append(loss)
-                return (
-                    jnp.mean(jnp.stack(policy_loss_logs)),
-                    updated_policy_params,
-                    updated_policy_opt_state,
-                )
+                return loss, updated_policy_params, updated_policy_opt_state
             total_loss, policy_params, policy_opt_state = jax.lax.cond(
                 step % self.cfg.delay_update == 0, _do,
                 lambda _: (state.policy_loss, policy_params, policy_opt_state), None)
