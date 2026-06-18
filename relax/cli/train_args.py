@@ -45,6 +45,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr_policy", type=float, default=None)
     parser.add_argument("--lr_q", type=float, default=None)
     parser.add_argument("--update_per_iteration", type=int, default=1)
+    parser.add_argument("--critic_update_steps", type=int, default=1, help="Number of Q/V optimizer steps inside each stateless update. All steps reuse the same sampled minibatch and fixed TD/value targets. Default 1.")
+    parser.add_argument("--policy_update_steps", type=int, default=1, help="Number of diffusion-policy optimizer steps when the delay_update gate fires. Steps reuse the same tilted-action batch but resample diffusion timestep/noise. Default 1.")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor for the Q critic. Default 0.99.")
     parser.add_argument("--polyak_tau", type=float, default=0.005, help="Polyak averaging coefficient for target network updates. Default 0.005.")
     parser.add_argument("--delay_update", type=int, default=2, help="Update policy and target networks every delay_update steps. Default 2.")
@@ -122,5 +124,13 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
         parser.error("--parallel_runs must be >= 1.")
     if args.num_vec_envs <= 0:
         parser.error("--num_vec_envs must be > 0.")
+    if args.update_per_iteration <= 0:
+        parser.error("--update_per_iteration must be > 0.")
+    if args.critic_update_steps <= 0:
+        parser.error("--critic_update_steps must be > 0.")
+    if args.policy_update_steps <= 0:
+        parser.error("--policy_update_steps must be > 0.")
+    if args.delay_update <= 0:
+        parser.error("--delay_update must be > 0.")
     if args.mala_steps <= 0:
         parser.error("--mala_steps must be > 0; the non-MALA sampling branches have been removed.")
