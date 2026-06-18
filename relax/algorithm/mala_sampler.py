@@ -104,30 +104,37 @@ def build_mala_sampler(
 
             eps_pred = model.eps_pred(policy_params, obs, x_in, t_idx)
             x0_hat = reconstruct_x0_from_noise(x_in, t_idx, eps_pred)
-            if guidance_gradient_space == "x0hatclipped":
-                x0_hat = jnp.clip(x0_hat, -x0_hat_clip_radius, x0_hat_clip_radius)
+            if guidance_gradient_space == "x0hat":
+                return jax.grad(
+                    lambda x0: guidance_multiplier * reduce_over_batch(
+                        q_aggregated_at_clipped_x0_hat(x0)
+                    )
+                )(jax.lax.stop_gradient(x0_hat))
+
+            x0_clipped = jnp.clip(x0_hat, -x0_hat_clip_radius, x0_hat_clip_radius)
             return jax.grad(
                 lambda action: guidance_multiplier * reduce_over_batch(
                     aggregate_q_fn([model.q(qp, obs, action) for qp in q_params_tuple])
                 )
-            )(jax.lax.stop_gradient(x0_hat))
+            )(jax.lax.stop_gradient(x0_clipped))
 
         def jacobian_free_energy_and_drift(t_idx, x):
             E_vals, vjp_fn = jax.vjp(lambda a: model.energy_fn(policy_params, obs, a, t_idx), x)
             (e_grad,) = vjp_fn(jnp.ones_like(E_vals))
             noise_pred = schedule.sqrt_one_minus_alphas_cumprod[t_idx] * e_grad
             x0_hat = reconstruct_x0_from_noise(x, t_idx, noise_pred)
-            x0_eval = (
-                jnp.clip(x0_hat, -x0_hat_clip_radius, x0_hat_clip_radius)
-                if guidance_gradient_space == "x0hatclipped"
-                else x0_hat
-            )
-            q = aggregate_q_fn([model.q(qp, obs, x0_eval) for qp in q_params_tuple])
-            grad_q = jax.grad(
-                lambda action: jnp.sum(
-                    aggregate_q_fn([model.q(qp, obs, action) for qp in q_params_tuple])
-                )
-            )(jax.lax.stop_gradient(x0_eval))
+            x0_clipped = jnp.clip(x0_hat, -x0_hat_clip_radius, x0_hat_clip_radius)
+            q = aggregate_q_fn([model.q(qp, obs, x0_clipped) for qp in q_params_tuple])
+            if guidance_gradient_space == "x0hat":
+                grad_q = jax.grad(
+                    lambda x0: jnp.sum(q_aggregated_at_clipped_x0_hat(x0))
+                )(jax.lax.stop_gradient(x0_hat))
+            else:
+                grad_q = jax.grad(
+                    lambda action: jnp.sum(
+                        aggregate_q_fn([model.q(qp, obs, action) for qp in q_params_tuple])
+                    )
+                )(jax.lax.stop_gradient(x0_clipped))
             energy = state.hp.alpha * E_vals - beta_current * q
             grad_energy = state.hp.alpha * e_grad - beta_current * grad_q
             clip_frac = jnp.mean((jnp.abs(x0_hat) > x0_hat_clip_radius).astype(jnp.float32))
