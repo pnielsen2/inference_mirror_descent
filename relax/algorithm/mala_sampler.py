@@ -30,6 +30,7 @@ def build_mala_sampler(
     compute_final_q: bool = True,
     advantage_normalization: bool,
     denoising_predictor: str,
+    guidance_gradient_space: str,
 ) -> Callable:
     """Return ``stateless_get_action_mala_full(key, state, obs, aggregate_q_fn)``.
 
@@ -71,34 +72,112 @@ def build_mala_sampler(
                 - noise_pred * schedule.sqrt_recipm1_alphas_cumprod[t_idx]
             )
 
+        def reconstruct_x0_from_xt(x_in, t_idx):
+            eps_pred = model.eps_pred(policy_params, obs, x_in, t_idx)
+            return reconstruct_x0_from_noise(x_in, t_idx, eps_pred)
+
+        def clip_x0_hat(x0_hat):
+            return jnp.clip(x0_hat, -x0_hat_clip_radius, x0_hat_clip_radius)
+
+        def q_aggregated_at_action(action):
+            return aggregate_q_fn([model.q(qp, obs, action) for qp in q_params_tuple])
+
         def q_aggregated_at_clipped_x0_hat(x0_hat):
-            x0_clipped = jnp.clip(x0_hat, -x0_hat_clip_radius, x0_hat_clip_radius)
-            return aggregate_q_fn([model.q(qp, obs, x0_clipped) for qp in q_params_tuple])
+            return q_aggregated_at_action(clip_x0_hat(x0_hat))
 
         # beta_current = β: fixed constant, sqrt(2δ/M) (KL-budget), or
         # min(β_KL, β*) (one-step dist-shift), depending on run config.
-        def energy_total(t, x):
-            E_vals, vjp_fn = jax.vjp(lambda a: model.energy_fn(policy_params, obs, a, t), x)
-            (e_grad,) = vjp_fn(jnp.ones_like(E_vals))
-            noise_pred = schedule.sqrt_one_minus_alphas_cumprod[t] * e_grad  # ε̂ = σ_t ∇_x E_θ
-            x0_hat = reconstruct_x0_from_noise(x, t, noise_pred)
-            clip_frac = jnp.mean((jnp.abs(x0_hat) > x0_hat_clip_radius).astype(jnp.float32))
-            return state.hp.alpha * E_vals - beta_current * q_aggregated_at_clipped_x0_hat(x0_hat), clip_frac
+        def base_energy_value_and_grad(t_idx, x):
+            E_vals, vjp_fn = jax.vjp(
+                lambda a: model.energy_fn(policy_params, obs, a, t_idx),
+                x,
+            )
+            grad_E = vjp_fn(jnp.ones_like(E_vals))[0]
+            return E_vals, grad_E
 
-        def guidance_value_from_x(x_in, t_idx):
-            # Tweedie-clean prediction with alpha-scaled base
-            # score; guidance component is NOT scaled.
-            eps_pred = model.eps_pred(policy_params, obs, x_in, t_idx)
-            x0_hat = reconstruct_x0_from_noise(x_in, t_idx, eps_pred)
+        def reconstruct_mala_x0_hat(x, t_idx, grad_E):
+            noise_pred = schedule.sqrt_one_minus_alphas_cumprod[t_idx] * grad_E
+            return reconstruct_x0_from_noise(x, t_idx, noise_pred)
+
+        def compute_clip_frac(x0_hat):
+            return jnp.mean(
+                (jnp.abs(x0_hat) > x0_hat_clip_radius).astype(jnp.float32)
+            )
+
+        def mala_q_gradient_at_action(action):
+            action_eval = jax.lax.stop_gradient(action)
+            return jax.grad(
+                lambda a: jnp.sum(q_aggregated_at_action(a))
+            )(action_eval)
+
+        def xt_target_energy(t_idx, x):
+            E_vals, grad_E = base_energy_value_and_grad(t_idx, x)
+            x0_hat = reconstruct_mala_x0_hat(x, t_idx, grad_E)
             q = q_aggregated_at_clipped_x0_hat(x0_hat)
+            energy = state.hp.alpha * E_vals - beta_current * q
+            return energy, compute_clip_frac(x0_hat)
 
-            # KL-budget mode adapts beta from advantage-moment statistics,
-            # but the sampling objective here still uses the same clipped-Q
-            # guidance term as the fixed-beta path.
+        def xt_energy_and_drift(t_idx, x):
+            energy, vjp_fn, clip_frac = jax.vjp(
+                lambda z: xt_target_energy(t_idx, z),
+                x,
+                has_aux=True,
+            )
+            grad_energy = vjp_fn(jnp.ones_like(energy))[0]
+            return energy, grad_energy, clip_frac
+
+        def x0hat_energy_and_drift(t_idx, x):
+            E_vals, grad_E = base_energy_value_and_grad(t_idx, x)
+            x0_hat = reconstruct_mala_x0_hat(x, t_idx, grad_E)
+            q = q_aggregated_at_action(x0_hat)
+            grad_q = mala_q_gradient_at_action(x0_hat)
+            energy = state.hp.alpha * E_vals - beta_current * q
+            grad_energy = state.hp.alpha * grad_E - beta_current * grad_q
+            return energy, grad_energy, compute_clip_frac(x0_hat)
+
+        def x0hatclipped_energy_and_drift(t_idx, x):
+            E_vals, grad_E = base_energy_value_and_grad(t_idx, x)
+            x0_hat = reconstruct_mala_x0_hat(x, t_idx, grad_E)
+            x0_eval = clip_x0_hat(x0_hat)
+            q = q_aggregated_at_action(x0_eval)
+            grad_q = mala_q_gradient_at_action(x0_eval)
+            energy = state.hp.alpha * E_vals - beta_current * q
+            grad_energy = state.hp.alpha * grad_E - beta_current * grad_q
+            return energy, grad_energy, compute_clip_frac(x0_hat)
+
+        if guidance_gradient_space == "xt":
+            mala_energy_and_drift = xt_energy_and_drift
+        elif guidance_gradient_space == "x0hat":
+            mala_energy_and_drift = x0hat_energy_and_drift
+        else:
+            mala_energy_and_drift = x0hatclipped_energy_and_drift
+
+        def predictor_q_scalar(action):
+            q = q_aggregated_at_action(action)
             return guidance_multiplier * reduce_over_batch(q)
 
-        def compute_guidance_gradient(x_in, t_idx):
-            return jax.grad(lambda x: guidance_value_from_x(x, t_idx))(x_in)
+        def compute_xt_guidance_gradient(x_in, t_idx):
+            def guidance_value_from_xt(x):
+                x0_hat = reconstruct_x0_from_xt(x, t_idx)
+                return predictor_q_scalar(clip_x0_hat(x0_hat))
+
+            return jax.grad(guidance_value_from_xt)(x_in)
+
+        def compute_x0hat_guidance_gradient(x_in, t_idx):
+            x0_hat = jax.lax.stop_gradient(reconstruct_x0_from_xt(x_in, t_idx))
+            return jax.grad(predictor_q_scalar)(x0_hat)
+
+        def compute_x0hatclipped_guidance_gradient(x_in, t_idx):
+            x0_hat = reconstruct_x0_from_xt(x_in, t_idx)
+            x0_eval = jax.lax.stop_gradient(clip_x0_hat(x0_hat))
+            return jax.grad(predictor_q_scalar)(x0_eval)
+
+        if guidance_gradient_space == "xt":
+            compute_guidance_gradient = compute_xt_guidance_gradient
+        elif guidance_gradient_space == "x0hat":
+            compute_guidance_gradient = compute_x0hat_guidance_gradient
+        else:
+            compute_guidance_gradient = compute_x0hatclipped_guidance_gradient
 
         # ---- Denoising predictor step (chosen at build time) -----------------
         def guided_eps_pred(t_idx, x_in):
@@ -145,10 +224,8 @@ def build_mala_sampler(
 
             def mala_body(_, state):
                 x_current, rng_step, log_eta_scale, accept_rate_sum, clip_frac_sum = state
-                # Langevin Dynamics transition for Metropolis-Hastings forward proposal
-                # compute energy, vector-jacobian product, and clip_frac in one pass
-                E_x, vjp_x, clip_x = jax.vjp(lambda x: energy_total(t_idx, x), x_current, has_aux=True)
-                grad_E_x = vjp_x(jnp.ones_like(E_x))[0]
+                # Langevin Dynamics transition for Metropolis-Hastings forward proposal.
+                E_x, grad_E_x, clip_x = mala_energy_and_drift(t_idx, x_current)
                 step_size = jnp.clip(jnp.exp(log_eta_scale) * eta_base_t, jnp.float32(1e-8), eta_upper)
 
                 proposal_mean = x_current - step_size * grad_E_x
@@ -158,10 +235,8 @@ def build_mala_sampler(
                 z = jax.random.normal(noise_key, x_current.shape)
                 
                 x_prop = proposal_mean + proposal_std * z
-                # Langevin Dynamics reverse transition for Metropolis-Hastings acceptance
-                # compute energy, vector-jacobian product, and clip_frac in one pass
-                E_x_prop, vjp_x_prop, _clip_prop = jax.vjp(lambda xx: energy_total(t_idx, xx), x_prop, has_aux=True)
-                grad_E_x_prop = vjp_x_prop(jnp.ones_like(E_x_prop))[0]
+                # Reverse proposal uses the same gradient mode at the proposed point.
+                E_x_prop, grad_E_x_prop, _clip_prop = mala_energy_and_drift(t_idx, x_prop)
 
                 reverse_mean = x_prop - step_size * grad_E_x_prop
 

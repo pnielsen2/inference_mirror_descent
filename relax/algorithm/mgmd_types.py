@@ -122,6 +122,7 @@ class MGMDConfig:
     initial_dist_shift_shape_ema: float = -1.0
     kl_budget: Optional[float] = None
     one_step_dist_shift_beta: bool = False
+    guidance_gradient_space: str = "xt"
 
     @classmethod
     def from_args(cls, args) -> "MGMDConfig":
@@ -157,4 +158,5 @@ class MGMDConfig:
             initial_dist_shift_shape_ema=args.initial_dist_shift_shape_ema,
             kl_budget=args.kl_budget,
             one_step_dist_shift_beta=args.one_step_dist_shift_beta,
+            guidance_gradient_space=args.guidance_gradient_space,
         )
