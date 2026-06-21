@@ -30,6 +30,7 @@ def build_mala_sampler(
     compute_final_q: bool = True,
     advantage_normalization: bool,
     denoising_predictor: str,
+    guidance_gradient_space: str,
 ) -> Callable:
     """Return ``stateless_get_action_mala_full(key, state, obs, aggregate_q_fn)``.
 
@@ -98,7 +99,46 @@ def build_mala_sampler(
             return guidance_multiplier * reduce_over_batch(q)
 
         def compute_guidance_gradient(x_in, t_idx):
-            return jax.grad(lambda x: guidance_value_from_x(x, t_idx))(x_in)
+            if guidance_gradient_space == "xt":
+                return jax.grad(lambda x: guidance_value_from_x(x, t_idx))(x_in)
+
+            eps_pred = model.eps_pred(policy_params, obs, x_in, t_idx)
+            x0_hat = reconstruct_x0_from_noise(x_in, t_idx, eps_pred)
+            if guidance_gradient_space == "x0hat":
+                return jax.grad(
+                    lambda x0: guidance_multiplier * reduce_over_batch(
+                        q_aggregated_at_clipped_x0_hat(x0)
+                    )
+                )(jax.lax.stop_gradient(x0_hat))
+
+            x0_clipped = jnp.clip(x0_hat, -x0_hat_clip_radius, x0_hat_clip_radius)
+            return jax.grad(
+                lambda action: guidance_multiplier * reduce_over_batch(
+                    aggregate_q_fn([model.q(qp, obs, action) for qp in q_params_tuple])
+                )
+            )(jax.lax.stop_gradient(x0_clipped))
+
+        def jacobian_free_energy_and_drift(t_idx, x):
+            E_vals, vjp_fn = jax.vjp(lambda a: model.energy_fn(policy_params, obs, a, t_idx), x)
+            (e_grad,) = vjp_fn(jnp.ones_like(E_vals))
+            noise_pred = schedule.sqrt_one_minus_alphas_cumprod[t_idx] * e_grad
+            x0_hat = reconstruct_x0_from_noise(x, t_idx, noise_pred)
+            x0_clipped = jnp.clip(x0_hat, -x0_hat_clip_radius, x0_hat_clip_radius)
+            q = aggregate_q_fn([model.q(qp, obs, x0_clipped) for qp in q_params_tuple])
+            if guidance_gradient_space == "x0hat":
+                grad_q = jax.grad(
+                    lambda x0: jnp.sum(q_aggregated_at_clipped_x0_hat(x0))
+                )(jax.lax.stop_gradient(x0_hat))
+            else:
+                grad_q = jax.grad(
+                    lambda action: jnp.sum(
+                        aggregate_q_fn([model.q(qp, obs, action) for qp in q_params_tuple])
+                    )
+                )(jax.lax.stop_gradient(x0_clipped))
+            energy = state.hp.alpha * E_vals - beta_current * q
+            grad_energy = state.hp.alpha * e_grad - beta_current * grad_q
+            clip_frac = jnp.mean((jnp.abs(x0_hat) > x0_hat_clip_radius).astype(jnp.float32))
+            return energy, grad_energy, clip_frac
 
         # ---- Denoising predictor step (chosen at build time) -----------------
         def guided_eps_pred(t_idx, x_in):
@@ -147,8 +187,11 @@ def build_mala_sampler(
                 x_current, rng_step, log_eta_scale, accept_rate_sum, clip_frac_sum = state
                 # Langevin Dynamics transition for Metropolis-Hastings forward proposal
                 # compute energy, vector-jacobian product, and clip_frac in one pass
-                E_x, vjp_x, clip_x = jax.vjp(lambda x: energy_total(t_idx, x), x_current, has_aux=True)
-                grad_E_x = vjp_x(jnp.ones_like(E_x))[0]
+                if guidance_gradient_space == "xt":
+                    E_x, vjp_x, clip_x = jax.vjp(lambda x: energy_total(t_idx, x), x_current, has_aux=True)
+                    grad_E_x = vjp_x(jnp.ones_like(E_x))[0]
+                else:
+                    E_x, grad_E_x, clip_x = jacobian_free_energy_and_drift(t_idx, x_current)
                 step_size = jnp.clip(jnp.exp(log_eta_scale) * eta_base_t, jnp.float32(1e-8), eta_upper)
 
                 proposal_mean = x_current - step_size * grad_E_x
@@ -160,8 +203,11 @@ def build_mala_sampler(
                 x_prop = proposal_mean + proposal_std * z
                 # Langevin Dynamics reverse transition for Metropolis-Hastings acceptance
                 # compute energy, vector-jacobian product, and clip_frac in one pass
-                E_x_prop, vjp_x_prop, _clip_prop = jax.vjp(lambda xx: energy_total(t_idx, xx), x_prop, has_aux=True)
-                grad_E_x_prop = vjp_x_prop(jnp.ones_like(E_x_prop))[0]
+                if guidance_gradient_space == "xt":
+                    E_x_prop, vjp_x_prop, _clip_prop = jax.vjp(lambda xx: energy_total(t_idx, xx), x_prop, has_aux=True)
+                    grad_E_x_prop = vjp_x_prop(jnp.ones_like(E_x_prop))[0]
+                else:
+                    E_x_prop, grad_E_x_prop, _clip_prop = jacobian_free_energy_and_drift(t_idx, x_prop)
 
                 reverse_mean = x_prop - step_size * grad_E_x_prop
 

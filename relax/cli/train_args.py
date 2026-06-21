@@ -45,6 +45,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr_policy", type=float, default=None)
     parser.add_argument("--lr_q", type=float, default=None)
     parser.add_argument("--update_per_iteration", type=int, default=1)
+    parser.add_argument("--critic_update_steps", type=int, default=1, help="Number of Q/V optimizer steps inside each stateless update. All steps reuse the same sampled minibatch and fixed TD/value targets. Default 1.")
+    parser.add_argument("--policy_update_steps", type=int, default=1, help="Number of diffusion-policy optimizer steps when the delay_update gate fires. Steps reuse the same tilted-action batch but resample diffusion timestep/noise. Default 1.")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor for the Q critic. Default 0.99.")
     parser.add_argument("--polyak_tau", type=float, default=0.005, help="Polyak averaging coefficient for target network updates. Default 0.005.")
     parser.add_argument("--delay_update", type=int, default=2, help="Update policy and target networks every delay_update steps. Default 2.")
@@ -72,6 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--guidance_strength_multiplier", type=float, default=1.0, help="Constant multiplier applied to the guided-predictor Q scalar before jax.grad. Composes with --batch_independent_guidance.")
     parser.add_argument("--policy_parameterization", type=str, default="E", choices=["E", "f"], help="Parameterization of the energy network scalar output. 'E' (default): network outputs E_theta; eps_pred = sqrt(1-alpha_bar_t)*grad E. 'f': network outputs f = sqrt(1-alpha_bar_t)*E_theta; eps_pred = grad f, energy_fn = f/sqrt(1-alpha_bar_t).")
     parser.add_argument("--policy_final_layer", type=str, default="default", choices=["default", "ff", "L2", "IP"], help="Final-layer head of the scalar policy network. 'default': replace DACERPolicyNet final layer with Linear(1). 'ff': keep full DACERPolicyNet (act_dim output) and tack on an extra learned Linear(1). 'L2': full backbone then E = -0.5*||v||^2 (no extra params). 'IP': full backbone then E = v·a (inner product with action, no extra params).")
+    parser.add_argument("--guidance_gradient_space", type=str, default="xt", choices=["xt", "x0hat", "x0hatclipped"], help="Whether to take the Q gradient with respect to 'xt' or the predicted clean action 'x0hat' or its clipped version 'x0hatclipped'.")
 
     # ----- MALA -------------------------------------------------------------
     parser.add_argument("--mala_steps", type=int, default=0, help="Number of MALA correction steps per diffusion step.")
@@ -121,5 +124,13 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
         parser.error("--parallel_runs must be >= 1.")
     if args.num_vec_envs <= 0:
         parser.error("--num_vec_envs must be > 0.")
+    if args.update_per_iteration <= 0:
+        parser.error("--update_per_iteration must be > 0.")
+    if args.critic_update_steps <= 0:
+        parser.error("--critic_update_steps must be > 0.")
+    if args.policy_update_steps <= 0:
+        parser.error("--policy_update_steps must be > 0.")
+    if args.delay_update <= 0:
+        parser.error("--delay_update must be > 0.")
     if args.mala_steps <= 0:
         parser.error("--mala_steps must be > 0; the non-MALA sampling branches have been removed.")

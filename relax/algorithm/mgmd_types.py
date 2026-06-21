@@ -122,6 +122,9 @@ class MGMDConfig:
     initial_dist_shift_shape_ema: float = -1.0
     kl_budget: Optional[float] = None
     one_step_dist_shift_beta: bool = False
+    guidance_gradient_space: str = "xt"
+    critic_update_steps: int = 1
+    policy_update_steps: int = 1
 
     @classmethod
     def from_args(cls, args) -> "MGMDConfig":
@@ -138,6 +141,8 @@ class MGMDConfig:
             lr_policy=float(lr_policy),
             lr_q=float(lr_q),
             delay_update=args.delay_update,
+            critic_update_steps=args.critic_update_steps,
+            policy_update_steps=args.policy_update_steps,
             reward_scale=args.reward_scale,
             q_agg_sample=args.q_agg_sample,
             beta=args.beta,
@@ -157,4 +162,5 @@ class MGMDConfig:
             initial_dist_shift_shape_ema=args.initial_dist_shift_shape_ema,
             kl_budget=args.kl_budget,
             one_step_dist_shift_beta=args.one_step_dist_shift_beta,
+            guidance_gradient_space=args.guidance_gradient_space,
         )

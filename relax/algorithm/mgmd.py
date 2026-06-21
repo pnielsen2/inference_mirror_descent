@@ -81,6 +81,7 @@ class MGMD:
             batch_independent_guidance=self.cfg.batch_independent_guidance,
             advantage_normalization=self.cfg.advantage_normalization,
             denoising_predictor=self.cfg.denoising_predictor,
+            guidance_gradient_space=self.cfg.guidance_gradient_space,
         )
         sampler = build_mala_sampler(**_sampler_kw)
         # Both sampling paths (rollout + TD next-action) use --q_agg_sample aggregation.
@@ -146,36 +147,68 @@ class MGMD:
             shared_backup = reward + (1 - done) * state.hp.gamma * q_target_min_for_backup
             q_backup_per_q = [shared_backup] * num_q
 
-            # One Adam step on each of the N Q critics against its TD target.
-            q_params, q_opt_states, all_q_losses = self._train_q_ensemble(
-                state, obs, action, q_params, q_opt_states, q_backup_per_q
-            )
+            # Reuse this minibatch and its fixed targets for C sequential
+            # critic/value optimizer steps. C is a static config value, so the
+            # Python loop is unrolled once during JIT tracing.
+            value_params_updated = state.value_params
+            value_opt_state_updated = state.opt_state.value
+            for _ in range(self.cfg.critic_update_steps):
+                q_params, q_opt_states, q_losses = self._train_q_ensemble(
+                    state, obs, action, q_params, q_opt_states, q_backup_per_q
+                )
 
-            # No-op when not doing adaptive beta
-            value_params_updated, value_opt_state_updated, value_loss_log = \
-                self._value_update_step(state, per_q_target_values, next_obs)
+                value_step_state = state._replace(
+                    value_params=value_params_updated,
+                    opt_state=state.opt_state._replace(value=value_opt_state_updated),
+                )
+                value_params_updated, value_opt_state_updated, value_loss = \
+                    self._value_update_step(value_step_state, per_q_target_values, next_obs)
+
+            q_loss = jnp.mean(q_losses)
+            value_loss_log = value_loss
 
             target_q_params = tuple(delayed_target_update(q_params[i], target_q_params[i], state.hp.polyak_tau, step, self.cfg.delay_update) for i in range(num_q))
 
-            def policy_loss_fn(policy_params) -> jax.Array:
+            def policy_loss_fn(policy_params, time_key, noise_key) -> jax.Array:
                 # Standard diffusion score-matching loss (eps-MSE)
                 # against ``tilted_action`` (target action sampled above).
                 # Uses optax.squared_error (== (x-y)**2), NOT optax.l2_loss (== 0.5*(x-y)**2)
                 t = jax.random.randint(
-                    diffusion_time_key,
+                    time_key,
                     (obs.shape[0],),
                     0,
                     self.model.num_timesteps,
                 )
-                noise = jax.random.normal(diffusion_noise_key, tilted_action.shape)
+                noise = jax.random.normal(noise_key, tilted_action.shape)
                 tilted_action_noisy = self.model.q_sample(t, tilted_action, noise)
                 noise_pred = self.model.eps_pred(policy_params, next_obs, tilted_action_noisy, t)
                 return optax.squared_error(noise_pred, noise).mean()
 
             def _do(_):
-                loss, grads = jax.value_and_grad(policy_loss_fn)(policy_params)
-                return (loss,) + delayed_param_update(
-                    self.policy_optim, policy_params, grads, policy_opt_state, state.hp.lr_policy, step, 1)
+                updated_policy_params = policy_params
+                updated_policy_opt_state = policy_opt_state
+                for policy_step_idx in range(self.cfg.policy_update_steps):
+                    # Preserve the exact old random stream for P=1; additional
+                    # steps derive independent keys from the same base keys.
+                    if policy_step_idx == 0:
+                        time_key = diffusion_time_key
+                        noise_key = diffusion_noise_key
+                    else:
+                        time_key = jax.random.fold_in(diffusion_time_key, policy_step_idx)
+                        noise_key = jax.random.fold_in(diffusion_noise_key, policy_step_idx)
+                    loss, grads = jax.value_and_grad(policy_loss_fn)(
+                        updated_policy_params, time_key, noise_key
+                    )
+                    updated_policy_params, updated_policy_opt_state = delayed_param_update(
+                        self.policy_optim,
+                        updated_policy_params,
+                        grads,
+                        updated_policy_opt_state,
+                        state.hp.lr_policy,
+                        step,
+                        1,
+                    )
+                return loss, updated_policy_params, updated_policy_opt_state
             total_loss, policy_params, policy_opt_state = jax.lax.cond(
                 step % self.cfg.delay_update == 0, _do,
                 lambda _: (state.policy_loss, policy_params, policy_opt_state), None)
@@ -192,8 +225,6 @@ class MGMD:
             )
 
             # --- Losses ---
-            q_loss = jnp.mean(all_q_losses)
-
             info = {
                 self.policy_loss_key: total_loss,
                 "losses/Q_loss": q_loss,
