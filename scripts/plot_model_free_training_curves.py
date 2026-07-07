@@ -13,6 +13,8 @@ import pandas as pd
 from datetime import datetime
 import os
 
+from relax.utils.fs import PROJECT_ROOT, wandb_entity_project
+
 # MuJoCo environments to support
 MUJOCO_ENVS = [
     "HalfCheetah-v4",
@@ -119,7 +121,7 @@ def find_runs_for_env(api, env_name, tfg_eta=16.0, seeds=None, most_recent_n=5):
     Returns:
         List of matching runs
     """
-    runs = api.runs("diffusion_online_rl")
+    runs = api.runs(wandb_entity_project())
     
     matching_runs = []
     runs_by_seed = defaultdict(list)
@@ -237,7 +239,7 @@ def main():
     tfg_eta = 16.0
     target_seeds = [0, 1, 2, 3, 4]
     
-    figures_dir = "/n/home09/pnielsen/inference_mirror_descent/figures"
+    figures_dir = str(PROJECT_ROOT / "figures")
     os.makedirs(figures_dir, exist_ok=True)
     
     results_summary = {}

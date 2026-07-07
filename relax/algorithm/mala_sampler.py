@@ -28,9 +28,11 @@ def build_mala_sampler(
     timesteps: int,
     batch_independent_guidance: bool,
     compute_final_q: bool = True,
-    advantage_normalization: bool,
+    ema_normalization: bool,
     denoising_predictor: str,
     guidance_gradient_space: str,
+    num_denoised_actions: int = 1,
+    batch_advantage_normalization: bool = False,
 ) -> Callable:
     """Return ``stateless_get_action_mala_full(key, state, obs, aggregate_q_fn)``.
 
@@ -53,17 +55,52 @@ def build_mala_sampler(
         x0_hat_clip_radius = state.hp.x0_hat_clip_radius
         mala_adapt_rate = state.hp.mala_adapt_rate
         guidance_multiplier = state.hp.guidance_mult
+        guidance_mult_increasing = state.hp.guidance_mult_increasing
 
+        # Denoise K actions per state: broadcast a leading [K] axis onto obs so
+        # every downstream Q / energy / eps call yields [K, batch, ...]. The K
+        # slices are iid (independent x_T + MALA noise), so index 0 is a uniform
+        # draw and the K per-state samples feed --batch_advantage_normalization.
+        K = num_denoised_actions
+        obs = jnp.broadcast_to(obs, (K, *obs.shape))
         action_shape = (*obs.shape[:-1], model.act_dim)
 
         key_x, loop_key = jax.random.split(key, 2)
         schedule = model.schedule
         x_recon_clip_radius = model.x_recon_clip_radius
-        reduce_over_batch = jnp.sum if batch_independent_guidance else jnp.mean
-        if advantage_normalization:
+        increasing_scheduler = schedule.alphas_cumprod / schedule.alphas_cumprod_prev
+        increasing_scheduler = increasing_scheduler / jnp.maximum(increasing_scheduler[0], jnp.float32(1e-8))
+        if ema_normalization:
             beta_current = beta_cmd / jnp.sqrt(jnp.maximum(state.advantage_second_moment_ema, jnp.float32(1e-6)))
         else:
             beta_current = beta_cmd
+
+        # Reduce a per-sample q [K, batch] to the scalar jax.grad differentiates:
+        # the K denoised actions are independent samples (summed over axis 0),
+        # while the batch axis is summed (batch-independent) or meaned (1/B).
+        # For K=1 this matches the previous jnp.sum / jnp.mean exactly.
+        def reduce_over_batch(q):
+            q = jnp.sum(q, axis=0)
+            return jnp.sum(q) if batch_independent_guidance else jnp.mean(q)
+
+        # --batch_advantage_normalization: divide Q by sqrt(mean_s Var_K(Q)) --
+        # the batch-mean of the per-state sample variance (ddof=1) over the K
+        # denoised actions. stop-gradient'd, so it only rescales the guidance
+        # magnitude (grad flows through the numerator Q).
+        def maybe_batch_normalize(q):
+            if not batch_advantage_normalization:
+                return q
+            denom = jnp.sqrt(jnp.maximum(jnp.mean(jnp.var(q, axis=0, ddof=1)), jnp.float32(1e-6)))
+            return q / jax.lax.stop_gradient(denom)
+
+        def agg_q_at_action(action):
+            return maybe_batch_normalize(aggregate_q_fn([model.q(qp, obs, action) for qp in q_params_tuple]))
+
+        def guidance_multiplier_at_t(t_idx):
+            return guidance_multiplier * (
+                (jnp.float32(1.0) - guidance_mult_increasing)
+                + guidance_mult_increasing * increasing_scheduler[t_idx]
+            )
 
         # ---- Shared Tweedie building blocks -------------------------
         def reconstruct_x0_from_noise(x_in, t_idx, noise_pred):
@@ -74,7 +111,7 @@ def build_mala_sampler(
 
         def q_aggregated_at_clipped_x0_hat(x0_hat):
             x0_clipped = jnp.clip(x0_hat, -x0_hat_clip_radius, x0_hat_clip_radius)
-            return aggregate_q_fn([model.q(qp, obs, x0_clipped) for qp in q_params_tuple])
+            return agg_q_at_action(x0_clipped)
 
         # beta_current = β: fixed constant, sqrt(2δ/M) (KL-budget), or
         # min(β_KL, β*) (one-step dist-shift), depending on run config.
@@ -92,13 +129,15 @@ def build_mala_sampler(
             eps_pred = model.eps_pred(policy_params, obs, x_in, t_idx)
             x0_hat = reconstruct_x0_from_noise(x_in, t_idx, eps_pred)
             q = q_aggregated_at_clipped_x0_hat(x0_hat)
+            guidance_multiplier_t = guidance_multiplier_at_t(t_idx)
 
             # KL-budget mode adapts beta from advantage-moment statistics,
             # but the sampling objective here still uses the same clipped-Q
             # guidance term as the fixed-beta path.
-            return guidance_multiplier * reduce_over_batch(q)
+            return guidance_multiplier_t * reduce_over_batch(q)
 
         def compute_guidance_gradient(x_in, t_idx):
+            guidance_multiplier_t = guidance_multiplier_at_t(t_idx)
             if guidance_gradient_space == "xt":
                 return jax.grad(lambda x: guidance_value_from_x(x, t_idx))(x_in)
 
@@ -106,15 +145,15 @@ def build_mala_sampler(
             x0_hat = reconstruct_x0_from_noise(x_in, t_idx, eps_pred)
             if guidance_gradient_space == "x0hat":
                 return jax.grad(
-                    lambda x0: guidance_multiplier * reduce_over_batch(
+                    lambda x0: guidance_multiplier_t * reduce_over_batch(
                         q_aggregated_at_clipped_x0_hat(x0)
                     )
                 )(jax.lax.stop_gradient(x0_hat))
 
             x0_clipped = jnp.clip(x0_hat, -x0_hat_clip_radius, x0_hat_clip_radius)
             return jax.grad(
-                lambda action: guidance_multiplier * reduce_over_batch(
-                    aggregate_q_fn([model.q(qp, obs, action) for qp in q_params_tuple])
+                lambda action: guidance_multiplier_t * reduce_over_batch(
+                    agg_q_at_action(action)
                 )
             )(jax.lax.stop_gradient(x0_clipped))
 
@@ -124,16 +163,14 @@ def build_mala_sampler(
             noise_pred = schedule.sqrt_one_minus_alphas_cumprod[t_idx] * e_grad
             x0_hat = reconstruct_x0_from_noise(x, t_idx, noise_pred)
             x0_clipped = jnp.clip(x0_hat, -x0_hat_clip_radius, x0_hat_clip_radius)
-            q = aggregate_q_fn([model.q(qp, obs, x0_clipped) for qp in q_params_tuple])
+            q = agg_q_at_action(x0_clipped)
             if guidance_gradient_space == "x0hat":
                 grad_q = jax.grad(
                     lambda x0: jnp.sum(q_aggregated_at_clipped_x0_hat(x0))
                 )(jax.lax.stop_gradient(x0_hat))
             else:
                 grad_q = jax.grad(
-                    lambda action: jnp.sum(
-                        aggregate_q_fn([model.q(qp, obs, action) for qp in q_params_tuple])
-                    )
+                    lambda action: jnp.sum(agg_q_at_action(action))
                 )(jax.lax.stop_gradient(x0_clipped))
             energy = state.hp.alpha * E_vals - beta_current * q
             grad_energy = state.hp.alpha * e_grad - beta_current * grad_q

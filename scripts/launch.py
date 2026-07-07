@@ -17,7 +17,7 @@ Usage examples:
     python scripts/launch.py --cmd "python scripts/train_mujoco.py --alg mgmd --env HalfCheetah-v4" \\
         --seeds 100 101 102 \\
         --ablate beta 8 16 32 \\
-        --ablate num_particles 1 64 128
+        --ablate num_denoised_actions 1 2 4
 
     # One-at-a-time (non-Cartesian) local sweep around the base command.
     # Regular --ablate axes still form their usual Cartesian product
@@ -732,7 +732,7 @@ def venv_for_command(cmd: str) -> Path:
     return venv_path
 
 
-def next_unused_sweep_id(project="pnielsen2-harvard/diffusion_online_rl"):
+def next_unused_sweep_id(project=None):
     """Return the smallest positive integer N such that no wandb run in the
     project has ``config.sweep_id == N`` yet. Probes ascending sweep_ids via
     ``len(api.runs(filters={config.sweep_id: N}))`` (a single O(1) backend
@@ -748,6 +748,9 @@ def next_unused_sweep_id(project="pnielsen2-harvard/diffusion_online_rl"):
     """
     try:
         import wandb
+        if project is None:
+            from relax.utils.fs import wandb_entity_project
+            project = wandb_entity_project()
         api = wandb.Api(timeout=20)
         n = 1
         # Hard cap keeps a bugged backend from spinning forever. 10000 sweeps
@@ -906,8 +909,8 @@ def main():
         if args.wandb_offline_base is not None:
             base = Path(args.wandb_offline_base)
         else:
-            user = os.environ.get("USER", "pnielsen")
-            base = Path(f"/n/netscratch/kdbrantley_lab/Lab/{user}/wandb")
+            from relax.utils.fs import WANDB_OFFLINE_BASE
+            base = WANDB_OFFLINE_BASE
         sweep_subdir = f"sweep_{sweep_id}" if sweep_id is not None else \
                        f"nosweep_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         wandb_dir_template = f"{base}/{sweep_subdir}/job_${{SLURM_JOB_ID}}"

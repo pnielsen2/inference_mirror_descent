@@ -16,7 +16,8 @@ from collections import defaultdict
 import wandb
 
 # ── wandb setup ──────────────────────────────────────────────────────────────
-WANDB_PROJECT = "pnielsen2-harvard/diffusion_online_rl"
+from relax.utils.fs import wandb_entity_project
+WANDB_PROJECT = wandb_entity_project()
 
 # ── Run IDs ──────────────────────────────────────────────────────────────────
 

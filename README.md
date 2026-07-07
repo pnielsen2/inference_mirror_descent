@@ -91,5 +91,47 @@ Remove `--dry-run` to actually submit the SLURM jobs.
 - inline the per-slot overrides via `--hp_pack_inline '<json>'`
 - auto-pick CPUs as `min(pack_size * num_vec_envs, 24)` unless you override `--cpus`
 
+## Sharing across the lab (multi-user setup)
+
+The code is user-agnostic: nothing is hardcoded to a specific home or
+netscratch path. Personal locations are derived from `$HOME` / `$USER`, and
+the wandb namespace is resolved from env vars with a shared default.
+
+### One-time setup per user
+
+```bash
+# 1. Independent clone + venv (see "Minimal setup" above); MuJoCo 2.1 at
+#    $HOME/.mujoco/mujoco210 and GLEW at $HOME/.local/glew as documented.
+# 2. wandb: log in, then point at the shared namespace.
+wandb login
+export WANDB_ENTITY=pnielsen2-harvard        # shared entity (invite-based for now)
+export WANDB_PROJECT=diffusion_online_rl      # optional; this is the default
+```
+
+Add the two `export` lines to your `~/.bashrc`. To migrate to a proper wandb
+**Team** later, everyone just changes `WANDB_ENTITY` to the team name — no code
+change needed. The default in `relax/utils/fs.py` (`pnielsen2-harvard`) is used
+only if `WANDB_ENTITY` is unset.
+
+### Where things live
+
+- **wandb runs** → the shared `$WANDB_ENTITY/$WANDB_PROJECT`. Every member's
+  runs land in the same project, so `compute_topsis.py`, `plot_*` etc. see
+  everyone's runs. Sweep IDs are drawn from that shared project, so two people
+  never collide.
+- **Offline wandb staging** → `/n/netscratch/kdbrantley_lab/Lab/$USER/wandb`
+  (per user). The `Lab/` tree is group-readable for `kdbrantley_lab`, so you
+  can read a colleague's runs in place — no copy needed. Note netscratch is
+  scratch storage (subject to purge); wandb cloud is the durable source of
+  truth. Override the base with `WANDB_OFFLINE_BASE` or `--wandb-offline-base`.
+
+### Accessing each other's runs for plotting
+
+- **From wandb (default):** `python scripts/compute_topsis.py --sweep-id N`
+  queries the shared project and sees all members' runs.
+- **From local offline dirs (no internet):** point the analysis scripts at the
+  other user's netscratch base, e.g.
+  `python scripts/build_sweep_local_metrics.py --sweep-id N --wandb-base /n/netscratch/kdbrantley_lab/Lab/<other-user>/wandb`.
+
 ## Acknowledgement
 We developed this repo based on [Efficient Online Reinforcement Learning for Diffusion Policies] (https://github.com/mahaitongdae/diffusion_policy_online_rl), which was in turn based on [DACER](https://github.com/happy-yan/DACER-Diffusion-with-Online-RL.git). We thank the authors of both repos for providing a high-quality code base.

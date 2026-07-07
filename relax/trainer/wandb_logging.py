@@ -14,6 +14,8 @@ from typing import List, Optional
 import numpy as np
 import wandb
 
+from relax.utils.fs import WANDB_ENTITY, WANDB_PROJECT
+
 
 _WANDB_INIT_STAGGER_MIN_SECONDS = float(
     os.environ.get("WANDB_INIT_STAGGER_MIN_SECONDS", "0.0")
@@ -142,7 +144,8 @@ class WandbMultiSeedLogger:
             # sync loop uploads to wandb.ai). Fall back to /tmp for the
             # local / online-mode path so unchanged setups still work.
             run = wandb.init(
-                project="diffusion_online_rl",
+                entity=WANDB_ENTITY,
+                project=WANDB_PROJECT,
                 name=name,
                 dir=os.environ.get("WANDB_DIR", "/tmp"),
                 group=group,

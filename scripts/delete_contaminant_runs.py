@@ -18,8 +18,7 @@ from __future__ import annotations
 import argparse
 import wandb
 
-ENTITY = "pnielsen2-harvard"
-PROJECT = "diffusion_online_rl"
+from relax.utils.fs import WANDB_ENTITY as ENTITY, WANDB_PROJECT as PROJECT
 
 
 def main():

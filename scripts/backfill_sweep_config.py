@@ -30,8 +30,7 @@ from pathlib import Path
 
 import wandb
 
-ENTITY = "pnielsen2-harvard"
-PROJECT = "diffusion_online_rl"
+from relax.utils.fs import WANDB_ENTITY as ENTITY, WANDB_PROJECT as PROJECT
 # Legacy launch identifiers (same ones compute_topsis.py's legacy mode uses).
 NAME_PREFIX = "dpmd_2026-04-21_2"
 NAME_MIN = "dpmd_2026-04-21_22-44-40"

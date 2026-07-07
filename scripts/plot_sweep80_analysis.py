@@ -34,6 +34,8 @@ import pandas as pd
 import plot_sweep45_kl1024_vs_baselines as sweep45_plot
 from scipy import stats
 
+from relax.utils.fs import WANDB_OFFLINE_BASE as NETSCRATCH_WANDB_ROOT
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -42,7 +44,6 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 REPO_DIR = SCRIPT_DIR.parent
 FIG_DIR = REPO_DIR / "figures"
 LSAC_DATA_DIR = Path.home() / "LSAC" / "data"
-NETSCRATCH_WANDB_ROOT = Path("/n/netscratch/kdbrantley_lab/Lab/pnielsen/wandb")
 
 SWEEP_ID = 80
 ENVS = ["Ant-v3", "HalfCheetah-v3", "Hopper-v3", "Humanoid-v3", "Swimmer-v3", "Walker2d-v3"]

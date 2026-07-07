@@ -56,6 +56,10 @@ class MGMD:
         self.use_advantage_stats = bool(cfg.advantage_normalization or cfg.kl_budget is not None)
         self.on_policy_ema = self.use_advantage_stats
         self.one_step_dist_shift_beta = bool(cfg.one_step_dist_shift_beta)
+        # V-free guidance-normalization knobs (see relax/cli/train_args.py).
+        self.num_denoised_actions = int(cfg.num_denoised_actions)
+        self.q_loss_normalization = bool(cfg.q_loss_normalization)
+        self.batch_advantage_normalization = bool(cfg.batch_advantage_normalization)
         self.policy_loss_key = "losses/Policy_epsilon_MSE"
 
         # --- Optimizers: unscaled Adam; per-seed state.lr_{q,policy} is applied at update time. ---
@@ -79,9 +83,11 @@ class MGMD:
         _sampler_kw = dict(
             model=self.model, value_head=self.value_head, timesteps=self._timesteps,
             batch_independent_guidance=self.cfg.batch_independent_guidance,
-            advantage_normalization=self.cfg.advantage_normalization,
+            ema_normalization=bool(self.cfg.advantage_normalization or self.cfg.q_loss_normalization),
             denoising_predictor=self.cfg.denoising_predictor,
             guidance_gradient_space=self.cfg.guidance_gradient_space,
+            num_denoised_actions=self.num_denoised_actions,
+            batch_advantage_normalization=self.batch_advantage_normalization,
         )
         sampler = build_mala_sampler(**_sampler_kw)
         # Both sampling paths (rollout + TD next-action) use --q_agg_sample aggregation.
@@ -137,13 +143,16 @@ class MGMD:
 
             reward *= state.hp.reward_scale
 
-            # Sample a single tilted next-action
+            # Denoise K tilted next-actions per state (K = num_denoised_actions).
             mala_result = sampler(next_eval_key, state, next_obs, agg_sample_fn)
-            tilted_action = mala_result.action
+            tilted_actions = mala_result.action           # [K, batch, act_dim]
+            K = self.num_denoised_actions
+            next_obs_k = jnp.broadcast_to(next_obs, (K, *next_obs.shape))
 
-            # Clipped double Q-learning: all Qs bootstrap from min_i(target_Q_i).
-            per_q_target_values = [self.model.q(tqp, next_obs, tilted_action) for tqp in target_q_params]
-            q_target_min_for_backup = _aggregate_q(per_q_target_values, "min")
+            # Clipped double Q-learning: min_i(target_Q_i) per action, then the
+            # TD backup averages that clipped double-Q over the K next-actions.
+            per_q_target_values = [self.model.q(tqp, next_obs_k, tilted_actions) for tqp in target_q_params]  # each [K, batch]
+            q_target_min_for_backup = jnp.mean(_aggregate_q(per_q_target_values, "min"), axis=0)  # [batch]
             shared_backup = reward + (1 - done) * state.hp.gamma * q_target_min_for_backup
             q_backup_per_q = [shared_backup] * num_q
 
@@ -167,21 +176,35 @@ class MGMD:
             q_loss = jnp.mean(q_losses)
             value_loss_log = value_loss
 
+            # V-free q_loss normalization: track EMA(Q TD loss) in the
+            # advantage_second_moment_ema slot (the sampler divides beta by
+            # sqrt of it). Host-side EMA is skipped since on_policy_ema is False.
+            new_adv_m2_ema = state.advantage_second_moment_ema
+            if self.q_loss_normalization:
+                tau = state.hp.adv_ema_tau
+                new_adv_m2_ema = (jnp.float32(1.0) - tau) * new_adv_m2_ema + tau * q_loss
+
             target_q_params = tuple(delayed_target_update(q_params[i], target_q_params[i], state.hp.polyak_tau, step, self.cfg.delay_update) for i in range(num_q))
 
+            # Diffusion policy regresses toward all K tilted actions; flatten the
+            # K axis into the batch so score-matching sees K*batch targets (for
+            # K=1 these are exactly the previous [batch, ...] tensors).
+            policy_targets = tilted_actions.reshape(K * obs.shape[0], -1)   # [K*batch, act_dim]
+            policy_obs = next_obs_k.reshape(K * obs.shape[0], -1)           # [K*batch, obs_dim]
+
             def policy_loss_fn(policy_params, time_key, noise_key) -> jax.Array:
-                # Standard diffusion score-matching loss (eps-MSE)
-                # against ``tilted_action`` (target action sampled above).
-                # Uses optax.squared_error (== (x-y)**2), NOT optax.l2_loss (== 0.5*(x-y)**2)
+                # Standard diffusion score-matching loss (eps-MSE) against the K
+                # tilted target actions sampled above. Uses optax.squared_error
+                # (== (x-y)**2), NOT optax.l2_loss (== 0.5*(x-y)**2).
                 t = jax.random.randint(
                     time_key,
-                    (obs.shape[0],),
+                    (policy_targets.shape[0],),
                     0,
                     self.model.num_timesteps,
                 )
-                noise = jax.random.normal(noise_key, tilted_action.shape)
-                tilted_action_noisy = self.model.q_sample(t, tilted_action, noise)
-                noise_pred = self.model.eps_pred(policy_params, next_obs, tilted_action_noisy, t)
+                noise = jax.random.normal(noise_key, policy_targets.shape)
+                tilted_action_noisy = self.model.q_sample(t, policy_targets, noise)
+                noise_pred = self.model.eps_pred(policy_params, policy_obs, tilted_action_noisy, t)
                 return optax.squared_error(noise_pred, noise).mean()
 
             def _do(_):
@@ -222,6 +245,7 @@ class MGMD:
                 log_eta_scales=mala_result.log_eta_scales,
                 value_params=value_params_updated,
                 policy_loss=total_loss,
+                advantage_second_moment_ema=new_adv_m2_ema,
             )
 
             # --- Losses ---
@@ -242,6 +266,15 @@ class MGMD:
             # --- Q section ---
             if self.on_policy_ema:
                 info["Critic/inv_sqrt(E(Var(Q))_ema)"] = jnp.float32(1.0) / jnp.sqrt(jnp.maximum(state.advantage_second_moment_ema, jnp.float32(1e-6)))
+            if self.q_loss_normalization:
+                info["Critic/q_loss_norm"] = jnp.sqrt(jnp.maximum(new_adv_m2_ema, jnp.float32(1e-6)))
+            if self.batch_advantage_normalization:
+                # Representative batch-norm scale for monitoring: per-state Q
+                # variance over the K next-actions (reusing per_q_target_values,
+                # so ~free), batch-averaged and square-rooted. A proxy for the
+                # per-noise-level denom the sampler applies during guidance.
+                q_agg_k = _aggregate_q(per_q_target_values, self.cfg.q_agg_sample)  # [K, batch]
+                info["Critic/batch_adv_norm"] = jnp.sqrt(jnp.maximum(jnp.mean(jnp.var(q_agg_k, axis=0, ddof=1)), jnp.float32(1e-6)))
             return state, info
 
         return stateless_update
@@ -293,7 +326,9 @@ class MGMD:
         if self.value_head is None or state.value_params is None:
             return state.value_params, state.opt_state.value, jnp.float32(0.0)
 
-        q_for_v = _aggregate_q(per_q_target_values, self.cfg.q_agg_sample)
+        # per_q_target_values entries are [K, batch]; average over the K denoised
+        # actions to get the on-policy V(s') regression target [batch].
+        q_for_v = jnp.mean(_aggregate_q(per_q_target_values, self.cfg.q_agg_sample), axis=0)
         return self.value_head.update_step(state, q_for_v, next_obs, state.hp.lr_q, self.optim)
 
     def get_action_vmap(self, key: jax.Array, obs: np.ndarray):
@@ -306,8 +341,10 @@ class MGMD:
         result = self._jit_vmap_get_action(key, self.state, obs)
         # log_eta_scales: shape [N, timesteps] — matches stacked state layout.
         self.state = self.state._replace(log_eta_scales=result.log_eta_scales)
-        action_np = np.asarray(result.action)
-        q_per_env = np.asarray(result.q)  # [N, num_envs]
+        # Sampler returns K iid actions per state ([N, K, num_envs, ...]); index 0
+        # is a uniform draw. Take it (and its raw Q) to step the environment.
+        action_np = np.asarray(result.action[:, 0])  # [N, num_envs, act_dim]
+        q_per_env = np.asarray(result.q[:, 0])       # [N, num_envs]
 
         if not self.on_policy_ema:
             return action_np, q_per_env, None
@@ -366,6 +403,7 @@ class MGMD:
                 lr_q=jnp.float32(cfg.lr_q),
                 lr_policy=jnp.float32(cfg.lr_policy),
                 guidance_mult=jnp.float32(cfg.guidance_strength_multiplier),
+                guidance_mult_increasing=jnp.float32(cfg.guidance_strength_schedule == "increasing"),
                 adv_ema_tau=jnp.float32(cfg.advantage_ema_tau),
                 shape_ema_tau=jnp.float32(cfg.shape_ema_tau),
                 kl_budget_val=jnp.float32(kl_budget_val),

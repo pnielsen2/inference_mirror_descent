@@ -27,6 +27,8 @@ from __future__ import annotations
 import argparse
 import os
 import pickle
+import random
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import StringIO
 from pathlib import Path
@@ -36,9 +38,42 @@ import pandas as pd
 import wandb
 from scipy import stats
 
-ENTITY = "pnielsen2-harvard"
-PROJECT = "diffusion_online_rl"
-ENVS = ["HalfCheetah-v3", "Ant-v3", "Walker2d-v3", "Humanoid-v3"]
+from relax.utils.fs import WANDB_ENTITY as ENTITY, WANDB_PROJECT as PROJECT
+
+# Concurrency / rate-limit handling for the wandb public API. Large sweeps
+# (thousands of runs) trip wandb's per-IP rate limiter (HTTP 429) when fetched
+# too aggressively; wandb's built-in retry only covers transient network blips,
+# so we add our own exponential backoff and keep the worker count modest.
+MAX_FETCH_WORKERS = int(os.environ.get("TOPSIS_FETCH_WORKERS", "4"))
+_RETRY_ATTEMPTS = 8
+_RETRY_BASE_DELAY = 2.0
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "429" in msg or "rate limit" in msg or "too many requests" in msg
+
+
+def _with_retries(fn, *, what: str):
+    """Call fn() with exponential backoff on wandb rate-limit (429) errors."""
+    delay = _RETRY_BASE_DELAY
+    last_exc = None
+    for attempt in range(1, _RETRY_ATTEMPTS + 1):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 - wandb raises CommError/HTTPError
+            last_exc = exc
+            if not _is_rate_limit_error(exc) or attempt == _RETRY_ATTEMPTS:
+                raise
+            sleep_s = delay + random.uniform(0, delay)
+            print(f"  rate-limited fetching {what} (attempt {attempt}/{_RETRY_ATTEMPTS}); "
+                  f"backing off {sleep_s:.1f}s", flush=True)
+            time.sleep(sleep_s)
+            delay = min(delay * 2, 60.0)
+    raise last_exc
+
+
+ENVS = ["Ant-v3", "HalfCheetah-v3", "Hopper-v3", "Humanoid-v3", "Swimmer-v3", "Walker2d-v3"]
 # Metric per run: mean of episode returns logged in the last
 # TAIL_WINDOW_STEPS env steps. Anchor is the max _step in the run's
 # episode-return stream (wandb's _step for "episode_return/{env}" is env_step,
@@ -458,7 +493,10 @@ def fetch_run_history(r, hp_names, benchmark_scores, config_tag_override=None):
             return None
         per_slot, config_tag, seed_val, seed_idx = res
         ep_key = f"episode_return/{env}"
-        hist = r.history(keys=[ep_key, "_step"], samples=10000, pandas=True)
+        hist = _with_retries(
+            lambda: r.history(keys=[ep_key, "_step"], samples=10000, pandas=True),
+            what=f"history {r.id}",
+        )
         if hist is None or hist.empty or ep_key not in hist.columns:
             return None
         # Keep only rows that actually carry an episode return; _step is the
@@ -524,9 +562,11 @@ def main():
     # real per-run config we must re-fetch each by id via ``api.run(path)``.
     # That's one HTTP call per run; 8-way parallel keeps it manageable.
     def _full_fetch(rid):
-        return api.run(f"{ENTITY}/{PROJECT}/{rid}")
-    print(f"Fetching full configs for {len(stub_runs)} runs (8-way parallel)...")
-    with ThreadPoolExecutor(max_workers=8) as ex:
+        return _with_retries(lambda: api.run(f"{ENTITY}/{PROJECT}/{rid}"),
+                             what=f"config {rid}")
+    print(f"Fetching full configs for {len(stub_runs)} runs "
+          f"({MAX_FETCH_WORKERS}-way parallel)...")
+    with ThreadPoolExecutor(max_workers=MAX_FETCH_WORKERS) as ex:
         runs = list(ex.map(_full_fetch, [r.id for r in stub_runs]))
     print(f"  full configs loaded.")
 
@@ -535,7 +575,7 @@ def main():
 
     # Fetch histories in parallel.
     records, errors = [], []
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=MAX_FETCH_WORKERS) as ex:
         futs = {ex.submit(fetch_run_history, r, hp_names, benchmark_scores): r for r in runs}
         for i, fut in enumerate(as_completed(futs), 1):
             rec = fut.result()

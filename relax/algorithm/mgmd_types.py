@@ -62,6 +62,7 @@ class HParams(NamedTuple):
     lr_q: jax.Array = 1e-4              # Q optimizer LR (applied as -lr*update)
     lr_policy: jax.Array = 1e-4         # policy optimizer LR
     guidance_mult: jax.Array = 1.0      # guidance strength multiplier
+    guidance_mult_increasing: jax.Array = 0.0  # 1.0 => use normalized alpha_t schedule from TFG
     adv_ema_tau: jax.Array = 0.0005     # advantage-moment EMA rate
     shape_ema_tau: jax.Array = 0.0001   # dimensionless shape EMA rate
     kl_budget_val: jax.Array = 1.0      # KL budget δ (host uses for β cap)
@@ -112,6 +113,7 @@ class MGMDConfig:
     q_td_huber_width: float = float("inf")
     batch_independent_guidance: bool = False
     guidance_strength_multiplier: float = 1.0
+    guidance_strength_schedule: str = "constant"
     alpha: float = 1.0
     T: float = 0.0
     eta: float = 0.0
@@ -125,6 +127,9 @@ class MGMDConfig:
     guidance_gradient_space: str = "xt"
     critic_update_steps: int = 1
     policy_update_steps: int = 1
+    num_denoised_actions: int = 1
+    batch_advantage_normalization: bool = False
+    q_loss_normalization: bool = False
 
     @classmethod
     def from_args(cls, args) -> "MGMDConfig":
@@ -135,6 +140,11 @@ class MGMDConfig:
         """
         lr_policy = args.lr if args.lr_policy is None else args.lr_policy
         lr_q = args.lr if args.lr_q is None else args.lr_q
+        guidance_strength_multiplier = args.guidance_strength_multiplier
+        guidance_strength_schedule = "constant"
+        if isinstance(guidance_strength_multiplier, str):
+            guidance_strength_schedule = guidance_strength_multiplier
+            guidance_strength_multiplier = 1.0
         return cls(
             gamma=args.gamma,
             polyak_tau=args.polyak_tau,
@@ -151,7 +161,8 @@ class MGMDConfig:
             denoising_predictor=args.denoising_predictor,
             q_td_huber_width=args.q_td_huber_width,
             batch_independent_guidance=args.batch_independent_guidance,
-            guidance_strength_multiplier=args.guidance_strength_multiplier,
+            guidance_strength_multiplier=float(guidance_strength_multiplier),
+            guidance_strength_schedule=guidance_strength_schedule,
             alpha=args.alpha,
             T=args.T,
             eta=args.eta,
@@ -163,4 +174,7 @@ class MGMDConfig:
             kl_budget=args.kl_budget,
             one_step_dist_shift_beta=args.one_step_dist_shift_beta,
             guidance_gradient_space=args.guidance_gradient_space,
+            num_denoised_actions=args.num_denoised_actions,
+            batch_advantage_normalization=args.batch_advantage_normalization,
+            q_loss_normalization=args.q_loss_normalization,
         )

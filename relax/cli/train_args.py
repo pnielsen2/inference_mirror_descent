@@ -7,6 +7,18 @@ three protected launch commands set.
 import argparse
 
 
+def _parse_guidance_strength_multiplier(value: str):
+    try:
+        return float(value)
+    except ValueError:
+        normalized = value.lower()
+        if normalized == "increasing":
+            return normalized
+        raise argparse.ArgumentTypeError(
+            "--guidance_strength_multiplier must be a float or 'increasing'"
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
 
@@ -71,10 +83,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--initial_dist_shift_shape_ema", type=float, default=-1.0, help="Initial value for the dimensionless distribution-shift shape EMA s2 = (2γc + κ₃) / v^(3/2).")
     parser.add_argument("--x0_hat_clip_radius", type=float, default=float("inf"), help="Clipping radius r for Tweedie clean-action estimates x0_hat used inside guidance/Q evaluation. x0_hat is clipped to [-r, r] before being passed into Q / model-based objectives. Default inf (no clip); in non-latent mode the network-side denoising clip is separately hardcoded to 1.0 to match normalized action bounds.")
     parser.add_argument("--batch_independent_guidance", action="store_true", default=False, help="If set, use jnp.sum instead of jnp.mean inside the guided predictor's q_mean_from_x, so the per-sample Q gradient is independent of batch size (fixes the 1/B attenuation).")
-    parser.add_argument("--guidance_strength_multiplier", type=float, default=1.0, help="Constant multiplier applied to the guided-predictor Q scalar before jax.grad. Composes with --batch_independent_guidance.")
+    parser.add_argument("--guidance_strength_multiplier", type=_parse_guidance_strength_multiplier, default=1.0, help="Multiplier applied to the guided-predictor Q scalar before jax.grad. Accepts a float for constant scaling or 'increasing' for the normalized α_t schedule from TFG (2409.15761). Composes with --batch_independent_guidance.")
     parser.add_argument("--policy_parameterization", type=str, default="E", choices=["E", "f"], help="Parameterization of the energy network scalar output. 'E' (default): network outputs E_theta; eps_pred = sqrt(1-alpha_bar_t)*grad E. 'f': network outputs f = sqrt(1-alpha_bar_t)*E_theta; eps_pred = grad f, energy_fn = f/sqrt(1-alpha_bar_t).")
     parser.add_argument("--policy_final_layer", type=str, default="default", choices=["default", "ff", "L2", "IP"], help="Final-layer head of the scalar policy network. 'default': replace DACERPolicyNet final layer with Linear(1). 'ff': keep full DACERPolicyNet (act_dim output) and tack on an extra learned Linear(1). 'L2': full backbone then E = -0.5*||v||^2 (no extra params). 'IP': full backbone then E = v·a (inner product with action, no extra params).")
     parser.add_argument("--guidance_gradient_space", type=str, default="xt", choices=["xt", "x0hat", "x0hatclipped"], help="Whether to take the Q gradient with respect to 'xt' or the predicted clean action 'x0hat' or its clipped version 'x0hatclipped'.")
+
+    # ----- multi-action denoising + V-free advantage normalization ----------
+    parser.add_argument("--num_denoised_actions", type=int, default=1, help="Number K of actions denoised per state in one sampler pass (formerly 'num_particles'). All K share the state and are iid draws. Rollout uses one (index 0, a uniform draw). The TD backup averages the clipped-double-Q over the K actions, and the diffusion policy regresses toward all K. K>=2 is required for --batch_advantage_normalization. Changes tensor shapes, so it is a 'hard' (non-vmap-packable) sweep axis in launch.py. Default 1.")
+    parser.add_argument("--batch_advantage_normalization", action="store_true", default=False, help="V-free guidance normalization. At each MALA/denoising step, rescale Q by 1/sqrt(mean_s Var_K(Q)): the per-state sample variance (ddof=1) of Q over the K denoised Tweedie estimates, averaged over the batch, square-rooted, and stop-gradient'd. Requires --num_denoised_actions >= 2. Composes additively with --beta / other normalizations.")
+    parser.add_argument("--q_loss_normalization", action="store_true", default=False, help="V-free guidance normalization. Divide the guidance Q by sqrt(EMA(Q TD loss)), where the EMA (rate --advantage_ema_tau) is tracked in-graph from the critic loss. Needs neither a V network nor multiple actions. Mutually exclusive with --advantage_normalization / --kl_budget(_per_dim) / --one_step_dist_shift_beta.")
 
     # ----- MALA -------------------------------------------------------------
     parser.add_argument("--mala_steps", type=int, default=0, help="Number of MALA correction steps per diffusion step.")
@@ -86,6 +103,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def validate_args(args, parser: argparse.ArgumentParser) -> None:
     """Post-parse validation. Calls ``parser.error`` on bad combinations."""
+    if isinstance(args.guidance_strength_multiplier, str) and args.guidance_strength_multiplier != "increasing":
+        parser.error("--guidance_strength_multiplier only supports the string value 'increasing'")
+
     if args.kl_budget is not None and args.kl_budget_per_dim is not None:
         parser.error("--kl_budget and --kl_budget_per_dim are mutually exclusive")
 
@@ -110,6 +130,29 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
         parser.error(
             "--advantage_normalization is mutually exclusive with --kl_budget, "
             "--kl_budget_per_dim, and --one_step_dist_shift_beta"
+        )
+
+    if args.num_denoised_actions < 1:
+        parser.error("--num_denoised_actions must be >= 1.")
+
+    if args.batch_advantage_normalization and args.num_denoised_actions < 2:
+        parser.error(
+            "--batch_advantage_normalization needs the per-state Q variance over "
+            "the denoised actions, so it requires --num_denoised_actions >= 2."
+        )
+
+    # --q_loss_normalization drives the same beta/sqrt(E[A^2]-slot) rescale as the
+    # V-based paths, so at most one of these guidance-normalization sources may run.
+    if args.q_loss_normalization and (
+        args.advantage_normalization
+        or args.kl_budget is not None
+        or args.kl_budget_per_dim is not None
+        or args.one_step_dist_shift_beta
+    ):
+        parser.error(
+            "--q_loss_normalization is mutually exclusive with "
+            "--advantage_normalization, --kl_budget, --kl_budget_per_dim, and "
+            "--one_step_dist_shift_beta"
         )
 
     if args.flatten_UTD:

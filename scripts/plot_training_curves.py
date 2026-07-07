@@ -145,7 +145,7 @@ def main():
         "config.env": env_name,
         "state": "finished",
     }
-    runs = api.runs("diffusion_online_rl", filters=filters)
+    runs = api.runs(wandb_entity_project(), filters=filters)
     
     # Group runs by configuration
     runs_by_config = defaultdict(dict)  # config_name -> {seed: run}

@@ -15,10 +15,12 @@ from collections import defaultdict
 from pathlib import Path
 import wandb
 
+from relax.utils.fs import PROJECT_ROOT, wandb_entity_project
+
 # Configuration
-FIGURES_DIR = "/n/home09/pnielsen/inference_mirror_descent/figures"
-LSAC_DATA_DIR = "/n/home09/pnielsen/LSAC/data"
-WANDB_PROJECT = "pnielsen2-harvard/diffusion_online_rl"
+FIGURES_DIR = str(PROJECT_ROOT / "figures")
+LSAC_DATA_DIR = os.path.expanduser("~/LSAC/data")
+WANDB_PROJECT = wandb_entity_project()
 
 # ── MGMD run IDs ────────────────────────────────────────────────────────────
 # HalfCheetah: 10 KL-Budget seeds (March 25, seeds 5-14)
