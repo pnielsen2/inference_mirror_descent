@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Optional, Tuple
 
 import jax, jax.numpy as jnp
 import numpy as np
@@ -60,6 +60,8 @@ class MGMD:
         self.num_denoised_actions = int(cfg.num_denoised_actions)
         self.q_loss_normalization = bool(cfg.q_loss_normalization)
         self.batch_advantage_normalization = bool(cfg.batch_advantage_normalization)
+        self.ema_advantage_normalization = bool(cfg.ema_advantage_normalization)
+        self.lr_anneal = bool(cfg.lr_anneal)
         self.policy_loss_key = "losses/Policy_epsilon_MSE"
 
         # --- Optimizers: unscaled Adam; per-seed state.lr_{q,policy} is applied at update time. ---
@@ -88,6 +90,7 @@ class MGMD:
             guidance_gradient_space=self.cfg.guidance_gradient_space,
             num_denoised_actions=self.num_denoised_actions,
             batch_advantage_normalization=self.batch_advantage_normalization,
+            ema_advantage_normalization=self.ema_advantage_normalization,
         )
         sampler = build_mala_sampler(**_sampler_kw)
         # Both sampling paths (rollout + TD next-action) use --q_agg_sample aggregation.
@@ -98,17 +101,55 @@ class MGMD:
         self._jit_vmap_update = jax.jit(jax.vmap(updater))
         self._jit_vmap_get_action = jax.jit(jax.vmap(stateless_get_action))
 
-    def update_vmap(self, key: jax.Array, data: Experience) -> Metric:
-        self.state, info = self._jit_vmap_update(key, self.state, data)
-        return _split_info_vmap(info)
+    def update_vmap(self, key: jax.Array, data: Experience, critic_weight: Optional[jax.Array] = None, env_step: Optional[float] = None):
+        """Vmapped training update.
+
+        ``critic_weight`` is an optional per-row weight (``[num_runs, batch]``) on
+        the Q TD loss; ``None`` means all-ones (standard mean). The fused-denoising
+        trainer passes zeros for the injected step-action rows so their backup
+        (bogus at an episode's first state) is excluded. Always returns the
+        index-0 tilted next-action per row so the fused path can reuse it to step
+        the env; the normal path ignores it.
+        """
+        if critic_weight is None:
+            critic_weight = jnp.ones_like(data.reward)
+        # env_step (host-side env-step counter) drives --lr_anneal; broadcast the
+        # shared scalar to a [num_runs] array so the default in_axes=0 vmap maps
+        # one copy to each seed. None (e.g. warmup) => 0 => no annealing yet.
+        num_runs = data.reward.shape[0]
+        if env_step is None:
+            env_step_arr = jnp.zeros((num_runs,), dtype=jnp.float32)
+        else:
+            env_step_arr = jnp.full((num_runs,), jnp.float32(env_step), dtype=jnp.float32)
+        self.state, info, actions = self._jit_vmap_update(key, self.state, data, critic_weight, env_step_arr)
+        scalar_info, array_info = _split_info_vmap(info)
+        return scalar_info, array_info, actions
+
+    def eval_q_v_vmap(self, obs: np.ndarray, action: np.ndarray):
+        """Rollout-equivalent Q(obs, action) and V(obs) for the stepping action.
+
+        Reproduces the ``(q_per_env, v_per_env)`` that ``get_action_vmap`` would
+        have returned in the non-fused path: online-Q aggregated with
+        ``--q_agg_sample`` and (when the on-policy-EMA V network exists) V(obs).
+        obs/action: ``[num_runs, envs_per_run, dim]``.
+        """
+        if getattr(self, "_jit_vmap_eval_q", None) is None:
+            def _eval_q(state, o, a):
+                return _aggregate_q([self.model.q(qp, o, a) for qp in state.params.q], self.cfg.q_agg_sample)
+            self._jit_vmap_eval_q = jax.jit(jax.vmap(_eval_q))
+        q_per_env = np.asarray(self._jit_vmap_eval_q(self.state, jnp.asarray(obs), jnp.asarray(action)))
+        if not self.on_policy_ema:
+            return q_per_env, None
+        v_per_env = np.asarray(self.value_head.apply_vmap(self.state.value_params, jnp.asarray(obs)))
+        return q_per_env, v_per_env
 
     def warmup_vmap(self, data: Experience, N: int) -> None:
         key = jax.random.split(jax.random.key(0), N)
         obs = data.obs[:, 0]
-        self._jit_vmap_update(key, self.state, data)
+        self._jit_vmap_update(key, self.state, data, jnp.ones_like(data.reward), jnp.zeros((N,), dtype=jnp.float32))
         self._jit_vmap_get_action(key, self.state, obs)
 
-    def _huber_loss(self, td_err, reward_scale, q_td_huber_width):
+    def _huber_loss(self, td_err, reward_scale, q_td_huber_width, weight=None):
         huber_delta = q_td_huber_width * reward_scale
         use_huber_loss = jnp.isfinite(huber_delta)
         huber_delta_safe = jnp.where(use_huber_loss, huber_delta, jnp.float32(1.0))
@@ -117,10 +158,12 @@ class MGMD:
         linear = abs_td_err - quadratic
         huber_per_elem = jnp.float32(0.5) * quadratic * quadratic + huber_delta_safe * linear
         per_elem_loss = jnp.where(use_huber_loss, huber_per_elem, td_err * td_err)
-        return jnp.mean(per_elem_loss)
+        if weight is None:
+            return jnp.mean(per_elem_loss)
+        return jnp.sum(weight * per_elem_loss) / jnp.maximum(jnp.sum(weight), jnp.float32(1.0))
 
     def _stateless_update(self, sampler, agg_sample_fn):
-        """Return the ``stateless_update(key, state, data)`` closure.
+        """Return the ``stateless_update(key, state, data, critic_weight)`` closure.
 
         Captures ``sampler`` (MALA sampler) and ``agg_sample_fn`` (Q aggregation
         used when sampling the TD next-action; distinct from the backup target
@@ -129,7 +172,7 @@ class MGMD:
         ``_jit_vmap_update``.
         """
         def stateless_update(
-            key: jax.Array, state: Diffv2TrainState, data: Experience
+            key: jax.Array, state: Diffv2TrainState, data: Experience, critic_weight: jax.Array, env_step: jax.Array
         ) -> Tuple[Diffv2OptStates, Metric]:
             obs, action, reward, next_obs, done = data.obs, data.action, data.reward, data.next_obs, data.done
             q_params = state.params.q          # tuple of N Q params
@@ -140,6 +183,24 @@ class MGMD:
             step = state.step
             num_q = len(q_params)
             next_eval_key, diffusion_time_key, diffusion_noise_key = jax.random.split(key, 3)
+
+            # LR annealing (ported from diffusion_policy_online_rl): scale BOTH the
+            # Q and policy learning rates by the SAME linear factor of the env-step
+            # count. factor = 1 for env_step <= transition_begin, decreasing linearly
+            # to lr_anneal_end_factor over transition_steps env steps, then held. The
+            # env-step count is threaded in from the trainer's host-side counter.
+            if self.lr_anneal:
+                _begin = jnp.float32(self.cfg.lr_anneal_transition_begin)
+                _steps = jnp.maximum(jnp.float32(self.cfg.lr_anneal_transition_steps), jnp.float32(1.0))
+                _end = jnp.float32(self.cfg.lr_anneal_end_factor)
+                _frac = jnp.clip((env_step - _begin) / _steps, jnp.float32(0.0), jnp.float32(1.0))
+                lr_factor = jnp.float32(1.0) + _frac * (_end - jnp.float32(1.0))
+                lr_q_eff = state.hp.lr_q * lr_factor
+                lr_policy_eff = state.hp.lr_policy * lr_factor
+            else:
+                lr_factor = jnp.float32(1.0)
+                lr_q_eff = state.hp.lr_q
+                lr_policy_eff = state.hp.lr_policy
 
             reward *= state.hp.reward_scale
 
@@ -163,7 +224,7 @@ class MGMD:
             value_opt_state_updated = state.opt_state.value
             for _ in range(self.cfg.critic_update_steps):
                 q_params, q_opt_states, q_losses = self._train_q_ensemble(
-                    state, obs, action, q_params, q_opt_states, q_backup_per_q
+                    state, obs, action, q_params, q_opt_states, q_backup_per_q, critic_weight, lr_q=lr_q_eff
                 )
 
                 value_step_state = state._replace(
@@ -183,6 +244,22 @@ class MGMD:
             if self.q_loss_normalization:
                 tau = state.hp.adv_ema_tau
                 new_adv_m2_ema = (jnp.float32(1.0) - tau) * new_adv_m2_ema + tau * q_loss
+
+            # EMA advantage normalization (ported from diffusion_policy_online_rl):
+            # track a slow EMA of the batch mean/std of the online (post-critic-
+            # update), --q_agg_sample-aggregated Q at the sampled next-actions. The
+            # sampler divides the guidance Q by q_running_std; q_running_mean is
+            # tracked for logging (it cancels in the guidance gradient).
+            new_q_running_mean = state.q_running_mean
+            new_q_running_std = state.q_running_std
+            if self.ema_advantage_normalization:
+                q_norm_samples = _aggregate_q(
+                    [self.model.q(qp, next_obs_k, tilted_actions) for qp in q_params],
+                    self.cfg.q_agg_sample,
+                )  # [K, batch] online Q at the tilted next-actions
+                rate = state.hp.adv_norm_ema_rate
+                new_q_running_mean = state.q_running_mean + rate * (jnp.mean(q_norm_samples) - state.q_running_mean)
+                new_q_running_std = state.q_running_std + rate * (jnp.std(q_norm_samples) - state.q_running_std)
 
             target_q_params = tuple(delayed_target_update(q_params[i], target_q_params[i], state.hp.polyak_tau, step, self.cfg.delay_update) for i in range(num_q))
 
@@ -227,7 +304,7 @@ class MGMD:
                         updated_policy_params,
                         grads,
                         updated_policy_opt_state,
-                        state.hp.lr_policy,
+                        lr_policy_eff,
                         step,
                         1,
                     )
@@ -246,6 +323,8 @@ class MGMD:
                 value_params=value_params_updated,
                 policy_loss=total_loss,
                 advantage_second_moment_ema=new_adv_m2_ema,
+                q_running_mean=new_q_running_mean,
+                q_running_std=new_q_running_std,
             )
 
             # --- Losses ---
@@ -253,6 +332,10 @@ class MGMD:
                 self.policy_loss_key: total_loss,
                 "losses/Q_loss": q_loss,
             }
+            if self.lr_anneal:
+                info["lr/anneal_factor"] = lr_factor
+                info["lr/lr_q"] = lr_q_eff
+                info["lr/lr_policy"] = lr_policy_eff
 
             # V_MSE: only when V network exists
             if self.on_policy_ema and state.value_params is not None:
@@ -268,6 +351,10 @@ class MGMD:
                 info["Critic/inv_sqrt(E(Var(Q))_ema)"] = jnp.float32(1.0) / jnp.sqrt(jnp.maximum(state.advantage_second_moment_ema, jnp.float32(1e-6)))
             if self.q_loss_normalization:
                 info["Critic/q_loss_norm"] = jnp.sqrt(jnp.maximum(new_adv_m2_ema, jnp.float32(1e-6)))
+            if self.ema_advantage_normalization:
+                info["Critic/adv_norm_running_mean"] = new_q_running_mean
+                info["Critic/adv_norm_running_std"] = new_q_running_std
+                info["Critic/adv_norm_inv_std"] = jnp.float32(1.0) / jnp.maximum(new_q_running_std, jnp.float32(1e-6))
             if self.batch_advantage_normalization:
                 # Representative batch-norm scale for monitoring: per-state Q
                 # variance over the K next-actions (reusing per_q_target_values,
@@ -275,11 +362,15 @@ class MGMD:
                 # per-noise-level denom the sampler applies during guidance.
                 q_agg_k = _aggregate_q(per_q_target_values, self.cfg.q_agg_sample)  # [K, batch]
                 info["Critic/batch_adv_norm"] = jnp.sqrt(jnp.maximum(jnp.mean(jnp.var(q_agg_k, axis=0, ddof=1)), jnp.float32(1e-6)))
-            return state, info
+            # Also return the index-0 (uniform-draw) tilted next-action per row so
+            # the fused-denoising trainer can reuse it to step the env. XLA already
+            # materializes tilted_actions for the policy loss, so this is ~free; the
+            # normal update_vmap path discards it.
+            return state, info, tilted_actions[0]
 
         return stateless_update
 
-    def _train_q_ensemble(self, state, obs, action, q_params, q_opt_states, q_backup_per_q):
+    def _train_q_ensemble(self, state, obs, action, q_params, q_opt_states, q_backup_per_q, critic_weight=None, lr_q=None):
         """One Adam step on each of the N Q critics against its TD target.
 
         The per-Q TD loss + Adam step is vmapped across the ensemble so XLA
@@ -291,16 +382,17 @@ class MGMD:
         ``(new_q_params_tuple, new_q_opt_states_tuple, all_q_losses)``.
         """
         num_q = len(q_params)
+        lr_q_use = state.hp.lr_q if lr_q is None else lr_q
 
         def single_q_train_step(qp, opt_s, backup_qi):
             def q_loss_fn(p):
                 q_pred_mean = self.model.q(p, obs, action)
                 td_err = q_pred_mean - backup_qi
-                return self._huber_loss(td_err, state.hp.reward_scale, state.hp.q_td_huber_width)
+                return self._huber_loss(td_err, state.hp.reward_scale, state.hp.q_td_huber_width, critic_weight)
 
             qi_loss, qi_grads = jax.value_and_grad(q_loss_fn)(qp)
             update, new_opt = self.optim.update(qi_grads, opt_s, params=qp)
-            update = jax.tree.map(lambda u: -state.hp.lr_q * u, update)
+            update = jax.tree.map(lambda u: -lr_q_use * u, update)
             new_qp = optax.apply_updates(qp, update)
             return new_qp, new_opt, qi_loss
 
@@ -366,7 +458,7 @@ class MGMD:
             self.value_head = None
             return None, None
 
-        self.value_head = ValueHead.create(self._obs_dim, self._hidden_dim)
+        self.value_head = ValueHead.create(self._obs_dim, self._hidden_dim, orthogonal_init=self.cfg.orthogonal_init)
         value_params_init = self.value_head.init_params(jax.random.PRNGKey(42))
         value_opt_state_init = self.value_head.init_opt_state(value_params_init, self.optim)
         return value_params_init, value_opt_state_init
@@ -397,6 +489,8 @@ class MGMD:
             advantage_third_moment_ema=jnp.float32(0.0),
             dist_shift_covariance_ema=jnp.float32(0.0),
             dist_shift_shape_ema=jnp.float32(cfg.initial_dist_shift_shape_ema),
+            q_running_mean=jnp.float32(0.0),
+            q_running_std=jnp.float32(1.0),
             hp=HParams(
                 gamma=jnp.float32(cfg.gamma),
                 polyak_tau=jnp.float32(cfg.polyak_tau),
@@ -406,6 +500,7 @@ class MGMD:
                 guidance_mult_increasing=jnp.float32(cfg.guidance_strength_schedule == "increasing"),
                 adv_ema_tau=jnp.float32(cfg.advantage_ema_tau),
                 shape_ema_tau=jnp.float32(cfg.shape_ema_tau),
+                adv_norm_ema_rate=jnp.float32(cfg.advantage_norm_ema_rate),
                 kl_budget_val=jnp.float32(kl_budget_val),
                 reward_scale=jnp.float32(cfg.reward_scale),
                 x0_hat_clip_radius=jnp.float32(cfg.x0_hat_clip_radius),

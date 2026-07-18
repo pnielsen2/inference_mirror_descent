@@ -71,6 +71,7 @@ class VmapOffPolicyTrainer:
         start_step: int = 1000,
         total_step: int = int(1e6),
         update_per_iteration: int = 1,
+        fused_denoising: bool = False,
         sample_log_n_env_step: int = 1000,
         update_log_n_env_steps: int = 5000,
         hparams: Optional[dict] = None,
@@ -89,6 +90,7 @@ class VmapOffPolicyTrainer:
         self.start_step = int(start_step)
         self.total_step = int(total_step)
         self.update_per_iteration = int(update_per_iteration)
+        self.fused_denoising = bool(fused_denoising)
         self.sample_log_n_env_step = int(sample_log_n_env_step)
         self.update_log_n_env_steps = int(update_log_n_env_steps)
         self.hparams = hparams or {}
@@ -165,6 +167,13 @@ class VmapOffPolicyTrainer:
         self._prev_adv_per_env = np.zeros((self.num_runs, self.envs_per_run), dtype=np.float32)
         self._prev_valid       = np.zeros((self.num_runs, self.envs_per_run), dtype=bool)
 
+        # Fused-denoising: the previous step's transition (obs, action, reward,
+        # done) + episode-reset mask, injected as the last E minibatch rows so
+        # their reused next-action is denoised at the current states. ``None``
+        # until the first step has been taken (that step's E rows are simply
+        # excluded from the critic instead of injected).
+        self._prev_injected = None
+
         # Pick the host-side advantage-state update path once at construction
         # time. The rollout block invokes this only when the algorithm
         # advertises on_policy_ema=True.
@@ -227,12 +236,20 @@ class VmapOffPolicyTrainer:
     def gather_transitions(self, keys: jax.Array, obs_flat: np.ndarray) -> np.ndarray:
         # obs_flat: [num_runs*envs_per_run, obs_dim] (from prior env.step)
         obs_nm = obs_flat.reshape(self.num_runs, self.envs_per_run, -1)
-
-        # Vmapped policy rollout. Returns (action [num_runs,envs_per_run,A], q [num_runs,envs_per_run], v [num_runs,envs_per_run] or None).
+        # Vmapped policy rollout: denoise the stepping action at the current obs.
+        # Returns (action [num_runs,E,A], q [num_runs,E], v [num_runs,E] or None).
         action_nm, q_per_env, v_per_env = self.algorithm.get_action_vmap(keys, obs_nm)
+        return self._step_and_record(action_nm, q_per_env, v_per_env, obs_nm)
 
+    def _step_and_record(self, action_nm, q_per_env, v_per_env, obs_nm) -> np.ndarray:
+        """Step the env with ``action_nm`` from states ``obs_nm``, update the
+        on-policy-EMA/β state, record the transition to the buffer + logs, and
+        return the next current obs. Shared by the fused and non-fused paths; the
+        only thing that differs between them is how ``action_nm`` (and its
+        rollout-equivalent ``q_per_env``/``v_per_env``) were produced.
+        """
         # Env step (flatten for Option B).
-        action_flat = action_nm.reshape(self.num_runs * self.envs_per_run, -1)
+        action_flat = np.asarray(action_nm).reshape(self.num_runs * self.envs_per_run, -1)
         next_obs_flat, reward_flat, term_flat, trunc_flat, info = self.env.step(action_flat)
 
         # Reshape all outputs back to [num_runs, envs_per_run, ...].
@@ -255,10 +272,11 @@ class VmapOffPolicyTrainer:
             q_per_env=q_per_env, v_per_env=v_per_env,
             rew_nm=rew_nm, term_nm=term_nm, trunc_nm=trunc_nm, nxt_nm=nxt_nm,
         )
-
-        obs_flat = self.env.get_current_obs()
-
-        return obs_flat
+        if self.fused_denoising:
+            # Stash this transition for next iteration's injected rows; its true
+            # next state is the obs returned below (== reset state on a boundary).
+            self._prev_injected = (obs_nm, action_nm, rew_nm, term_nm, term_nm | trunc_nm)
+        return self.env.get_current_obs()
 
     # ------------------------------------------------------------------
     # On-policy EMA + adaptive-β update (host-side, run-axis-vectorized).
@@ -294,8 +312,12 @@ class VmapOffPolicyTrainer:
         batches = [self.buffers[s].sample(self.batch_size) for s in range(self.num_runs)]
 
         stacked_batches = jax.tree.map(lambda *xs: jnp.stack([jnp.asarray(x) for x in xs], axis=0), *batches)
-        info, array_info = self.algorithm.update_vmap(update_key, stacked_batches)
+        # Env-step count (shared across runs, stepped in lockstep) drives --lr_anneal.
+        env_step = self.sample_logs[0].sample_step
+        scalar_info, array_info, _ = self.algorithm.update_vmap(update_key, stacked_batches, env_step=env_step)
+        self._log_update(scalar_info, array_info)
 
+    def _log_update(self, info: dict, array_info: dict):
         # info: dict tag -> np.ndarray[num_runs]
         # Log per-run; use per-run update step = UpdateLog.update_step * 5
         # (existing convention from UpdateLog.log at line 291 of accumulator.py).
@@ -321,7 +343,10 @@ class VmapOffPolicyTrainer:
     def run(self, key: jax.Array):
         try:
             obs = self.warmup()
-            self._train(key, obs)
+            if self.fused_denoising:
+                self._train_fused(key, obs)
+            else:
+                self._train(key, obs)
         except KeyboardInterrupt:
             pass
         finally:
@@ -345,6 +370,78 @@ class VmapOffPolicyTrainer:
             self.progress.refresh()
             self.logger.flush_all()
         return obs
+
+    def _train_fused(self, key: jax.Array, obs):
+        """Fused-denoising main loop.
+
+        A single denoising pass per env step serves both training and stepping.
+        The training update denoises the next-action for the whole minibatch;
+        for the last ``envs_per_run`` rows -- filled with the previous step's
+        transition and repointed so ``next_obs`` is the current state -- that
+        denoised action is reused to step the env, dropping the separate
+        ``get_action_vmap`` pass. Those rows are valid transitions except right
+        after an episode reset, where ``(s, a)`` no longer connects to the
+        current (reset) state; only those reset rows are excluded from the Q TD
+        loss (critic weight 0). The genuine transition is always recorded to the
+        buffer regardless.
+
+        ``update_per_iteration`` (U) is respected: the fused update is update #1
+        (yielding the stepping action from the pre-update policy, matching the
+        non-fused timing); the remaining U-1 are ordinary training-only updates.
+        """
+        while self.sample_logs[0].sample_step <= self.total_step:
+            step = self.sample_logs[0].sample_step
+            run_keys = jax.vmap(lambda k: jax.random.fold_in(k, step))(key)
+            split_keys = jax.vmap(lambda k: jax.random.split(k, self.update_per_iteration))(run_keys)
+
+            obs_nm = obs.reshape(self.num_runs, self.envs_per_run, -1)
+            action_nm, q_per_env, v_per_env = self._fused_gather(split_keys[:, 0], obs_nm)
+            obs = self._step_and_record(action_nm, q_per_env, v_per_env, obs_nm)
+
+            # Remaining U-1 training-only updates.
+            for i in range(self.update_per_iteration - 1):
+                self.update(split_keys[:, i + 1])
+
+            self.progress.n = self.sample_logs[0].sample_step
+            self.progress.refresh()
+            self.logger.flush_all()
+        return obs
+
+    def _fused_gather(self, update_key: jax.Array, obs_nm: np.ndarray):
+        """Fused replacement for ``gather_transitions``' action denoise.
+
+        Samples a training minibatch, repoints the last ``envs_per_run`` rows'
+        ``next_obs`` to the current states and zeros their critic weight, runs the
+        (logged) training update, and harvests the denoised next-action for those
+        rows as the stepping action plus its rollout-equivalent Q(s,a)/V(s).
+        """
+        E, B = self.envs_per_run, self.batch_size
+        prev = self._prev_injected
+        if prev is not None:
+            prev_obs, prev_act, prev_rew, prev_done, prev_boundary = prev
+        critic_weight = np.ones((self.num_runs, B), dtype=np.float32)
+        batches = []
+        for s in range(self.num_runs):
+            b = self.buffers[s].sample(B)
+            # next_obs of the injected rows = the current state = the previous
+            # transition's true next state, except right after a reset.
+            b.next_obs[-E:] = obs_nm[s]
+            if prev is None:
+                critic_weight[s, -E:] = 0.0  # first step: no coherent prev transition
+            else:
+                b.obs[-E:], b.action[-E:], b.reward[-E:], b.done[-E:] = \
+                    prev_obs[s], prev_act[s], prev_rew[s], prev_done[s]
+                critic_weight[s, -E:] = ~prev_boundary[s]  # drop only the reset rows
+            batches.append(b)
+        stacked = jax.tree.map(lambda *xs: jnp.stack([jnp.asarray(x) for x in xs], axis=0), *batches)
+
+        env_step = self.sample_logs[0].sample_step
+        scalar_info, array_info, actions = self.algorithm.update_vmap(update_key, stacked, jnp.asarray(critic_weight), env_step=env_step)
+        self._log_update(scalar_info, array_info)
+
+        action_nm = np.asarray(actions[:, -E:])  # [num_runs, E, act_dim]
+        q_per_env, v_per_env = self.algorithm.eval_q_v_vmap(obs_nm, action_nm)
+        return action_nm, q_per_env, v_per_env
 
     def finish(self):
         self.logger.flush_all()

@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 import jax, jax.numpy as jnp
 import haiku as hk
@@ -16,10 +16,11 @@ class ValueNet(hk.Module):
     hidden_sizes: Sequence[int]
     activation: Activation
     output_activation: Activation = Identity
+    w_init: Any = None
     name: str = None
 
     def __call__(self, obs: jax.Array) -> jax.Array:
-        return mlp(self.hidden_sizes, 1, self.activation, self.output_activation)(obs)[..., 0]
+        return mlp(self.hidden_sizes, 1, self.activation, self.output_activation, w_init=self.w_init)(obs)[..., 0]
 
 
 @dataclass
@@ -28,18 +29,19 @@ class QNet(hk.Module):
     hidden_sizes: Sequence[int]
     activation: Activation
     output_activation: Activation = Identity
+    w_init: Any = None
     name: str = None
 
     def __call__(self, obs: jax.Array, act: jax.Array) -> jax.Array:
         input = jnp.concatenate((obs, act), axis=-1)
-        return mlp(self.hidden_sizes, 1, self.activation, self.output_activation)(input)[..., 0]
+        return mlp(self.hidden_sizes, 1, self.activation, self.output_activation, w_init=self.w_init)(input)[..., 0]
 
 
-def mlp(hidden_sizes: Sequence[int], output_size: int, activation: Activation, output_activation: Activation) -> Callable[[jax.Array], jax.Array]:
+def mlp(hidden_sizes: Sequence[int], output_size: int, activation: Activation, output_activation: Activation, w_init: Any = None) -> Callable[[jax.Array], jax.Array]:
     layers = []
     for hidden_size in hidden_sizes:
-        layers += [hk.Linear(hidden_size), activation]
-    layers += [hk.Linear(output_size), output_activation]
+        layers += [hk.Linear(hidden_size, w_init=w_init), activation]
+    layers += [hk.Linear(output_size, w_init=w_init), output_activation]
     return hk.Sequential(layers)
 
 

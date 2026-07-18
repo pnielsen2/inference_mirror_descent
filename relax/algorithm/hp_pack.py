@@ -28,6 +28,7 @@ from relax.cli.train_setup import resolve_cmd_params
 # is implicit (e.g. "lr_q" stays "lr_q").
 CLI_TO_FIELD = {
     "advantage_ema_tau": "adv_ema_tau",
+    "advantage_norm_ema_rate": "adv_norm_ema_rate",
     "guidance_strength_multiplier": "guidance_mult",
     "kl_budget": "kl_budget_val",
     "initial_advantage_second_moment_ema": "advantage_second_moment_ema",
@@ -38,6 +39,7 @@ CLI_TO_FIELD = {
 
 ALLOWED_KEYS = {
     "lr_q", "lr_policy", "gamma", "polyak_tau", "advantage_ema_tau",
+    "advantage_norm_ema_rate",
     "guidance_strength_multiplier", "shape_ema_tau", "beta", "kl_budget",
     "initial_advantage_second_moment_ema", "initial_dist_shift_shape_ema",
     "reward_scale", "x0_hat_clip_radius", "mala_adapt_rate",

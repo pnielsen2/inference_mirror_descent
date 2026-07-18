@@ -33,11 +33,13 @@ class ValueHead:
     _apply_vmap: Optional[Callable] = None  # built eagerly in ``create``
 
     @classmethod
-    def create(cls, obs_dim: int, hidden_dim: int) -> "ValueHead":
+    def create(cls, obs_dim: int, hidden_dim: int, orthogonal_init: bool = False) -> "ValueHead":
+        w_init = hk.initializers.Orthogonal() if orthogonal_init else None
         value_net = hk.without_apply_rng(
             hk.transform(lambda obs: ValueNet(
                 hidden_sizes=(hidden_dim, hidden_dim, hidden_dim),
                 activation=jax.nn.relu,
+                w_init=w_init,
             )(obs))
         )
         v_apply = value_net.apply

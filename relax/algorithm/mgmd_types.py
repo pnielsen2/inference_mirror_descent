@@ -65,6 +65,7 @@ class HParams(NamedTuple):
     guidance_mult_increasing: jax.Array = 0.0  # 1.0 => use normalized alpha_t schedule from TFG
     adv_ema_tau: jax.Array = 0.0005     # advantage-moment EMA rate
     shape_ema_tau: jax.Array = 0.0001   # dimensionless shape EMA rate
+    adv_norm_ema_rate: jax.Array = 0.001  # EMA rate for --ema_advantage_normalization running mean/std
     kl_budget_val: jax.Array = 1.0      # KL budget δ (host uses for β cap)
     reward_scale: jax.Array = 1.0       # reward scaling for TD / huber δ
     x0_hat_clip_radius: jax.Array = 1.0  # clip radius for x0 prediction
@@ -87,6 +88,8 @@ class Diffv2TrainState(NamedTuple):
     advantage_third_moment_ema: float = 0.0
     dist_shift_covariance_ema: float = 0.0
     dist_shift_shape_ema: float = -1.0        # EMA of s₂ = (2γc + κ₃) / v^(3/2), dimensionless shape
+    q_running_mean: float = 0.0              # EMA(batch mean of online agg-Q at next-actions); --ema_advantage_normalization
+    q_running_std: float = 1.0               # EMA(batch std of online agg-Q at next-actions); guidance Q divisor
     policy_loss: jax.Array = 0.0             # last computed policy loss; held constant on non-update steps
     hp: HParams = HParams()
 
@@ -130,6 +133,19 @@ class MGMDConfig:
     num_denoised_actions: int = 1
     batch_advantage_normalization: bool = False
     q_loss_normalization: bool = False
+    ema_advantage_normalization: bool = False
+    advantage_norm_ema_rate: float = 0.001
+    lr_anneal: bool = False
+    # Defaults reproduce diffusion_policy_online_rl's default LR-vs-ENV-step curve:
+    # its policy schedule is linear(begin=2.5e4, steps=5e4) in POLICY-OPTIM steps
+    # with lr 3e-4 -> 3e-5 (factor 0.1); at its defaults there are 10 env steps per
+    # policy-optim step (num_vec_envs=5 * delay_update=2), so begin/steps map to
+    # 2.5e5 / 5e5 env steps. Annealing here is a pure function of env steps, so this
+    # curve is independent of this codebase's own num_vec_envs / update_per_iteration.
+    lr_anneal_end_factor: float = 0.1
+    lr_anneal_transition_begin: int = 250000
+    lr_anneal_transition_steps: int = 500000
+    orthogonal_init: bool = False
 
     @classmethod
     def from_args(cls, args) -> "MGMDConfig":
@@ -177,4 +193,11 @@ class MGMDConfig:
             num_denoised_actions=args.num_denoised_actions,
             batch_advantage_normalization=args.batch_advantage_normalization,
             q_loss_normalization=args.q_loss_normalization,
+            ema_advantage_normalization=args.ema_advantage_normalization,
+            advantage_norm_ema_rate=args.advantage_norm_ema_rate,
+            lr_anneal=args.lr_anneal,
+            lr_anneal_end_factor=args.lr_anneal_end_factor,
+            lr_anneal_transition_begin=args.lr_anneal_transition_begin,
+            lr_anneal_transition_steps=args.lr_anneal_transition_steps,
+            orthogonal_init=args.orthogonal_init,
         )

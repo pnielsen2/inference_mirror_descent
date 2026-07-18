@@ -49,15 +49,19 @@ def resolve_cmd_params(alpha, beta, T, eta):
         alpha = beta / eta
         T = (eta - beta) / (beta * eta)
     elif T is not None and eta is not None:
-        alpha = 1.0 / (1.0 + eta * T)
-        beta = eta / (1.0 + eta * T)
+        denom = 1.0 + eta * T
+        if denom <= 0.0:
+            raise ValueError(
+                f"Cannot derive a valid CMD update from --T and --eta: "
+                f"1 + eta*T must be > 0, got {denom} (eta={eta}, T={T})."
+            )
+        alpha = 1.0 / denom
+        beta = eta / denom
 
     if alpha <= 0.0:
         raise ValueError(f"Resolved alpha must be > 0, got {alpha}.")
     if beta < 0.0:
         raise ValueError(f"Resolved beta must be >= 0, got {beta}.")
-    if T < 0.0:
-        raise ValueError(f"Resolved T must be >= 0, got {T}.")
     if eta < 0.0:
         raise ValueError(f"Resolved eta must be >= 0, got {eta}.")
 
@@ -154,6 +158,7 @@ def build_per_seed_state(
         snr_max=args.snr_max,
         policy_parameterization=args.policy_parameterization,
         policy_final_layer=args.policy_final_layer,
+        orthogonal_init=args.orthogonal_init,
     )
     params_list = [model.init_params(k) for k in seeds.init_keys]
     return model, params_list, buffers_list

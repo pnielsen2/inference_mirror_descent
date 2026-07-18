@@ -46,6 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_q_networks", type=int, default=2, help="Number of Q critic networks to train (default 2, i.e. twin Q).")
     parser.add_argument("--buffer_size", type=int, default=int(1e6))
     parser.add_argument("--batch_size", type=int, default=256, help="Mini-batch size for training updates.")
+    parser.add_argument("--orthogonal_init", action="store_true", default=False, help="Initialize ALL network weight matrices (Q critics, diffusion/energy policy net, and the optional KL-budget V-network) with random orthogonal matrices (haiku Orthogonal, scale 1.0). Biases keep their default zero init. Default off = haiku's TruncatedNormal(1/sqrt(fan_in)).")
 
     # ----- diffusion schedule ----------------------------------------------
     parser.add_argument("--diffusion_steps", type=int, default=20)
@@ -56,7 +57,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--lr_policy", type=float, default=None)
     parser.add_argument("--lr_q", type=float, default=None)
+    parser.add_argument("--lr_anneal", action="store_true", default=False, help="Anneal BOTH the Q and policy learning rates by the same linear factor as a function of the env-step count (ported from diffusion_policy_online_rl). Factor is 1.0 up to --lr_anneal_transition_begin env steps, then decreases linearly to --lr_anneal_end_factor over --lr_anneal_transition_steps env steps, then held. The optional V-network LR (KL-budget mode) is not annealed. The defaults reproduce diffusion_policy_online_rl's default LR-vs-env-step curve exactly (see below).")
+    parser.add_argument("--lr_anneal_end_factor", type=float, default=0.1, help="Final LR multiplier for --lr_anneal. Default 0.1 reproduces diffusion_policy_online_rl's default policy-LR decay (train_mujoco.py: lr=3e-4 -> lr_schedule_end=3e-5).")
+    parser.add_argument("--lr_anneal_transition_begin", type=int, default=250000, help="Env step at which LR annealing begins. Default 250000 reproduces diffusion_policy_online_rl's transition_begin=2.5e4 POLICY-OPTIM steps, converted to env steps via its default 10 env-steps-per-policy-update (num_vec_envs=5 * delay_update=2). Units are ENV steps here.")
+    parser.add_argument("--lr_anneal_transition_steps", type=int, default=500000, help="Number of ENV steps over which the LR anneals from 1x down to --lr_anneal_end_factor. Default 500000 = diffusion_policy_online_rl's transition_steps=5e4 policy-optim steps * 10 env-steps-per-policy-update.")
     parser.add_argument("--update_per_iteration", type=int, default=1)
+    parser.add_argument("--fused_denoising", action="store_true", default=False, help="Proposed Algorithm 1 Modification: fuse the stepping + training denoising passes into one. The current transition (s'_B = s) is injected as the last --num_vec_envs rows of the training minibatch; the update denoises the whole minibatch, and the denoised next-action for those rows is reused to step the env (dropping the separate get_action denoising pass). --update_per_iteration is respected (the fused update is #1; the rest are training-only). Requires --batch_size > --num_vec_envs.")
     parser.add_argument("--critic_update_steps", type=int, default=1, help="Number of Q/V optimizer steps inside each stateless update. All steps reuse the same sampled minibatch and fixed TD/value targets. Default 1.")
     parser.add_argument("--policy_update_steps", type=int, default=1, help="Number of diffusion-policy optimizer steps when the delay_update gate fires. Steps reuse the same tilted-action batch but resample diffusion timestep/noise. Default 1.")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor for the Q critic. Default 0.99.")
@@ -92,6 +98,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_denoised_actions", type=int, default=1, help="Number K of actions denoised per state in one sampler pass (formerly 'num_particles'). All K share the state and are iid draws. Rollout uses one (index 0, a uniform draw). The TD backup averages the clipped-double-Q over the K actions, and the diffusion policy regresses toward all K. K>=2 is required for --batch_advantage_normalization. Changes tensor shapes, so it is a 'hard' (non-vmap-packable) sweep axis in launch.py. Default 1.")
     parser.add_argument("--batch_advantage_normalization", action="store_true", default=False, help="V-free guidance normalization. At each MALA/denoising step, rescale Q by 1/sqrt(mean_s Var_K(Q)): the per-state sample variance (ddof=1) of Q over the K denoised Tweedie estimates, averaged over the batch, square-rooted, and stop-gradient'd. Requires --num_denoised_actions >= 2. Composes additively with --beta / other normalizations.")
     parser.add_argument("--q_loss_normalization", action="store_true", default=False, help="V-free guidance normalization. Divide the guidance Q by sqrt(EMA(Q TD loss)), where the EMA (rate --advantage_ema_tau) is tracked in-graph from the critic loss. Needs neither a V network nor multiple actions. Mutually exclusive with --advantage_normalization / --kl_budget(_per_dim) / --one_step_dist_shift_beta.")
+    parser.add_argument("--ema_advantage_normalization", action="store_true", default=False, help="V-free guidance normalization ported from diffusion_policy_online_rl. Divide the guidance Q by a slow EMA of the batch std of the online --q_agg_sample-aggregated Q at the sampled next-actions: Q_norm = (Q - mu)/sigma with mu, sigma stop-gradient'd (mu cancels in the guidance gradient, so this is effectively a 1/sigma rescale). EMA rate --advantage_norm_ema_rate. Needs neither a V network nor multiple actions. Mutually exclusive with --advantage_normalization / --kl_budget(_per_dim) / --one_step_dist_shift_beta / --q_loss_normalization.")
+    parser.add_argument("--advantage_norm_ema_rate", type=float, default=0.001, help="Per-step EMA rate r for the --ema_advantage_normalization running mean/std: x += r*(batch - x). Default 0.001 (the value hardcoded in diffusion_policy_online_rl).")
 
     # ----- MALA -------------------------------------------------------------
     parser.add_argument("--mala_steps", type=int, default=0, help="Number of MALA correction steps per diffusion step.")
@@ -155,9 +163,33 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
             "--one_step_dist_shift_beta"
         )
 
+    # --ema_advantage_normalization rescales the guidance Q by an EMA(std) and is
+    # its own guidance-normalization source, so it cannot combine with the other
+    # sources that also drive the beta/Q rescale.
+    if args.ema_advantage_normalization and (
+        args.advantage_normalization
+        or args.kl_budget is not None
+        or args.kl_budget_per_dim is not None
+        or args.one_step_dist_shift_beta
+        or args.q_loss_normalization
+    ):
+        parser.error(
+            "--ema_advantage_normalization is mutually exclusive with "
+            "--advantage_normalization, --kl_budget, --kl_budget_per_dim, "
+            "--one_step_dist_shift_beta, and --q_loss_normalization"
+        )
+
     if args.flatten_UTD:
         args.num_vec_envs = 1
         args.update_per_iteration = 1
+
+    # Fused denoising injects --num_vec_envs current transitions as the last rows
+    # of the minibatch, so there must be room for at least one randomly sampled row.
+    if args.fused_denoising and args.batch_size <= args.num_vec_envs:
+        parser.error(
+            "--fused_denoising requires --batch_size > --num_vec_envs "
+            f"(got batch_size={args.batch_size}, num_vec_envs={args.num_vec_envs})."
+        )
 
     # --one_step_dist_shift_beta implies a KL budget (default 5.33 per dim)
     if args.one_step_dist_shift_beta and args.kl_budget is None and args.kl_budget_per_dim is None:

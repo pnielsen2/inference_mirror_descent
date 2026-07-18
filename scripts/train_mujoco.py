@@ -75,6 +75,7 @@ if __name__ == "__main__":
         start_step=args.start_step,
         total_step=args.total_step,
         update_per_iteration=args.update_per_iteration,
+        fused_denoising=args.fused_denoising,
         update_log_n_env_steps=5 if args.debug else 5000,
         hparams=args_dict,
         hp_pack_dict=_hp_loaded,

@@ -33,6 +33,7 @@ def build_mala_sampler(
     guidance_gradient_space: str,
     num_denoised_actions: int = 1,
     batch_advantage_normalization: bool = False,
+    ema_advantage_normalization: bool = False,
 ) -> Callable:
     """Return ``stateless_get_action_mala_full(key, state, obs, aggregate_q_fn)``.
 
@@ -93,8 +94,21 @@ def build_mala_sampler(
             denom = jnp.sqrt(jnp.maximum(jnp.mean(jnp.var(q, axis=0, ddof=1)), jnp.float32(1e-6)))
             return q / jax.lax.stop_gradient(denom)
 
+        # --ema_advantage_normalization (ported from diffusion_policy_online_rl):
+        # z-score Q by a slow EMA of the batch mean/std of the online agg-Q at the
+        # sampled next-actions (tracked in the trainer's q_running_mean/std). Both
+        # stats are stop-gradient'd, so the mean subtraction is a gradient /
+        # energy-difference no-op (kept to mirror (Q - mu)/sigma) and only the
+        # 1/sigma factor rescales the guidance magnitude.
+        def maybe_ema_normalize(q):
+            if not ema_advantage_normalization:
+                return q
+            mean = jax.lax.stop_gradient(state.q_running_mean)
+            std = jnp.maximum(jax.lax.stop_gradient(state.q_running_std), jnp.float32(1e-6))
+            return (q - mean) / std
+
         def agg_q_at_action(action):
-            return maybe_batch_normalize(aggregate_q_fn([model.q(qp, obs, action) for qp in q_params_tuple]))
+            return maybe_ema_normalize(maybe_batch_normalize(aggregate_q_fn([model.q(qp, obs, action) for qp in q_params_tuple])))
 
         def guidance_multiplier_at_t(t_idx):
             return guidance_multiplier * (

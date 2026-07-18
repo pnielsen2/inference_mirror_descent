@@ -39,6 +39,7 @@ class ScalarPolicyNet(hk.Module):
     output_activation: Activation = Identity
     time_dim: int = 16
     policy_final_layer: str = "default"
+    w_init: Any = None
     name: str = None
 
     def __call__(
@@ -55,15 +56,15 @@ class ScalarPolicyNet(hk.Module):
             t: Diffusion timestep
         """
         te = scaled_sinusoidal_encoding(t, dim=self.time_dim, batch_shape=obs.shape[:-1])
-        te = hk.Linear(self.time_dim * 2)(te)
+        te = hk.Linear(self.time_dim * 2, w_init=self.w_init)(te)
         te = self.activation(te)
-        te = hk.Linear(self.time_dim)(te)
+        te = hk.Linear(self.time_dim, w_init=self.w_init)(te)
         input = jnp.concatenate((obs, act, te), axis=-1)
         if self.policy_final_layer == "default":
-            return mlp(self.hidden_sizes, 1, self.activation, self.output_activation)(input)[..., 0]
-        v = mlp(self.hidden_sizes, act.shape[-1], self.activation, self.output_activation)(input)
+            return mlp(self.hidden_sizes, 1, self.activation, self.output_activation, w_init=self.w_init)(input)[..., 0]
+        v = mlp(self.hidden_sizes, act.shape[-1], self.activation, self.output_activation, w_init=self.w_init)(input)
         if self.policy_final_layer == "ff":
-            return hk.Linear(1)(v)[..., 0]
+            return hk.Linear(1, w_init=self.w_init)(v)[..., 0]
         if self.policy_final_layer == "L2":
             return -0.5 * jnp.sum(v ** 2, axis=-1)
         return jnp.sum(v * act, axis=-1)  # "IP"
@@ -134,18 +135,25 @@ class ActorCritic:
         num_q_networks: int = 2,
         policy_parameterization: str = "E",
         policy_final_layer: str = "default",
+        orthogonal_init: bool = False,
     ) -> "ActorCritic":
         """Build the architecture: haiku transforms + DDPM schedule.
 
         Seed-independent. One :class:`ActorCritic` instance can be reused
         across any number of seeds; fresh per-seed params are sampled
         with :meth:`init_params`.
+
+        ``orthogonal_init`` selects the weight-matrix initializer for every
+        ``hk.Linear`` in the Q ensemble and the diffusion/energy policy net:
+        ``True`` -> ``hk.initializers.Orthogonal()`` (random orthogonal, scale
+        1.0; biases keep their default zeros), ``False`` -> haiku's default.
         """
-        q_net = hk.without_apply_rng(hk.transform(lambda obs, act: QNet(hidden_sizes, activation)(obs, act)))
+        w_init = hk.initializers.Orthogonal() if orthogonal_init else None
+        q_net = hk.without_apply_rng(hk.transform(lambda obs, act: QNet(hidden_sizes, activation, w_init=w_init)(obs, act)))
 
         policy_scalar = hk.without_apply_rng(
             hk.transform(
-                lambda obs, act, t: ScalarPolicyNet(diffusion_hidden_sizes, activation, policy_final_layer=policy_final_layer)(
+                lambda obs, act, t: ScalarPolicyNet(diffusion_hidden_sizes, activation, policy_final_layer=policy_final_layer, w_init=w_init)(
                     obs,
                     act,
                     t,
