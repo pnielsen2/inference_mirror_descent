@@ -15,6 +15,7 @@ Layout (Option B):
 """
 from pathlib import Path
 from typing import List, Optional
+import os
 
 import jax
 import jax.numpy as jnp
@@ -30,6 +31,11 @@ from relax.trainer.accumulator import Interval, SampleLog, UpdateLog
 from relax.trainer.sample_metrics import SampleMetricsRecorder
 from relax.trainer.wandb_logging import WandbMultiSeedLogger, build_config_tag  # noqa: F401  (build_config_tag re-exported for analysis scripts)
 from relax.utils.experience import Experience
+from relax.utils.diagnostic_snapshot import (
+    sample_replay_batches_for_snapshot,
+    sample_replay_buffer_subset_for_snapshot,
+    save_diagnostic_snapshot,
+)
 
 
 def _detect_env_can_terminate(env_name: str) -> bool:
@@ -79,6 +85,11 @@ class VmapOffPolicyTrainer:
         hp_pack_dict: Optional[dict] = None,
         sweep_id: Optional[int] = None,
         config_tag_keys: Optional[str] = None,
+        save_diagnostic_snapshots: bool = False,
+        diagnostic_snapshot_steps: Optional[List[int]] = None,
+        diagnostic_snapshot_batch_size: int = 256,
+        diagnostic_snapshot_buffer_fraction: float = 0.0,
+        diagnostic_snapshot_dir: Optional[str] = None,
     ):
         self.env = env
         self.algorithm = algorithm
@@ -96,6 +107,20 @@ class VmapOffPolicyTrainer:
         self.hparams = hparams or {}
         self._wandb_names = wandb_names
         self.sweep_id = sweep_id
+        self.save_diagnostic_snapshots = bool(save_diagnostic_snapshots)
+        self.diagnostic_snapshot_steps = sorted({
+            int(step) for step in (diagnostic_snapshot_steps or [])
+        })
+        self.diagnostic_snapshot_batch_size = int(diagnostic_snapshot_batch_size)
+        self.diagnostic_snapshot_buffer_fraction = float(diagnostic_snapshot_buffer_fraction)
+        self.diagnostic_snapshot_dir = (
+            Path(diagnostic_snapshot_dir) / f"{self.log_path.name}_pid{os.getpid()}"
+            if diagnostic_snapshot_dir is not None else None
+        )
+        self._diagnostic_snapshot_saved_steps = set()
+        self._diagnostic_snapshot_rng = np.random.default_rng(
+            int(self.hparams.get("seed", 0)) + 7919
+        )
         # Parse the comma-separated list of tag keys (set by launch.py from
         # the union of hard+easy ablation axes, minus env/seed). None means
         # the config_tag falls back to "single" -- only meaningful when
@@ -183,6 +208,71 @@ class VmapOffPolicyTrainer:
             self._update_advantage_state = self._ema_update_kl_only
         else:
             self._update_advantage_state = self._ema_update_m2_only
+
+    def _maybe_save_diagnostic_snapshots(self, step: int, obs_flat: np.ndarray) -> None:
+        if not self.save_diagnostic_snapshots:
+            return
+        if self.diagnostic_snapshot_dir is None:
+            raise ValueError("diagnostic_snapshot_dir must be set when saving diagnostic snapshots")
+
+        due_steps = [
+            target
+            for target in self.diagnostic_snapshot_steps
+            if target not in self._diagnostic_snapshot_saved_steps and step >= target
+        ]
+        if not due_steps:
+            return
+
+        rollout_obs = np.asarray(obs_flat).reshape(self.num_runs, self.envs_per_run, -1)
+        replay_batches, replay_indices = sample_replay_batches_for_snapshot(
+            self.buffers,
+            batch_size=self.diagnostic_snapshot_batch_size,
+            rng=self._diagnostic_snapshot_rng,
+        )
+        replay_buffer_subset = None
+        replay_buffer_subset_indices = None
+        if self.diagnostic_snapshot_buffer_fraction > 0.0:
+            replay_buffer_subset, replay_buffer_subset_indices = sample_replay_buffer_subset_for_snapshot(
+                self.buffers,
+                fraction=self.diagnostic_snapshot_buffer_fraction,
+                rng=self._diagnostic_snapshot_rng,
+            )
+        base_metadata = {
+            "actual_sample_step": int(step),
+            "env_name": self.env_name,
+            "num_runs": int(self.num_runs),
+            "envs_per_run": int(self.envs_per_run),
+            "rollout_obs_shape": list(rollout_obs.shape),
+            "replay_batch_size": int(self.diagnostic_snapshot_batch_size),
+            "replay_buffer_subset_fraction": float(self.diagnostic_snapshot_buffer_fraction),
+            "replay_buffer_subset_size": (
+                0 if replay_buffer_subset_indices is None else int(replay_buffer_subset_indices.shape[1])
+            ),
+            "buffer_lens": [int(buffer.len) for buffer in self.buffers],
+            "total_step": int(self.total_step),
+            "start_step": int(self.start_step),
+            "update_per_iteration": int(self.update_per_iteration),
+            "fused_denoising": bool(self.fused_denoising),
+            "pid": int(os.getpid()),
+            "sweep_id": None if self.sweep_id is None else int(self.sweep_id),
+        }
+
+        for target in due_steps:
+            path = save_diagnostic_snapshot(
+                root_dir=self.diagnostic_snapshot_dir,
+                env_name=self.env_name,
+                step=target,
+                algorithm_state=self.algorithm.state,
+                rollout_obs=rollout_obs,
+                replay_batches=replay_batches,
+                replay_indices=replay_indices,
+                metadata={**base_metadata, "target_step": int(target)},
+                hparams=self.hparams,
+                replay_buffer_subset=replay_buffer_subset,
+                replay_buffer_subset_indices=replay_buffer_subset_indices,
+            )
+            print(f"[diagnostic_snapshot] saved {path}")
+            self._diagnostic_snapshot_saved_steps.add(target)
 
     # ------------------------------------------------------------------
     # Setup
@@ -355,6 +445,7 @@ class VmapOffPolicyTrainer:
     def _train(self, key: jax.Array, obs):
         while self.sample_logs[0].sample_step <= self.total_step:
             step = self.sample_logs[0].sample_step
+            self._maybe_save_diagnostic_snapshots(step, obs)
             # fold_in(key, step) deterministically mixes the integer ``step``
             # into ``key`` to produce a fresh per-step PRNG without having to
             # thread an updated key through the loop. Same (key, step) -> same
@@ -391,6 +482,7 @@ class VmapOffPolicyTrainer:
         """
         while self.sample_logs[0].sample_step <= self.total_step:
             step = self.sample_logs[0].sample_step
+            self._maybe_save_diagnostic_snapshots(step, obs)
             run_keys = jax.vmap(lambda k: jax.random.fold_in(k, step))(key)
             split_keys = jax.vmap(lambda k: jax.random.split(k, self.update_per_iteration))(run_keys)
 

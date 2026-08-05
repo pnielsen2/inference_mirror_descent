@@ -39,6 +39,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sweep_id", type=int, default=None, help="Launcher-assigned integer identifying this sweep. When set, every wandb run from this invocation is placed in wandb group 'sweep_<sweep_id>', and each per-vmap-slot run's config includes a 'config_tag' field built from sweep_id + the per-slot hyperparameters (excluding seed/env) so a single tag value filters wandb to all runs across envs/seeds that share this hp configuration.")
     parser.add_argument("--config_tag_keys", type=str, default=None, help="Comma-separated list of argparse attribute names whose values should be included in the per-slot config_tag. Typically set automatically by scripts/launch.py to the union of all --ablate hard+easy flags (minus env and seed). Values come from the hp_pack (per-slot) when the key is a pack key, else from this script's CLI args (shared across all vmap slots within the job).")
 
+    # ----- diagnostic snapshots --------------------------------------------
+    parser.add_argument("--save_diagnostic_snapshots", action="store_true", default=False, help="Save host-side diagnostic snapshots at selected env steps. Snapshots include the vmapped algorithm state, the next rollout observations, and a fixed replay minibatch for later sampler-distribution analysis.")
+    parser.add_argument("--diagnostic_snapshot_steps", type=int, nargs="*", default=[], help="Env-step targets at which to save diagnostic snapshots. The trainer saves the first time the per-run env step reaches or crosses each target.")
+    parser.add_argument("--diagnostic_snapshot_batch_size", type=int, default=256, help="Number of replay transitions per run to save in each diagnostic snapshot for TD next-action / distillation diagnostics.")
+    parser.add_argument("--diagnostic_snapshot_buffer_fraction", type=float, default=0.0, help="Optional replay-buffer subset fraction to save per run in each diagnostic snapshot. 0 disables subset saving; 0.1 saves a uniform 10%% subset of each run's current valid buffer without advancing buffer RNGs.")
+    parser.add_argument("--diagnostic_snapshot_dir", type=str, default=None, help="Directory where diagnostic snapshots are written. Required when --save_diagnostic_snapshots is set.")
+
     # ----- networks ---------------------------------------------------------
     parser.add_argument("--hidden_num", type=int, default=3)
     parser.add_argument("--hidden_dim", type=int, default=256)
@@ -199,6 +206,17 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
         parser.error("--parallel_runs must be >= 1.")
     if args.num_vec_envs <= 0:
         parser.error("--num_vec_envs must be > 0.")
+    if args.diagnostic_snapshot_batch_size <= 0:
+        parser.error("--diagnostic_snapshot_batch_size must be > 0.")
+    if args.diagnostic_snapshot_buffer_fraction < 0.0 or args.diagnostic_snapshot_buffer_fraction > 1.0:
+        parser.error("--diagnostic_snapshot_buffer_fraction must be between 0 and 1.")
+    if any(step <= 0 for step in args.diagnostic_snapshot_steps):
+        parser.error("--diagnostic_snapshot_steps must contain positive env-step integers.")
+    if args.save_diagnostic_snapshots:
+        if not args.diagnostic_snapshot_steps:
+            parser.error("--save_diagnostic_snapshots requires --diagnostic_snapshot_steps.")
+        if args.diagnostic_snapshot_dir is None:
+            parser.error("--save_diagnostic_snapshots requires --diagnostic_snapshot_dir.")
     if args.update_per_iteration <= 0:
         parser.error("--update_per_iteration must be > 0.")
     if args.critic_update_steps <= 0:

@@ -81,6 +81,11 @@ if __name__ == "__main__":
         hp_pack_dict=_hp_loaded,
         sweep_id=args.sweep_id,
         config_tag_keys=args.config_tag_keys,
+        save_diagnostic_snapshots=args.save_diagnostic_snapshots,
+        diagnostic_snapshot_steps=args.diagnostic_snapshot_steps,
+        diagnostic_snapshot_batch_size=args.diagnostic_snapshot_batch_size,
+        diagnostic_snapshot_buffer_fraction=args.diagnostic_snapshot_buffer_fraction,
+        diagnostic_snapshot_dir=args.diagnostic_snapshot_dir,
     )
     trainer.setup(Experience.create_example(obs_dim, act_dim, trainer.batch_size))
     trainer.run(seeds.train_keys)
