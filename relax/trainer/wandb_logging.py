@@ -197,6 +197,14 @@ class WandbMultiSeedLogger:
 
             for tag, value in run_arrays.items():
                 arr = np.asarray(value)
+                if tag.endswith("_hist"):
+                    finite = arr[np.isfinite(arr)].reshape(-1)
+                    if finite.size >= 2 and float(np.min(finite)) < float(np.max(finite)):
+                        try:
+                            self._buffer_per_run(s, {tag: wandb.Histogram(finite)}, step)
+                        except ValueError:
+                            pass
+                    continue
                 if snr is not None and len(arr) == len(snr):
                     table = wandb.Table(
                         columns=["log2_snr", "value"],

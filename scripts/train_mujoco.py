@@ -1,9 +1,11 @@
 import json
 import time
 
+import gymnasium
+
 from relax.algorithm.mgmd import MGMD
 from relax.algorithm.mgmd_types import MGMDConfig
-from relax.env import create_vector_env
+from relax.env import RelaxWrapper, create_vector_env
 from relax.utils.experience import Experience
 from relax.utils.fs import PROJECT_ROOT
 from relax.utils.seeding import derive_seed_bundle
@@ -35,6 +37,18 @@ if __name__ == "__main__":
         per_entry_env_seeds=seeds.per_entry_env_seeds,
         per_entry_action_seeds=seeds.per_entry_action_seeds,
     )
+    eval_seed_effective = None
+    eval_envs = None
+    if args.eval_every > 0:
+        eval_seed_effective = int(args.eval_seed if args.eval_seed is not None else (args.seed + 1000003) % (2**32 - 1))
+        eval_envs = []
+        for i in range(args.parallel_runs):
+            env_i = RelaxWrapper(
+                gymnasium.make(args.env),
+                action_seed=int((eval_seed_effective + 1009 * i + 1) % (2**32 - 1)),
+            )
+            env_i.reset(seed=int((eval_seed_effective + 9973 * i) % (2**32 - 1)))
+            eval_envs.append(env_i)
 
     # Apply --kl_budget / --kl_budget_per_dim / --T promotion to beta + V-net.
     resolve_kl_budget(args, act_dim)
@@ -60,6 +74,7 @@ if __name__ == "__main__":
     # Allow the algorithm to override or augment these with its own effective
     # hyperparameters (e.g., internally clamped / derived values).
     args_dict = dict(vars(args))
+    args_dict["eval_seed_effective"] = eval_seed_effective
     if hasattr(algorithm, "get_effective_hparams"):
         args_dict.update(algorithm.get_effective_hparams())
 
@@ -81,6 +96,16 @@ if __name__ == "__main__":
         hp_pack_dict=_hp_loaded,
         sweep_id=args.sweep_id,
         config_tag_keys=args.config_tag_keys,
+        save_diagnostic_snapshots=args.save_diagnostic_snapshots,
+        diagnostic_snapshot_steps=args.diagnostic_snapshot_steps,
+        diagnostic_snapshot_batch_size=args.diagnostic_snapshot_batch_size,
+        diagnostic_snapshot_buffer_fraction=args.diagnostic_snapshot_buffer_fraction,
+        diagnostic_snapshot_dir=args.diagnostic_snapshot_dir,
+        eval_envs=eval_envs,
+        eval_every=args.eval_every,
+        eval_n_episodes=args.eval_n_episodes,
+        eval_best_of_n_actions=args.eval_best_of_n_actions,
+        eval_seed=0 if eval_seed_effective is None else eval_seed_effective,
     )
     trainer.setup(Experience.create_example(obs_dim, act_dim, trainer.batch_size))
     trainer.run(seeds.train_keys)

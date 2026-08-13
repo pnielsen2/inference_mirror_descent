@@ -1,3 +1,4 @@
+import math
 from typing import Optional, Tuple
 
 import jax, jax.numpy as jnp
@@ -5,11 +6,13 @@ import numpy as np
 import optax
 import haiku as hk
 
+from relax.algorithm.diffusion_sampler import build_diffusion_sampler
 from relax.algorithm.mala_sampler import build_mala_sampler
 from relax.algorithm.mgmd_types import (
     Diffv2OptStates,
     HParams,
     Diffv2TrainState,
+    MalaSampleResult,
     MGMDConfig,
 )
 from relax.algorithm.value_head import ValueHead
@@ -56,17 +59,37 @@ class MGMD:
         self.use_advantage_stats = bool(cfg.advantage_normalization or cfg.kl_budget is not None)
         self.on_policy_ema = self.use_advantage_stats
         self.one_step_dist_shift_beta = bool(cfg.one_step_dist_shift_beta)
+        self.mgmd_variant = cfg.mgmd_variant
+        self.rsm_variant = self.mgmd_variant == "rsm"
+        self.soft_resample_variant = self.mgmd_variant == "soft_resample"
         # V-free guidance-normalization knobs (see relax/cli/train_args.py).
         self.num_denoised_actions = int(cfg.num_denoised_actions)
+        self.soft_resample_actions = int(cfg.soft_resample_actions)
+        self.best_of_n_actions = int(cfg.best_of_n_actions)
+        self.best_of_n_td_action_sampling = bool(cfg.best_of_n_td_action_sampling)
+        self.best_of_n_td_actions = int(
+            cfg.best_of_n_td_actions if cfg.best_of_n_td_actions is not None else cfg.best_of_n_actions
+        )
+        self.uses_best_of_n_noise = (
+            self.best_of_n_actions > 1
+            or (self.best_of_n_td_action_sampling and self.best_of_n_td_actions > 1)
+        )
         self.q_loss_normalization = bool(cfg.q_loss_normalization)
         self.batch_advantage_normalization = bool(cfg.batch_advantage_normalization)
         self.ema_advantage_normalization = bool(cfg.ema_advantage_normalization)
         self.lr_anneal = bool(cfg.lr_anneal)
-        self.policy_loss_key = "losses/Policy_epsilon_MSE"
+        self.policy_loss_key = (
+            "losses/Policy_RSM_weighted_epsilon_MSE"
+            if self.rsm_variant else
+            "losses/Policy_soft_resample_weighted_epsilon_MSE"
+            if self.soft_resample_variant else
+            "losses/Policy_epsilon_MSE"
+        )
 
         # --- Optimizers: unscaled Adam; per-seed state.lr_{q,policy} is applied at update time. ---
         self.optim = optax.scale_by_adam()
         self.policy_optim = optax.scale_by_adam()
+        self.best_of_n_noise_optim = optax.adam(self.cfg.best_of_n_noise_lr)
 
         # --- Optional V(s) network for KL-budget / on-policy-EMA beta adaptation and logging. ---
         value_params_init, value_opt_state_init = self._setup_value_network(params)
@@ -81,7 +104,8 @@ class MGMD:
         self._snr = self._alphas_cumprod / np.maximum(1.0 - self._alphas_cumprod, 1e-8)
 
         # --- Stateless update / sampler closures (jit-able, vmap-able). ---
-        # Build the MALA sampler; body lives in relax.algorithm.mala_sampler.
+        # Default MGMD uses MALA-guided sampling. The RSM variant binds to a
+        # plain DDPM sampler for both rollout and TD next-action sampling.
         _sampler_kw = dict(
             model=self.model, value_head=self.value_head, timesteps=self._timesteps,
             batch_independent_guidance=self.cfg.batch_independent_guidance,
@@ -92,14 +116,54 @@ class MGMD:
             batch_advantage_normalization=self.batch_advantage_normalization,
             ema_advantage_normalization=self.ema_advantage_normalization,
         )
-        sampler = build_mala_sampler(**_sampler_kw)
         # Both sampling paths (rollout + TD next-action) use --q_agg_sample aggregation.
         # The TD-backup target itself remains hardcoded to 'min' (clipped double-Q).
         agg_critic = lambda qm: _aggregate_q(qm, self.cfg.q_agg_sample)
-        updater = self._stateless_update(build_mala_sampler(**_sampler_kw, compute_final_q=False), agg_critic)
-        stateless_get_action = lambda key, state, obs: sampler(key, state, obs, agg_critic)
+        if self.rsm_variant:
+            rollout_sampler = build_diffusion_sampler(
+                model=self.model,
+                timesteps=self._timesteps,
+                num_denoised_actions=1,
+            )
+            td_sampler = build_diffusion_sampler(
+                model=self.model,
+                timesteps=self._timesteps,
+                num_denoised_actions=self.num_denoised_actions,
+                compute_final_q=False,
+            )
+            training_num_actions = self.num_denoised_actions
+        elif self.soft_resample_variant:
+            proposal_sampler = build_diffusion_sampler(
+                model=self.model,
+                timesteps=self._timesteps,
+                num_denoised_actions=self.soft_resample_actions,
+                compute_final_q=True,
+            )
+            rollout_sampler = self._stateless_soft_resample_sampler(proposal_sampler)
+            td_sampler = self._stateless_soft_resample_sampler(proposal_sampler)
+            training_num_actions = 1
+        else:
+            rollout_sampler = build_mala_sampler(
+                **dict(_sampler_kw, num_denoised_actions=self.best_of_n_actions)
+            )
+            if self.best_of_n_td_action_sampling:
+                td_sampler = self._stateless_best_of_n_training_sampler(
+                    build_mala_sampler(
+                        **dict(_sampler_kw, num_denoised_actions=self.best_of_n_td_actions)
+                    )
+                )
+                training_num_actions = 1
+            else:
+                td_sampler = build_mala_sampler(**_sampler_kw, compute_final_q=False)
+                training_num_actions = self.num_denoised_actions
+        updater = self._stateless_update(td_sampler, agg_critic, training_num_actions)
+        stateless_get_action = self._stateless_get_action(rollout_sampler, agg_critic)
         self._jit_vmap_update = jax.jit(jax.vmap(updater))
         self._jit_vmap_get_action = jax.jit(jax.vmap(stateless_get_action))
+        self._jit_vmap_eval_action_by_n = {}
+        self._last_rollout_soft_resample_ess = None
+        self._last_rollout_soft_resample_pmax = None
+        self._last_soft_resample_array_log_step = -float("inf")
 
     def update_vmap(self, key: jax.Array, data: Experience, critic_weight: Optional[jax.Array] = None, env_step: Optional[float] = None):
         """Vmapped training update.
@@ -123,7 +187,42 @@ class MGMD:
             env_step_arr = jnp.full((num_runs,), jnp.float32(env_step), dtype=jnp.float32)
         self.state, info, actions = self._jit_vmap_update(key, self.state, data, critic_weight, env_step_arr)
         scalar_info, array_info = _split_info_vmap(info)
+        if self.soft_resample_variant:
+            dump_arrays = self._soft_resample_array_dump_due(env_step)
+            self._augment_soft_resample_rollout_info(scalar_info, array_info, dump_arrays)
+            self._filter_soft_resample_array_dumps(array_info, dump_arrays)
         return scalar_info, array_info, actions
+
+    def _soft_resample_array_dump_due(self, env_step: Optional[float]) -> bool:
+        interval = int(self.cfg.soft_resample_ess_dump_interval)
+        if interval <= 0 or env_step is None:
+            return False
+        env_step_f = float(env_step)
+        if env_step_f - self._last_soft_resample_array_log_step < interval:
+            return False
+        self._last_soft_resample_array_log_step = env_step_f
+        return True
+
+    def _augment_soft_resample_rollout_info(self, scalar_info: dict, array_info: dict, dump_arrays: bool) -> None:
+        ess = self._last_rollout_soft_resample_ess
+        pmax = self._last_rollout_soft_resample_pmax
+        if ess is None or pmax is None:
+            return
+        _add_np_summary_info(scalar_info, "SoftResample/Rollout/ess", ess)
+        _add_np_summary_info(scalar_info, "SoftResample/Rollout/pmax", pmax)
+        for slot in range(ess.shape[1]):
+            scalar_info[f"SoftResample/Rollout/ess_slot_{slot}"] = ess[:, slot]
+            scalar_info[f"SoftResample/Rollout/pmax_slot_{slot}"] = pmax[:, slot]
+        if dump_arrays:
+            array_info["SoftResample/Rollout/ess_hist"] = ess
+            array_info["SoftResample/Rollout/pmax_hist"] = pmax
+
+    def _filter_soft_resample_array_dumps(self, array_info: dict, dump_arrays: bool) -> None:
+        if dump_arrays:
+            return
+        for key in list(array_info.keys()):
+            if key.startswith("SoftResample/TD/") and key.endswith("_hist"):
+                array_info.pop(key)
 
     def eval_q_v_vmap(self, obs: np.ndarray, action: np.ndarray):
         """Rollout-equivalent Q(obs, action) and V(obs) for the stepping action.
@@ -162,10 +261,210 @@ class MGMD:
             return jnp.mean(per_elem_loss)
         return jnp.sum(weight * per_elem_loss) / jnp.maximum(jnp.sum(weight), jnp.float32(1.0))
 
-    def _stateless_update(self, sampler, agg_sample_fn):
+    def _stateless_get_action(self, sampler, agg_sample_fn):
+        """Return rollout sampler closure.
+
+        ``best_of_n_actions=1`` preserves the existing single-sample rollout.
+        ``best_of_n_actions>1`` selects the highest final online-Q candidate and
+        then adds DPMD-style learned Gaussian execution noise. The selected Q is
+        used only for choosing the pre-noise candidate; the returned Q is
+        recomputed at the actually executed noisy action.
+        """
+        def stateless_get_action(key: jax.Array, state: Diffv2TrainState, obs: jax.Array):
+            sample_key, noise_key = jax.random.split(key)
+            result = sampler(sample_key, state, obs, agg_sample_fn)
+            if self.soft_resample_variant:
+                return MalaSampleResult(
+                    action=result.action[0],
+                    q=result.q[0],
+                    log_eta_scales=result.log_eta_scales,
+                    per_level_acc=result.per_level_acc,
+                    per_level_clip=result.per_level_clip,
+                    candidate_action=result.candidate_action,
+                    weights=result.weights,
+                    ess=result.ess,
+                    pmax=result.pmax,
+                    selected_idx=result.selected_idx,
+                )
+            if self.best_of_n_actions == 1:
+                return MalaSampleResult(
+                    action=result.action[0],
+                    q=result.q[0],
+                    log_eta_scales=result.log_eta_scales,
+                    per_level_acc=result.per_level_acc,
+                    per_level_clip=result.per_level_clip,
+                )
+
+            best_idx = jnp.argmax(result.q, axis=0)
+            gather_idx = best_idx[None, ...]
+            while gather_idx.ndim < result.action.ndim:
+                gather_idx = gather_idx[..., None]
+            best_action = jnp.take_along_axis(result.action, gather_idx, axis=0).squeeze(axis=0)
+            noise_scale = jnp.exp(state.log_best_of_n_noise_scale)
+            exec_action = best_action + jax.random.normal(noise_key, best_action.shape) * noise_scale
+            exec_q = _aggregate_q(
+                [self.model.q(qp, obs, exec_action) for qp in state.params.q],
+                self.cfg.q_agg_sample,
+            )
+            return MalaSampleResult(
+                action=exec_action,
+                q=exec_q,
+                log_eta_scales=result.log_eta_scales,
+                per_level_acc=result.per_level_acc,
+                per_level_clip=result.per_level_clip,
+            )
+
+        return stateless_get_action
+
+    def _stateless_eval_action(self, sampler, agg_sample_fn):
+        """Eval-only best-of-N action selector.
+
+        Evaluation intentionally differs from rollout best-of-N in one way:
+        after selecting the highest-Q candidate, it executes that candidate
+        directly, without the learned post-selection Gaussian exploration noise.
+        """
+        def stateless_eval_action(key: jax.Array, state: Diffv2TrainState, obs: jax.Array):
+            result = sampler(key, state, obs, agg_sample_fn)
+            best_idx = jnp.argmax(result.q, axis=0)
+            gather_idx = best_idx[None, ...]
+            while gather_idx.ndim < result.action.ndim:
+                gather_idx = gather_idx[..., None]
+            action = jnp.take_along_axis(result.action, gather_idx, axis=0).squeeze(axis=0)
+            q = jnp.take_along_axis(result.q, best_idx[None, ...], axis=0).squeeze(axis=0)
+            return action, q
+
+        return stateless_eval_action
+
+    def _build_eval_action_vmap(self, num_actions: int):
+        num_actions = int(num_actions)
+        agg_critic = lambda qm: _aggregate_q(qm, self.cfg.q_agg_sample)
+        if self.rsm_variant or self.soft_resample_variant:
+            sampler = build_diffusion_sampler(
+                model=self.model,
+                timesteps=self._timesteps,
+                num_denoised_actions=num_actions,
+                compute_final_q=True,
+            )
+        else:
+            sampler = build_mala_sampler(
+                model=self.model,
+                value_head=self.value_head,
+                timesteps=self._timesteps,
+                batch_independent_guidance=self.cfg.batch_independent_guidance,
+                ema_normalization=bool(self.cfg.advantage_normalization or self.cfg.q_loss_normalization),
+                denoising_predictor=self.cfg.denoising_predictor,
+                guidance_gradient_space=self.cfg.guidance_gradient_space,
+                num_denoised_actions=num_actions,
+                batch_advantage_normalization=self.batch_advantage_normalization,
+                ema_advantage_normalization=self.ema_advantage_normalization,
+            )
+        return jax.jit(jax.vmap(self._stateless_eval_action(sampler, agg_critic)))
+
+    def _stateless_best_of_n_training_sampler(self, sampler):
+        """Return a TD next-action sampler with DPMD-style best-of-N selection.
+
+        The wrapped sampler emits N candidate actions per replay state. This
+        closure selects the highest final online-Q candidate, adds the same
+        learned Gaussian best-of-N noise used by rollout, recomputes online Q at
+        the executed action, and restores a leading singleton action axis so the
+        training update can keep its [K, batch, ...] tensor convention.
+        """
+        def stateless_best_of_n_training_sampler(
+            key: jax.Array,
+            state: Diffv2TrainState,
+            obs: jax.Array,
+            aggregate_q_fn,
+        ):
+            sample_key, noise_key = jax.random.split(key)
+            result = sampler(sample_key, state, obs, aggregate_q_fn)
+            if self.best_of_n_td_actions == 1:
+                return result
+
+            best_idx = jnp.argmax(result.q, axis=0)
+            gather_idx = best_idx[None, ...]
+            while gather_idx.ndim < result.action.ndim:
+                gather_idx = gather_idx[..., None]
+            best_action = jnp.take_along_axis(result.action, gather_idx, axis=0).squeeze(axis=0)
+
+            noise_scale = jnp.exp(state.log_best_of_n_noise_scale)
+            exec_action = best_action + jax.random.normal(noise_key, best_action.shape) * noise_scale
+            exec_q = aggregate_q_fn(
+                [self.model.q(qp, obs, exec_action) for qp in state.params.q],
+            )
+            return MalaSampleResult(
+                action=exec_action[None, ...],
+                q=exec_q[None, ...],
+                log_eta_scales=result.log_eta_scales,
+                per_level_acc=result.per_level_acc,
+                per_level_clip=result.per_level_clip,
+            )
+
+        return stateless_best_of_n_training_sampler
+
+    def _stateless_soft_resample_sampler(self, sampler):
+        """Return a sampler targeting pi_old(a|s) * exp(beta * processed_Q).
+
+        The wrapped plain-diffusion sampler emits N proposal actions per state.
+        This closure computes per-state Boltzmann weights, samples one proposal
+        for rollout / TD backup, and keeps the full candidate set + weights for
+        policy distillation and ESS logging.
+        """
+        def stateless_soft_resample_sampler(
+            key: jax.Array,
+            state: Diffv2TrainState,
+            obs: jax.Array,
+            aggregate_q_fn,
+        ):
+            sample_key, choice_key = jax.random.split(key)
+            result = sampler(sample_key, state, obs, aggregate_q_fn)
+            q_processed = _processed_q_for_resampling(
+                result.q,
+                state,
+                self.batch_advantage_normalization,
+                self.ema_advantage_normalization,
+            )
+            beta_resample = _soft_resample_beta(
+                state,
+                self.cfg.advantage_normalization or self.q_loss_normalization,
+            )
+            weights, ess, pmax = _soft_resample_weights_from_q(q_processed, beta_resample)
+            logits = beta_resample * q_processed
+            selected_idx = jax.random.categorical(choice_key, logits, axis=0)
+
+            gather_idx = selected_idx[None, ...]
+            while gather_idx.ndim < result.action.ndim:
+                gather_idx = gather_idx[..., None]
+            selected_action = jnp.take_along_axis(result.action, gather_idx, axis=0).squeeze(axis=0)
+            selected_q = jnp.take_along_axis(result.q, selected_idx[None, ...], axis=0).squeeze(axis=0)
+
+            return MalaSampleResult(
+                action=selected_action[None, ...],
+                q=selected_q[None, ...],
+                log_eta_scales=result.log_eta_scales,
+                per_level_acc=result.per_level_acc,
+                per_level_clip=result.per_level_clip,
+                candidate_action=result.action,
+                weights=weights,
+                ess=ess,
+                pmax=pmax,
+                selected_idx=selected_idx,
+            )
+
+        return stateless_soft_resample_sampler
+
+    def _best_of_n_noise_loss(self, log_noise_scale):
+        noise_scale = jnp.exp(log_noise_scale)
+        entropy_approx = jnp.float32(0.5 * self.model.act_dim) * jnp.log(
+            jnp.float32(2.0 * math.pi * math.e) * noise_scale * noise_scale
+        )
+        target_entropy = jnp.float32(-self.cfg.best_of_n_noise_target_entropy_scale * self.model.act_dim)
+        loss = log_noise_scale * jax.lax.stop_gradient(entropy_approx - target_entropy)
+        return loss, entropy_approx
+
+    def _stateless_update(self, sampler, agg_sample_fn, training_num_actions: int):
         """Return the ``stateless_update(key, state, data, critic_weight)`` closure.
 
-        Captures ``sampler`` (MALA sampler) and ``agg_sample_fn`` (Q aggregation
+        Captures ``sampler`` (MALA or plain diffusion sampler) and ``agg_sample_fn`` (Q aggregation
         used when sampling the TD next-action; distinct from the backup target
         which is hardcoded to 'min'). Called once from ``__init__``; the result
         is wrapped with ``jax.jit(jax.vmap(...))`` and stored as
@@ -180,6 +479,7 @@ class MGMD:
             policy_params = state.params.policy
             q_opt_states = state.opt_state.q   # tuple of N opt states
             policy_opt_state = state.opt_state.policy
+            best_of_n_noise_opt_state = state.opt_state.best_of_n_noise
             step = state.step
             num_q = len(q_params)
             next_eval_key, diffusion_time_key, diffusion_noise_key = jax.random.split(key, 3)
@@ -204,10 +504,13 @@ class MGMD:
 
             reward *= state.hp.reward_scale
 
-            # Denoise K tilted next-actions per state (K = num_denoised_actions).
+            # Denoise K tilted next-actions per replay state. By default
+            # K = num_denoised_actions. With --best_of_n_td_action_sampling,
+            # the sampler internally denoises N=best_of_n_td_actions candidates,
+            # selects one DPMD-style action, and returns it as K=1.
             mala_result = sampler(next_eval_key, state, next_obs, agg_sample_fn)
             tilted_actions = mala_result.action           # [K, batch, act_dim]
-            K = self.num_denoised_actions
+            K = training_num_actions
             next_obs_k = jnp.broadcast_to(next_obs, (K, *next_obs.shape))
 
             # Clipped double Q-learning: min_i(target_Q_i) per action, then the
@@ -252,11 +555,27 @@ class MGMD:
             # tracked for logging (it cancels in the guidance gradient).
             new_q_running_mean = state.q_running_mean
             new_q_running_std = state.q_running_std
-            if self.ema_advantage_normalization:
+            q_norm_samples = None
+            if self.ema_advantage_normalization or self.rsm_variant:
                 q_norm_samples = _aggregate_q(
                     [self.model.q(qp, next_obs_k, tilted_actions) for qp in q_params],
                     self.cfg.q_agg_sample,
                 )  # [K, batch] online Q at the tilted next-actions
+            if self.soft_resample_variant:
+                q_norm_samples = _aggregate_q(
+                    [self.model.q(qp, next_obs_k, tilted_actions) for qp in q_params],
+                    self.cfg.q_agg_sample,
+                )
+                if mala_result.candidate_action is not None:
+                    candidate_next_obs = jnp.broadcast_to(
+                        next_obs,
+                        (self.soft_resample_actions, *next_obs.shape),
+                    )
+                    q_norm_samples = _aggregate_q(
+                        [self.model.q(qp, candidate_next_obs, mala_result.candidate_action) for qp in q_params],
+                        self.cfg.q_agg_sample,
+                    )  # [N, batch] online Q at all soft-resample candidates
+            if self.ema_advantage_normalization:
                 rate = state.hp.adv_norm_ema_rate
                 new_q_running_mean = state.q_running_mean + rate * (jnp.mean(q_norm_samples) - state.q_running_mean)
                 new_q_running_std = state.q_running_std + rate * (jnp.std(q_norm_samples) - state.q_running_std)
@@ -266,13 +585,32 @@ class MGMD:
             # Diffusion policy regresses toward all K tilted actions; flatten the
             # K axis into the batch so score-matching sees K*batch targets (for
             # K=1 these are exactly the previous [batch, ...] tensors).
-            policy_targets = tilted_actions.reshape(K * obs.shape[0], -1)   # [K*batch, act_dim]
-            policy_obs = next_obs_k.reshape(K * obs.shape[0], -1)           # [K*batch, obs_dim]
+            if self.soft_resample_variant:
+                policy_K = self.soft_resample_actions
+                policy_action_block = mala_result.candidate_action
+                policy_obs_block = jnp.broadcast_to(next_obs, (policy_K, *next_obs.shape))
+                soft_policy_weights = jax.lax.stop_gradient(mala_result.weights)
+            else:
+                policy_K = K
+                policy_action_block = tilted_actions
+                policy_obs_block = next_obs_k
+                soft_policy_weights = None
+            policy_targets = policy_action_block.reshape(policy_K * obs.shape[0], -1)   # [policy_K*batch, act_dim]
+            policy_obs = policy_obs_block.reshape(policy_K * obs.shape[0], -1)           # [policy_K*batch, obs_dim]
+            rsm_q_used = jnp.zeros((policy_targets.shape[0],), dtype=policy_targets.dtype)
+            rsm_scaled_q = jnp.zeros((policy_targets.shape[0],), dtype=policy_targets.dtype)
+            rsm_weights = jnp.ones((policy_targets.shape[0], 1), dtype=policy_targets.dtype)
+            if self.rsm_variant:
+                q_for_rsm = q_norm_samples.reshape(K * obs.shape[0])
+                if self.ema_advantage_normalization:
+                    q_for_rsm = (q_for_rsm - state.q_running_mean) / jnp.maximum(state.q_running_std, jnp.float32(1e-6))
+                rsm_q_used = q_for_rsm
+                rsm_scaled_q = jnp.clip(state.beta * q_for_rsm, jnp.float32(-3.0), jnp.float32(3.0))
+                rsm_weights = jax.lax.stop_gradient(jnp.exp(rsm_scaled_q))[..., None]
 
             def policy_loss_fn(policy_params, time_key, noise_key) -> jax.Array:
-                # Standard diffusion score-matching loss (eps-MSE) against the K
-                # tilted target actions sampled above. Uses optax.squared_error
-                # (== (x-y)**2), NOT optax.l2_loss (== 0.5*(x-y)**2).
+                # Default MGMD: unweighted eps-MSE distillation. RSM variant:
+                # same diffusion target actions, weighted by exp(beta * Q_used).
                 t = jax.random.randint(
                     time_key,
                     (policy_targets.shape[0],),
@@ -282,7 +620,13 @@ class MGMD:
                 noise = jax.random.normal(noise_key, policy_targets.shape)
                 tilted_action_noisy = self.model.q_sample(t, policy_targets, noise)
                 noise_pred = self.model.eps_pred(policy_params, policy_obs, tilted_action_noisy, t)
-                return optax.squared_error(noise_pred, noise).mean()
+                per_dim_loss = optax.squared_error(noise_pred, noise)
+                if self.rsm_variant:
+                    return (rsm_weights * per_dim_loss).mean()
+                if self.soft_resample_variant:
+                    per_action_loss = jnp.mean(per_dim_loss, axis=-1).reshape(policy_K, obs.shape[0])
+                    return jnp.mean(jnp.sum(soft_policy_weights * per_action_loss, axis=0))
+                return per_dim_loss.mean()
 
             def _do(_):
                 updated_policy_params = policy_params
@@ -313,14 +657,43 @@ class MGMD:
                 step % self.cfg.delay_update == 0, _do,
                 lambda _: (state.policy_loss, policy_params, policy_opt_state), None)
 
+            log_best_of_n_noise_scale = state.log_best_of_n_noise_scale
+            best_of_n_noise_loss = jnp.float32(0.0)
+            best_of_n_noise_entropy = jnp.float32(0.0)
+            if self.uses_best_of_n_noise:
+                def _update_noise(_):
+                    (loss, entropy_approx), grads = jax.value_and_grad(
+                        self._best_of_n_noise_loss, has_aux=True
+                    )(log_best_of_n_noise_scale)
+                    updates, new_opt_state = self.best_of_n_noise_optim.update(
+                        grads, best_of_n_noise_opt_state, params=log_best_of_n_noise_scale
+                    )
+                    new_log_noise = optax.apply_updates(log_best_of_n_noise_scale, updates)
+                    return new_log_noise, new_opt_state, loss, entropy_approx
 
+                def _skip_noise(_):
+                    loss, entropy_approx = self._best_of_n_noise_loss(log_best_of_n_noise_scale)
+                    return log_best_of_n_noise_scale, best_of_n_noise_opt_state, loss, entropy_approx
+
+                log_best_of_n_noise_scale, best_of_n_noise_opt_state, best_of_n_noise_loss, best_of_n_noise_entropy = jax.lax.cond(
+                    step % self.cfg.delay_best_of_n_noise_update == 0,
+                    _update_noise,
+                    _skip_noise,
+                    None,
+                )
 
             state = state._replace(
                 params=ActorCriticParams(q_params, target_q_params, policy_params),
-                opt_state=Diffv2OptStates(q=q_opt_states, policy=policy_opt_state, value=value_opt_state_updated),
+                opt_state=Diffv2OptStates(
+                    q=q_opt_states,
+                    policy=policy_opt_state,
+                    best_of_n_noise=best_of_n_noise_opt_state,
+                    value=value_opt_state_updated,
+                ),
                 step=step + 1,
                 log_eta_scales=mala_result.log_eta_scales,
                 value_params=value_params_updated,
+                log_best_of_n_noise_scale=log_best_of_n_noise_scale,
                 policy_loss=total_loss,
                 advantage_second_moment_ema=new_adv_m2_ema,
                 q_running_mean=new_q_running_mean,
@@ -336,6 +709,38 @@ class MGMD:
                 info["lr/anneal_factor"] = lr_factor
                 info["lr/lr_q"] = lr_q_eff
                 info["lr/lr_policy"] = lr_policy_eff
+            if self.uses_best_of_n_noise:
+                info["BestOfN/noise_scale"] = jnp.exp(log_best_of_n_noise_scale)
+                info["BestOfN/noise_entropy_approx"] = best_of_n_noise_entropy
+                info["BestOfN/noise_loss"] = best_of_n_noise_loss
+                info["BestOfN/num_actions"] = jnp.float32(self.best_of_n_actions)
+                info["BestOfN/rollout_num_actions"] = jnp.float32(self.best_of_n_actions)
+                info["BestOfN/td_num_actions"] = jnp.float32(self.best_of_n_td_actions)
+                info["BestOfN/td_action_sampling"] = jnp.float32(self.best_of_n_td_action_sampling)
+            if self.rsm_variant:
+                info["RSM/q_used_mean"] = jnp.mean(rsm_q_used)
+                info["RSM/q_used_std"] = jnp.std(rsm_q_used)
+                info["RSM/scaled_q_mean"] = jnp.mean(rsm_scaled_q)
+                info["RSM/scaled_q_std"] = jnp.std(rsm_scaled_q)
+                info["RSM/weights_mean"] = jnp.mean(rsm_weights)
+                info["RSM/weights_std"] = jnp.std(rsm_weights)
+                info["RSM/weights_min"] = jnp.min(rsm_weights)
+                info["RSM/weights_max"] = jnp.max(rsm_weights)
+                info["RSM/num_denoised_actions"] = jnp.float32(self.num_denoised_actions)
+            if self.soft_resample_variant:
+                td_ess = mala_result.ess.reshape(-1)
+                td_pmax = mala_result.pmax.reshape(-1)
+                td_selected_idx = mala_result.selected_idx.reshape(-1).astype(jnp.float32)
+                info.update(_summary_info("SoftResample/TD/ess", td_ess))
+                info.update(_summary_info("SoftResample/TD/pmax", td_pmax))
+                info.update(_summary_info("SoftResample/TD/selected_idx", td_selected_idx))
+                info["SoftResample/actions"] = jnp.float32(self.soft_resample_actions)
+                info["SoftResample/beta_resample"] = _soft_resample_beta(
+                    state,
+                    self.cfg.advantage_normalization or self.q_loss_normalization,
+                )
+                info["SoftResample/TD/ess_hist"] = td_ess
+                info["SoftResample/TD/pmax_hist"] = td_pmax
 
             # V_MSE: only when V network exists
             if self.on_policy_ema and state.value_params is not None:
@@ -433,10 +838,13 @@ class MGMD:
         result = self._jit_vmap_get_action(key, self.state, obs)
         # log_eta_scales: shape [N, timesteps] — matches stacked state layout.
         self.state = self.state._replace(log_eta_scales=result.log_eta_scales)
-        # Sampler returns K iid actions per state ([N, K, num_envs, ...]); index 0
-        # is a uniform draw. Take it (and its raw Q) to step the environment.
-        action_np = np.asarray(result.action[:, 0])  # [N, num_envs, act_dim]
-        q_per_env = np.asarray(result.q[:, 0])       # [N, num_envs]
+        if self.soft_resample_variant:
+            self._last_rollout_soft_resample_ess = np.asarray(result.ess)
+            self._last_rollout_soft_resample_pmax = np.asarray(result.pmax)
+        # _stateless_get_action already returns the selected rollout action:
+        # index-0 for best_of_n_actions=1, or best-of-N plus learned noise for N>1.
+        action_np = np.asarray(result.action)  # [N, num_envs, act_dim]
+        q_per_env = np.asarray(result.q)       # [N, num_envs]
 
         if not self.on_policy_ema:
             return action_np, q_per_env, None
@@ -444,6 +852,19 @@ class MGMD:
         v = self.value_head.apply_vmap(self.state.value_params, jnp.asarray(obs))
         v_per_env = np.asarray(v)  # [N, num_envs]
         return action_np, q_per_env, v_per_env
+
+    def get_eval_action_vmap(self, key: jax.Array, obs: np.ndarray, num_actions: int):
+        """Vmapped separate-eval action.
+
+        ``num_actions`` is the evaluation-only best-of-N count. The returned
+        action has shape [num_runs, eval_envs_per_run, act_dim]. This method
+        does not update ``self.state`` or MALA adaptation statistics.
+        """
+        num_actions = int(num_actions)
+        if num_actions not in self._jit_vmap_eval_action_by_n:
+            self._jit_vmap_eval_action_by_n[num_actions] = self._build_eval_action_vmap(num_actions)
+        action, q = self._jit_vmap_eval_action_by_n[num_actions](key, self.state, obs)
+        return np.asarray(action), np.asarray(q)
 
     def _setup_value_network(self, params):
         """Construct the V(s) network used by KL-budget / on-policy-EMA mode.
@@ -479,6 +900,9 @@ class MGMD:
             opt_state=Diffv2OptStates(
                 q=tuple(self.optim.init(qp) for qp in params.q),
                 policy=self.policy_optim.init(params.policy),
+                best_of_n_noise=self.best_of_n_noise_optim.init(
+                    jnp.float32(math.log(cfg.best_of_n_noise_scale_init))
+                ),
                 value=value_opt_state_init,
             ),
             step=jnp.int32(0),
@@ -491,6 +915,7 @@ class MGMD:
             dist_shift_shape_ema=jnp.float32(cfg.initial_dist_shift_shape_ema),
             q_running_mean=jnp.float32(0.0),
             q_running_std=jnp.float32(1.0),
+            log_best_of_n_noise_scale=jnp.float32(math.log(cfg.best_of_n_noise_scale_init)),
             hp=HParams(
                 gamma=jnp.float32(cfg.gamma),
                 polyak_tau=jnp.float32(cfg.polyak_tau),
@@ -538,8 +963,14 @@ class MGMD:
 
     def get_effective_hparams(self) -> dict:
         return {
+            "mgmd_variant_effective": self.cfg.mgmd_variant,
             "lr_policy_effective": float(self.cfg.lr_policy),
             "lr_q_effective": float(self.cfg.lr_q),
+            "best_of_n_noise_scale_init_effective": float(self.cfg.best_of_n_noise_scale_init),
+            "best_of_n_td_action_sampling_effective": bool(self.cfg.best_of_n_td_action_sampling),
+            "best_of_n_td_actions_effective": int(self.best_of_n_td_actions),
+            "soft_resample_actions_effective": int(self.soft_resample_actions),
+            "soft_resample_ess_dump_interval_effective": int(self.cfg.soft_resample_ess_dump_interval),
         }
 
 
@@ -567,3 +998,63 @@ def _aggregate_q(q_means, mode: str):
     if mode == "mean":
         return sum(q_means) * jnp.float32(1.0 / len(q_means))
     raise ValueError(f"_aggregate_q: unknown mode {mode!r}")
+
+
+def _processed_q_for_resampling(q: jax.Array, state: Diffv2TrainState,
+                                batch_advantage_normalization: bool,
+                                ema_advantage_normalization: bool) -> jax.Array:
+    """Apply the same scale conventions used by MGMD's Q-guided sampler."""
+    out = q
+    if batch_advantage_normalization:
+        denom = jnp.sqrt(jnp.maximum(jnp.mean(jnp.var(out, axis=0, ddof=1)), jnp.float32(1e-6)))
+        out = out / jax.lax.stop_gradient(denom)
+    if ema_advantage_normalization:
+        mean = jax.lax.stop_gradient(state.q_running_mean)
+        std = jnp.maximum(jax.lax.stop_gradient(state.q_running_std), jnp.float32(1e-6))
+        out = (out - mean) / std
+    return out
+
+
+def _soft_resample_beta(state: Diffv2TrainState, q_scale_ema_normalization: bool) -> jax.Array:
+    if not q_scale_ema_normalization:
+        return state.beta
+    return state.beta / jnp.sqrt(jnp.maximum(state.advantage_second_moment_ema, jnp.float32(1e-6)))
+
+
+def _soft_resample_weights_from_q(q: jax.Array, beta: jax.Array):
+    """Return per-state softmax weights, ESS, and max probability.
+
+    ``q`` is shaped ``[N, ...]``. The leading axis is the candidate axis and
+    every remaining position is one independent state. Normalization is over
+    the candidate axis only.
+    """
+    logits = beta * q
+    weights = jax.nn.softmax(logits, axis=0)
+    ess = jnp.float32(1.0) / jnp.maximum(jnp.sum(weights * weights, axis=0), jnp.float32(1e-12))
+    pmax = jnp.max(weights, axis=0)
+    return weights, ess, pmax
+
+
+def _summary_info(prefix: str, values: jax.Array) -> dict:
+    flat = jnp.ravel(values)
+    return {
+        f"{prefix}_mean": jnp.mean(flat),
+        f"{prefix}_std": jnp.std(flat),
+        f"{prefix}_min": jnp.min(flat),
+        f"{prefix}_max": jnp.max(flat),
+        f"{prefix}_p10": jnp.quantile(flat, jnp.float32(0.10)),
+        f"{prefix}_p25": jnp.quantile(flat, jnp.float32(0.25)),
+        f"{prefix}_p50": jnp.quantile(flat, jnp.float32(0.50)),
+        f"{prefix}_p75": jnp.quantile(flat, jnp.float32(0.75)),
+        f"{prefix}_p90": jnp.quantile(flat, jnp.float32(0.90)),
+    }
+
+
+def _add_np_summary_info(info: dict, prefix: str, values: np.ndarray) -> None:
+    arr = np.asarray(values, dtype=np.float32)
+    info[f"{prefix}_mean"] = np.mean(arr, axis=1)
+    info[f"{prefix}_std"] = np.std(arr, axis=1)
+    info[f"{prefix}_min"] = np.min(arr, axis=1)
+    info[f"{prefix}_max"] = np.max(arr, axis=1)
+    for q, name in [(0.10, "p10"), (0.25, "p25"), (0.50, "p50"), (0.75, "p75"), (0.90, "p90")]:
+        info[f"{prefix}_{name}"] = np.quantile(arr, q, axis=1)

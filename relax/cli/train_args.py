@@ -24,6 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ----- env / run control -------------------------------------------------
     parser.add_argument("--alg", type=str, default="mgmd", choices=["mgmd"])
+    parser.add_argument("--mgmd_variant", type=str, default="mgmd", choices=["mgmd", "rsm", "soft_resample"], help="'mgmd' keeps the current MALA-guided sampler + sampler-distillation policy update. 'rsm' uses an unguided DDPM diffusion sampler for rollout and TD next-action sampling, then updates the policy with RSM-weighted diffusion loss. 'soft_resample' samples N unguided diffusion candidates and resamples from the per-state Boltzmann weights exp(beta * processed_Q).")
     parser.add_argument("--env", type=str, default="HalfCheetah-v3")
     parser.add_argument("--suffix", type=str, default="")
     parser.add_argument("--num_vec_envs", type=int, default=5)
@@ -38,6 +39,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hp_pack_inline", type=str, default=None, help="Inline JSON with per-run hyperparameter overrides. Each key is an argparse attribute name of this script (e.g. 'polyak_tau', 'beta', 'advantage_ema_tau', 'guidance_strength_multiplier', 'kl_budget', 'shape_ema_tau', 'seed') mapped to a list of length parallel_runs. Applied after vmap state construction; internally translated to Diffv2TrainState field names via _CLI_TO_FIELD.")
     parser.add_argument("--sweep_id", type=int, default=None, help="Launcher-assigned integer identifying this sweep. When set, every wandb run from this invocation is placed in wandb group 'sweep_<sweep_id>', and each per-vmap-slot run's config includes a 'config_tag' field built from sweep_id + the per-slot hyperparameters (excluding seed/env) so a single tag value filters wandb to all runs across envs/seeds that share this hp configuration.")
     parser.add_argument("--config_tag_keys", type=str, default=None, help="Comma-separated list of argparse attribute names whose values should be included in the per-slot config_tag. Typically set automatically by scripts/launch.py to the union of all --ablate hard+easy flags (minus env and seed). Values come from the hp_pack (per-slot) when the key is a pack key, else from this script's CLI args (shared across all vmap slots within the job).")
+
+    # ----- diagnostic snapshots --------------------------------------------
+    parser.add_argument("--save_diagnostic_snapshots", action="store_true", default=False, help="Save host-side diagnostic snapshots at selected env steps. Snapshots include the vmapped algorithm state, the next rollout observations, and a fixed replay minibatch for later sampler-distribution analysis.")
+    parser.add_argument("--diagnostic_snapshot_steps", type=int, nargs="*", default=[], help="Env-step targets at which to save diagnostic snapshots. The trainer saves the first time the per-run env step reaches or crosses each target.")
+    parser.add_argument("--diagnostic_snapshot_batch_size", type=int, default=256, help="Number of replay transitions per run to save in each diagnostic snapshot for TD next-action / distillation diagnostics.")
+    parser.add_argument("--diagnostic_snapshot_buffer_fraction", type=float, default=0.0, help="Optional replay-buffer subset fraction to save per run in each diagnostic snapshot. 0 disables subset saving; 0.1 saves a uniform 10%% subset of each run's current valid buffer without advancing buffer RNGs.")
+    parser.add_argument("--diagnostic_snapshot_dir", type=str, default=None, help="Directory where diagnostic snapshots are written. Required when --save_diagnostic_snapshots is set.")
+
+    # ----- separate evaluation ---------------------------------------------
+    parser.add_argument("--eval_every", type=int, default=0, help="Run separate evaluation every this many training env steps. Default 0 disables evaluation.")
+    parser.add_argument("--eval_n_episodes", type=int, default=10, help="Number of complete episodes per seed/run for each separate evaluation.")
+    parser.add_argument("--eval_best_of_n_actions", type=int, default=1, help="Best-of-N candidate count used only by separate evaluation. The selected action is executed without post-selection exploration noise.")
+    parser.add_argument("--eval_seed", type=int, default=None, help="Base seed for separate evaluation envs. Default derives one from --seed.")
 
     # ----- networks ---------------------------------------------------------
     parser.add_argument("--hidden_num", type=int, default=3)
@@ -95,7 +109,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--guidance_gradient_space", type=str, default="xt", choices=["xt", "x0hat", "x0hatclipped"], help="Whether to take the Q gradient with respect to 'xt' or the predicted clean action 'x0hat' or its clipped version 'x0hatclipped'.")
 
     # ----- multi-action denoising + V-free advantage normalization ----------
-    parser.add_argument("--num_denoised_actions", type=int, default=1, help="Number K of actions denoised per state in one sampler pass (formerly 'num_particles'). All K share the state and are iid draws. Rollout uses one (index 0, a uniform draw). The TD backup averages the clipped-double-Q over the K actions, and the diffusion policy regresses toward all K. K>=2 is required for --batch_advantage_normalization. Changes tensor shapes, so it is a 'hard' (non-vmap-packable) sweep axis in launch.py. Default 1.")
+    parser.add_argument("--num_denoised_actions", type=int, default=1, help="Training-time number K of denoised next-actions per sampled replay state. The TD backup averages clipped-double-Q over these K actions, and the diffusion policy regresses toward all K. K>=2 is required for --batch_advantage_normalization. This is separate from rollout-time --best_of_n_actions. Changes tensor shapes, so it is a 'hard' (non-vmap-packable) sweep axis in launch.py. Default 1.")
+    parser.add_argument("--soft_resample_actions", type=int, default=1, help="Candidate count N for --mgmd_variant soft_resample. The sampler draws N unguided diffusion actions per state, forms per-state Boltzmann weights from exp(beta * processed_Q), resamples one action for rollout/TD backup, and trains the diffusion policy against all N candidates with those normalized weights. This is a hard sweep axis because it changes JAX tensor shapes.")
+    parser.add_argument("--soft_resample_ess_dump_interval", type=int, default=0, help="Env-step interval for logging full soft-resample ESS/pmax histograms. Scalar ESS/pmax summaries are still logged at the normal update logging cadence. Default 0 disables full histogram dumps.")
+    parser.add_argument("--best_of_n_actions", type=int, default=1, help="Rollout-time best-of-N candidate count. N=1 preserves the current uniform single-sample rollout exactly. N>1 denoises N candidate actions at the current env state, picks the highest final online --q_agg_sample Q candidate, then adds DPMD-style learned Gaussian execution noise with std exp(log_best_of_n_noise_scale). Separate from training-time --num_denoised_actions.")
+    parser.add_argument("--best_of_n_td_action_sampling", action="store_true", default=False, help="Also use DPMD-style best-of-N for TD next-action sampling. When set, the training TD sampler denoises --best_of_n_td_actions candidates at s', selects the highest final online --q_agg_sample Q candidate, adds the same learned Gaussian best-of-N noise, and returns that single action for both the TD backup and policy distillation. Requires --num_denoised_actions 1.")
+    parser.add_argument("--best_of_n_td_actions", type=int, default=None, help="TD next-action best-of-N candidate count used only with --best_of_n_td_action_sampling. Defaults to --best_of_n_actions for backward compatibility, so old commands keep their previous rollout+TD behavior. This is a hard sweep axis because it changes JAX sampler shapes.")
+    parser.add_argument("--best_of_n_noise_scale_init", type=float, default=0.5, help="Initial std for learned post-best-of-N rollout Gaussian noise. Default 0.5 matches DPMD's exp(log(5))*noise_scale with noise_scale=0.1.")
+    parser.add_argument("--best_of_n_noise_lr", type=float, default=7e-3, help="Adam learning rate for the DPMD-style best-of-N noise scheduler. Used when rollout or TD best-of-N uses N > 1.")
+    parser.add_argument("--delay_best_of_n_noise_update", type=int, default=250, help="Update the best-of-N noise scheduler every this many MGMD update steps. Used when rollout or TD best-of-N uses N > 1.")
+    parser.add_argument("--best_of_n_noise_target_entropy_scale", type=float, default=0.9, help="Target entropy coefficient c in H_target = -c * act_dim for the learned best-of-N rollout noise scheduler. Default 0.9 matches DPMD.")
     parser.add_argument("--batch_advantage_normalization", action="store_true", default=False, help="V-free guidance normalization. At each MALA/denoising step, rescale Q by 1/sqrt(mean_s Var_K(Q)): the per-state sample variance (ddof=1) of Q over the K denoised Tweedie estimates, averaged over the batch, square-rooted, and stop-gradient'd. Requires --num_denoised_actions >= 2. Composes additively with --beta / other normalizations.")
     parser.add_argument("--q_loss_normalization", action="store_true", default=False, help="V-free guidance normalization. Divide the guidance Q by sqrt(EMA(Q TD loss)), where the EMA (rate --advantage_ema_tau) is tracked in-graph from the critic loss. Needs neither a V network nor multiple actions. Mutually exclusive with --advantage_normalization / --kl_budget(_per_dim) / --one_step_dist_shift_beta.")
     parser.add_argument("--ema_advantage_normalization", action="store_true", default=False, help="V-free guidance normalization ported from diffusion_policy_online_rl. Divide the guidance Q by a slow EMA of the batch std of the online --q_agg_sample-aggregated Q at the sampled next-actions: Q_norm = (Q - mu)/sigma with mu, sigma stop-gradient'd (mu cancels in the guidance gradient, so this is effectively a 1/sigma rescale). EMA rate --advantage_norm_ema_rate. Needs neither a V network nor multiple actions. Mutually exclusive with --advantage_normalization / --kl_budget(_per_dim) / --one_step_dist_shift_beta / --q_loss_normalization.")
@@ -143,10 +166,55 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
     if args.num_denoised_actions < 1:
         parser.error("--num_denoised_actions must be >= 1.")
 
-    if args.batch_advantage_normalization and args.num_denoised_actions < 2:
+    if args.soft_resample_actions < 1:
+        parser.error("--soft_resample_actions must be >= 1.")
+
+    if args.best_of_n_actions < 1:
+        parser.error("--best_of_n_actions must be >= 1.")
+
+    if args.best_of_n_td_actions is None:
+        args.best_of_n_td_actions = args.best_of_n_actions
+
+    if args.best_of_n_td_actions < 1:
+        parser.error("--best_of_n_td_actions must be >= 1.")
+
+    if args.mgmd_variant in {"rsm", "soft_resample"} and (
+        args.best_of_n_actions != 1
+        or args.best_of_n_td_action_sampling
+        or args.best_of_n_td_actions != 1
+    ):
+        parser.error(f"--mgmd_variant {args.mgmd_variant} does not support best-of-N options in this implementation.")
+
+    if args.mgmd_variant == "soft_resample" and args.fused_denoising:
+        parser.error("--mgmd_variant soft_resample is not supported with --fused_denoising in this first implementation.")
+
+    if args.best_of_n_td_action_sampling and args.num_denoised_actions != 1:
+        parser.error("--best_of_n_td_action_sampling currently requires --num_denoised_actions 1.")
+
+    uses_best_of_n_noise = args.best_of_n_actions > 1 or (
+        args.best_of_n_td_action_sampling and args.best_of_n_td_actions > 1
+    )
+
+    if uses_best_of_n_noise and args.best_of_n_noise_scale_init <= 0:
+        parser.error("--best_of_n_noise_scale_init must be > 0 when a best-of-N sampler uses N > 1.")
+
+    if uses_best_of_n_noise and args.best_of_n_noise_lr <= 0:
+        parser.error("--best_of_n_noise_lr must be > 0 when a best-of-N sampler uses N > 1.")
+
+    if args.delay_best_of_n_noise_update <= 0:
+        parser.error("--delay_best_of_n_noise_update must be > 0.")
+
+    if uses_best_of_n_noise and args.best_of_n_noise_target_entropy_scale <= 0:
+        parser.error("--best_of_n_noise_target_entropy_scale must be > 0 when a best-of-N sampler uses N > 1.")
+
+    if uses_best_of_n_noise and args.fused_denoising:
+        parser.error("best-of-N samplers with N > 1 are not supported with --fused_denoising in this first implementation.")
+
+    batch_adv_sample_count = args.soft_resample_actions if args.mgmd_variant == "soft_resample" else args.num_denoised_actions
+    if args.batch_advantage_normalization and batch_adv_sample_count < 2:
         parser.error(
             "--batch_advantage_normalization needs the per-state Q variance over "
-            "the denoised actions, so it requires --num_denoised_actions >= 2."
+            "the denoised actions, so it requires at least two candidates."
         )
 
     # --q_loss_normalization drives the same beta/sqrt(E[A^2]-slot) rescale as the
@@ -199,6 +267,23 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
         parser.error("--parallel_runs must be >= 1.")
     if args.num_vec_envs <= 0:
         parser.error("--num_vec_envs must be > 0.")
+    if args.diagnostic_snapshot_batch_size <= 0:
+        parser.error("--diagnostic_snapshot_batch_size must be > 0.")
+    if args.diagnostic_snapshot_buffer_fraction < 0.0 or args.diagnostic_snapshot_buffer_fraction > 1.0:
+        parser.error("--diagnostic_snapshot_buffer_fraction must be between 0 and 1.")
+    if any(step <= 0 for step in args.diagnostic_snapshot_steps):
+        parser.error("--diagnostic_snapshot_steps must contain positive env-step integers.")
+    if args.save_diagnostic_snapshots:
+        if not args.diagnostic_snapshot_steps:
+            parser.error("--save_diagnostic_snapshots requires --diagnostic_snapshot_steps.")
+        if args.diagnostic_snapshot_dir is None:
+            parser.error("--save_diagnostic_snapshots requires --diagnostic_snapshot_dir.")
+    if args.eval_every < 0:
+        parser.error("--eval_every must be >= 0.")
+    if args.eval_n_episodes <= 0:
+        parser.error("--eval_n_episodes must be > 0.")
+    if args.eval_best_of_n_actions <= 0:
+        parser.error("--eval_best_of_n_actions must be > 0.")
     if args.update_per_iteration <= 0:
         parser.error("--update_per_iteration must be > 0.")
     if args.critic_update_steps <= 0:
@@ -207,5 +292,5 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
         parser.error("--policy_update_steps must be > 0.")
     if args.delay_update <= 0:
         parser.error("--delay_update must be > 0.")
-    if args.mala_steps <= 0:
+    if args.mgmd_variant == "mgmd" and args.mala_steps <= 0:
         parser.error("--mala_steps must be > 0; the non-MALA sampling branches have been removed.")

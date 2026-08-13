@@ -31,6 +31,7 @@ from relax.network.actor_critic import ActorCriticParams
 class Diffv2OptStates(NamedTuple):
     q: tuple  # tuple of N optax.OptState, one per Q network
     policy: optax.OptState
+    best_of_n_noise: optax.OptState = None
     value: optax.OptState = None  # Optional V(s) network for normalized advantage guidance
 
 
@@ -47,6 +48,11 @@ class MalaSampleResult(NamedTuple):
     log_eta_scales: jax.Array
     per_level_acc: jax.Array
     per_level_clip: jax.Array
+    candidate_action: jax.Array = None
+    weights: jax.Array = None
+    ess: jax.Array = None
+    pmax: jax.Array = None
+    selected_idx: jax.Array = None
 
 
 class HParams(NamedTuple):
@@ -90,6 +96,7 @@ class Diffv2TrainState(NamedTuple):
     dist_shift_shape_ema: float = -1.0        # EMA of s₂ = (2γc + κ₃) / v^(3/2), dimensionless shape
     q_running_mean: float = 0.0              # EMA(batch mean of online agg-Q at next-actions); --ema_advantage_normalization
     q_running_std: float = 1.0               # EMA(batch std of online agg-Q at next-actions); guidance Q divisor
+    log_best_of_n_noise_scale: float = 0.0   # log std for DPMD-style post-best-of-N rollout noise
     policy_loss: jax.Array = 0.0             # last computed policy loss; held constant on non-update steps
     hp: HParams = HParams()
 
@@ -108,6 +115,7 @@ class MGMDConfig:
     lr_q: float = 1e-4
     delay_update: int = 2
     reward_scale: float = 0.2
+    mgmd_variant: str = "mgmd"
     q_agg_sample: str = "min"
     beta: float = 0.0
     x0_hat_clip_radius: float = 1.0
@@ -131,6 +139,15 @@ class MGMDConfig:
     critic_update_steps: int = 1
     policy_update_steps: int = 1
     num_denoised_actions: int = 1
+    soft_resample_actions: int = 1
+    soft_resample_ess_dump_interval: int = 10000
+    best_of_n_actions: int = 1
+    best_of_n_td_action_sampling: bool = False
+    best_of_n_td_actions: Optional[int] = None
+    best_of_n_noise_scale_init: float = 0.5
+    best_of_n_noise_lr: float = 7e-3
+    delay_best_of_n_noise_update: int = 250
+    best_of_n_noise_target_entropy_scale: float = 0.9
     batch_advantage_normalization: bool = False
     q_loss_normalization: bool = False
     ema_advantage_normalization: bool = False
@@ -170,6 +187,7 @@ class MGMDConfig:
             critic_update_steps=args.critic_update_steps,
             policy_update_steps=args.policy_update_steps,
             reward_scale=args.reward_scale,
+            mgmd_variant=args.mgmd_variant,
             q_agg_sample=args.q_agg_sample,
             beta=args.beta,
             x0_hat_clip_radius=args.x0_hat_clip_radius,
@@ -191,6 +209,15 @@ class MGMDConfig:
             one_step_dist_shift_beta=args.one_step_dist_shift_beta,
             guidance_gradient_space=args.guidance_gradient_space,
             num_denoised_actions=args.num_denoised_actions,
+            soft_resample_actions=args.soft_resample_actions,
+            soft_resample_ess_dump_interval=args.soft_resample_ess_dump_interval,
+            best_of_n_actions=args.best_of_n_actions,
+            best_of_n_td_action_sampling=args.best_of_n_td_action_sampling,
+            best_of_n_td_actions=args.best_of_n_td_actions,
+            best_of_n_noise_scale_init=args.best_of_n_noise_scale_init,
+            best_of_n_noise_lr=args.best_of_n_noise_lr,
+            delay_best_of_n_noise_update=args.delay_best_of_n_noise_update,
+            best_of_n_noise_target_entropy_scale=args.best_of_n_noise_target_entropy_scale,
             batch_advantage_normalization=args.batch_advantage_normalization,
             q_loss_normalization=args.q_loss_normalization,
             ema_advantage_normalization=args.ema_advantage_normalization,
