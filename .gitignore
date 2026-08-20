@@ -27,6 +27,7 @@ slurm-*.out
 multirun/
 wandb/
 .DS_Store
+/scratch/
 
 # Mujoco / runtime artifacts
 MUJOCO_LOG.TXT
@@ -48,6 +49,10 @@ sweeps/*/state.json
 *.hdf5
 *.npy
 *.npz
+
+# Generated figures: plots are reproducible from the scripts, so no image ever
+# belongs in git (they were 76% of history by size before being purged).
+*.png
 
 # LaTeX build artifacts (but NOT source files)
 paper/build/
@@ -73,7 +78,6 @@ paper/icml2026-official/
 # - paper/*.tex (paper, presentation, poster)
 # - paper/*.bib (bibliography)
 # - paper/style/*.sty (helper packages only)
-# - figures/*.png (code-generated figures for papers)
 # - Makefile (build system)
 # - sweeps/*.yaml (sweep config files)
 #
