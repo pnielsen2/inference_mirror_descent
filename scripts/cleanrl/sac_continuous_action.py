@@ -4,8 +4,9 @@ import os
 import random
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import List
 
 # Ensure cleanrl_utils is importable from the scripts/ directory
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -42,6 +43,16 @@ class Args:
     """whether to capture videos of the agent performances (check out `videos` folder)"""
     csv_output: str = None
     """path to write episode CSV (global_step, episodic_return, episodic_length)"""
+    eval_every: int = 0
+    """run evaluation episodes every this many env steps (0 disables)"""
+    eval_episodes: int = 10
+    """number of evaluation episodes per evaluation point"""
+    eval_best_of_n: List[int] = field(default_factory=lambda: [32])
+    """candidate actions sampled per state during evaluation; the candidate with the highest aggregated Q is executed (1 = plain stochastic policy). One eval curve is produced per value, all at the same checkpoints"""
+    eval_q_agg: str = "min"
+    """how to aggregate the twin critics when scoring eval candidates: 'min' (SAC's own pessimistic value, as used in its actor loss) or 'mean'"""
+    eval_csv_output: str = None
+    """path to write the eval CSV (env_step, train_step, eval_best_of_n_actions, episode_index, episode_return, episode_length)"""
 
     # Algorithm specific arguments
     env_id: str = "Hopper-v4"
@@ -159,9 +170,80 @@ class Actor(nn.Module):
         return action, log_prob, mean
 
 
+def _best_of_n_actions_batched(actor, qf1, qf2, obs_list, n_list, device, q_agg):
+    """One best-of-N action per (obs, N) pair, in a single actor+critic call.
+
+    ``obs_list[i]`` is scored with ``n_list[i]`` iid policy samples; the rows for
+    all pairs are concatenated so an eval that sweeps N costs one pair of GPU
+    calls per env step instead of one pair per N. Returns an array of actions,
+    row ``i`` for pair ``i``.
+    """
+    with torch.no_grad():
+        obs_rows = torch.cat(
+            [
+                torch.as_tensor(obs, dtype=torch.float32, device=device).reshape(1, -1).expand(n, -1)
+                for obs, n in zip(obs_list, n_list)
+            ]
+        )
+        candidates, _, _ = actor.get_action(obs_rows)
+        q1 = qf1(obs_rows, candidates).view(-1)
+        q2 = qf2(obs_rows, candidates).view(-1)
+        q = torch.min(q1, q2) if q_agg == "min" else 0.5 * (q1 + q2)
+        picks, offset = [], 0
+        for n in n_list:
+            picks.append(offset + torch.argmax(q[offset : offset + n]))
+            offset += n
+        # Single device->host transfer for the whole group.
+        return candidates[torch.stack(picks)].cpu().numpy()
+
+
+def run_eval_episodes(actor, qf1, qf2, eval_envs, device, n_episodes, n_values, q_agg, episode_seeds=None):
+    """Best-of-N eval episodes for every N in ``n_values`` at one checkpoint.
+
+    ``eval_envs[i]`` is a dedicated env for ``n_values[i]``. For each episode
+    index all envs are reset to the same seed and then stepped in lockstep, so
+    the N curves are a paired comparison (identical start states, one shared
+    policy-noise stream) rather than independent samples. Returns
+    ``{n: (returns, lengths)}``.
+
+    Touches neither the replay buffer nor the training envs. Callers snapshot and
+    restore the torch RNG state around this so the training run's random stream
+    -- and therefore its training curve -- is unaffected by evaluating.
+    """
+    k = len(n_values)
+    out = {n: ([], []) for n in n_values}
+    for ep_idx in range(n_episodes):
+        seed = None if episode_seeds is None else int(episode_seeds[ep_idx])
+        obs = [env.reset(seed=seed)[0] for env in eval_envs]
+        ep_return = [0.0] * k
+        ep_length = [0] * k
+        active = [True] * k
+        while any(active):
+            idxs = [i for i in range(k) if active[i]]
+            actions = _best_of_n_actions_batched(
+                actor, qf1, qf2, [obs[i] for i in idxs], [n_values[i] for i in idxs], device, q_agg
+            )
+            for row, i in enumerate(idxs):
+                next_obs, reward, terminated, truncated, _ = eval_envs[i].step(actions[row])
+                obs[i] = next_obs
+                ep_return[i] += float(reward)
+                ep_length[i] += 1
+                if bool(terminated) or bool(truncated):
+                    active[i] = False
+        for i, n in enumerate(n_values):
+            out[n][0].append(ep_return[i])
+            out[n][1].append(ep_length[i])
+    return out
+
+
 if __name__ == "__main__":
 
     args = tyro.cli(Args)
+    if args.eval_q_agg not in ("min", "mean"):
+        raise ValueError(f"--eval-q-agg must be 'min' or 'mean', got {args.eval_q_agg!r}")
+    eval_n_values = sorted({int(n) for n in args.eval_best_of_n})
+    if any(n < 1 for n in eval_n_values):
+        raise ValueError(f"--eval-best-of-n values must be >= 1, got {args.eval_best_of_n}")
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
@@ -237,8 +319,33 @@ if __name__ == "__main__":
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow(["global_step", "episodic_return", "episodic_length"])
 
+    # Best-of-N evaluation. The eval envs are separate instances, explicitly
+    # seeded per eval episode, so evaluating consumes nothing the training loop
+    # would have drawn: combined with the torch RNG snapshot below, the training
+    # curve is identical to the same run with --eval-every 0.
+    eval_envs = []
+    eval_csv_file = None
+    eval_csv_writer = None
+    if args.eval_every:
+        # One env per N so the N sweep can be stepped in lockstep from a common
+        # start state; each is reset with an explicit per-episode seed below.
+        eval_envs = [gym.make(args.env_id) for _ in eval_n_values]
+        if args.eval_csv_output:
+            eval_csv_path = Path(args.eval_csv_output)
+            eval_csv_path.parent.mkdir(parents=True, exist_ok=True)
+            eval_csv_file = open(eval_csv_path, "w", newline="")
+            eval_csv_writer = csv.writer(eval_csv_file)
+            eval_csv_writer.writerow([
+                "env_step", "train_step", "eval_best_of_n_actions",
+                "episode_index", "episode_return", "episode_length",
+            ])
+
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
+    # gymnasium >= 1.0 SyncVectorEnv uses next-step autoreset: the step right
+    # after an episode ends ignores the action and returns (reset_obs, 0.0,
+    # False, False). That is not a real transition and must not be stored.
+    autoreset = np.zeros(envs.num_envs, dtype=bool)
     total_episode_steps = 0
     global_step = 0
     while total_episode_steps < args.total_timesteps:
@@ -285,7 +392,13 @@ if __name__ == "__main__":
             for idx, trunc in enumerate(truncations):
                 if trunc:
                     real_next_obs[idx] = infos["final_observation"][idx]
-        rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
+        if not autoreset.any():
+            rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
+        elif envs.num_envs > 1:
+            raise NotImplementedError(
+                "per-env autoreset masking is not supported for num_envs > 1"
+            )
+        autoreset = np.logical_or(terminations, truncations)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
@@ -361,7 +474,49 @@ if __name__ == "__main__":
 
         global_step += 1
 
+        if args.eval_every and global_step % args.eval_every == 0:
+            # Snapshot/restore so the eval action samples do not advance the
+            # training stream (torch.distributions has no per-call generator).
+            torch_rng_state = torch.get_rng_state()
+            # Same start states and same actor-noise stream for every N at this
+            # checkpoint, so the N curves differ only through the argmax.
+            eval_seed = args.seed + 100_000 + global_step
+            episode_seeds = [eval_seed + 1_000_003 * ep for ep in range(args.eval_episodes)]
+            eval_start = time.time()
+            torch.manual_seed(eval_seed)
+            eval_results = run_eval_episodes(
+                actor, qf1, qf2, eval_envs, device,
+                args.eval_episodes, eval_n_values, args.eval_q_agg,
+                episode_seeds=episode_seeds,
+            )
+            torch.set_rng_state(torch_rng_state)
+            for n_candidates in eval_n_values:
+                eval_returns, eval_lengths = eval_results[n_candidates]
+                mean_return = float(np.mean(eval_returns))
+                print(
+                    f"eval env_step={global_step} best_of_{n_candidates} "
+                    f"({args.eval_q_agg}) episodes={args.eval_episodes} "
+                    f"return_mean={mean_return:.1f} return_std={float(np.std(eval_returns)):.1f} "
+                    f"length_mean={float(np.mean(eval_lengths)):.0f}",
+                    flush=True,
+                )
+                writer.add_scalar(f"eval/n{n_candidates}/episode_return_mean", mean_return, global_step)
+                writer.add_scalar(f"eval/n{n_candidates}/episode_return_std", float(np.std(eval_returns)), global_step)
+                writer.add_scalar(f"eval/n{n_candidates}/episode_length_mean", float(np.mean(eval_lengths)), global_step)
+                if eval_csv_writer:
+                    for ep_idx, (ep_ret, ep_len) in enumerate(zip(eval_returns, eval_lengths)):
+                        eval_csv_writer.writerow([
+                            global_step, total_episode_steps, n_candidates,
+                            ep_idx, ep_ret, ep_len,
+                        ])
+                    eval_csv_file.flush()
+            print(f"eval env_step={global_step} all_N took={time.time() - eval_start:.0f}s", flush=True)
+
     envs.close()
+    for eval_env in eval_envs:
+        eval_env.close()
     writer.close()
     if csv_file:
         csv_file.close()
+    if eval_csv_file:
+        eval_csv_file.close()

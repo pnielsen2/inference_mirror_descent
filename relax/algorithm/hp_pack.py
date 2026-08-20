@@ -38,12 +38,15 @@ CLI_TO_FIELD = {
 
 
 ALLOWED_KEYS = {
-    "lr_q", "lr_policy", "gamma", "polyak_tau", "advantage_ema_tau",
+    "lr_q", "lr_policy", "gamma", "q_polyak_tau", "policy_polyak_tau",
+    "delay_target_q_update", "delay_policy_update", "delay_target_policy_update",
+    "advantage_ema_tau",
     "advantage_norm_ema_rate",
     "guidance_strength_multiplier", "shape_ema_tau", "beta", "kl_budget",
     "initial_advantage_second_moment_ema", "initial_dist_shift_shape_ema",
     "reward_scale", "x0_hat_clip_radius", "mala_adapt_rate",
-    "q_td_huber_width", "alpha", "T", "eta",
+    "q_td_huber_width", "alpha", "T", "eta", "s_hat",
+    "noise_schedule_gamma", "noise_schedule_warmup",
     "seed",
 }
 

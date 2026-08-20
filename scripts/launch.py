@@ -23,11 +23,11 @@ Usage examples:
     # Regular --ablate axes still form their usual Cartesian product
     # (here: env), while each --oat-ablate axis contributes its values one
     # at a time on top of the base config.
-    python scripts/launch.py --cmd "python scripts/train_mujoco.py --alg mgmd --env HalfCheetah-v3 --lr_q 0.00015 --polyak_tau 0.005" \\
+    python scripts/launch.py --cmd "python scripts/train_mujoco.py --alg mgmd --env HalfCheetah-v3 --lr_q 0.00015 --q_polyak_tau 0.005" \\
         --seeds 0 1 \\
         --ablate env HalfCheetah-v3 Ant-v3 Walker2d-v3 Humanoid-v3 \\
         --oat-ablate lr_q 0.000075 0.0003 \\
-        --oat-ablate polyak_tau 0.0025 0.01
+        --oat-ablate q_polyak_tau 0.0025 0.01
 
     # Dry run (print commands without submitting)
     python scripts/launch.py --cmd "..." --dry-run
@@ -80,7 +80,11 @@ FLAG_TO_HP_KEY = {f: f for f in (
     "lr_q",
     "lr_policy",
     "gamma",
-    "polyak_tau",
+    "q_polyak_tau",
+    "policy_polyak_tau",
+    "delay_target_q_update",
+    "delay_policy_update",
+    "delay_target_policy_update",
     "advantage_ema_tau",
     "shape_ema_tau",
     "initial_advantage_second_moment_ema",
@@ -95,6 +99,9 @@ FLAG_TO_HP_KEY = {f: f for f in (
     "alpha",
     "T",
     "eta",
+    "s_hat",
+    "noise_schedule_gamma",
+    "noise_schedule_warmup",
 )}
 
 
@@ -191,7 +198,11 @@ _WANDB_SYNC_PID=$!
 _wandb_cleanup() {{
   kill $_WANDB_SYNC_PID 2>/dev/null || true
   echo "Final wandb sync at $(date)"
-  (cd "$WANDB_DIR" && nice -n 19 wandb sync --sync-all --include-synced) >> "$WANDB_DIR/sync.log" 2>&1 || true
+  # NB: no --include-synced here. The background loop above already re-uploads
+  # every run each interval; at exit we only need to flush runs not yet synced.
+  # Re-syncing all (large) offline runs from scratch made jobs sit "running" for
+  # hours after training finished while the final upload churned.
+  (cd "$WANDB_DIR" && nice -n 19 wandb sync --sync-all) >> "$WANDB_DIR/sync.log" 2>&1 || true
 }}
 trap _wandb_cleanup EXIT INT TERM
 """

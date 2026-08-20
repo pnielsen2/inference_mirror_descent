@@ -154,11 +154,12 @@ def build_per_seed_state(
         beta_schedule_type=args.beta_schedule_type,
         mala_steps=args.mala_steps,
         num_q_networks=args.num_q_networks,
-        x_recon_clip_radius=1.0,
+        x_recon_clip_radius=(float("inf") if getattr(args, "latent_action", False) else 1.0),
         snr_max=args.snr_max,
         policy_parameterization=args.policy_parameterization,
         policy_final_layer=args.policy_final_layer,
         orthogonal_init=args.orthogonal_init,
+        noise_cond_theta=args.noise_cond_theta,
     )
     params_list = [model.init_params(k) for k in seeds.init_keys]
     return model, params_list, buffers_list

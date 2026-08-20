@@ -16,6 +16,17 @@ def unstack_tree(stacked, n: int):
     return tuple(jax.tree.map(lambda x: x[i], stacked) for i in range(n))
 
 
+def is_due(step, delay):
+    """``step`` is a multiple of ``delay``, i.e. this update fires.
+
+    ``delay`` may be a traced per-seed scalar (update periods are packed as
+    float32 hps so they are vmappable "easy" ablations); it is floored to an
+    integer >= 1, so a 0 period degrades to "every step" instead of a
+    mod-by-zero. A non-firing step is a pure no-op via the callers' ``cond``.
+    """
+    return step % jnp.maximum(jnp.asarray(delay).astype(jnp.int32), 1) == 0
+
+
 def delayed_param_update(optim, params, grads, opt_state, lr, step, delay):
     """Apply ``optim.update`` -> scale by ``-lr`` -> ``optax.apply_updates``,
     but only when ``step % delay == 0``. Otherwise pass ``(params, opt_state)``
@@ -28,7 +39,7 @@ def delayed_param_update(optim, params, grads, opt_state, lr, step, delay):
         new_params = optax.apply_updates(po[0], update)
         return new_params, new_opt_state
     return jax.lax.cond(
-        step % delay == 0,
+        is_due(step, delay),
         do_update,
         lambda po: po,
         (params, opt_state),
@@ -38,7 +49,7 @@ def delayed_param_update(optim, params, grads, opt_state, lr, step, delay):
 def delayed_target_update(params, target_params, polyak_tau, step, delay):
     """Polyak-averaged target update gated by ``step % delay == 0``."""
     return jax.lax.cond(
-        step % delay == 0,
+        is_due(step, delay),
         lambda tp: optax.incremental_update(params, tp, polyak_tau), # Polyak Update
         lambda tp: tp,
         target_params,

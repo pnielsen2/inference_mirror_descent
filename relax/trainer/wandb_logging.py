@@ -156,8 +156,18 @@ class WandbMultiSeedLogger:
             self._runs.append(run)
 
     def set_snr(self, snr):
-        """Provide diffusion SNR per timestep for log2-SNR-keyed array tables."""
-        self.snr = snr
+        """Provide diffusion SNR per timestep for log2-SNR-keyed array tables.
+
+        Accepts ``[T]`` or ``[num_runs, T]`` and normalizes to the latter. It is
+        per-run because ``--s_hat`` is a per-seed hp, so slots in one vmap pack
+        can sit on different log-SNR grids; using slot 0's axis for all of them
+        would silently mislabel every other slot's per-level curves.
+        """
+        if snr is None:
+            self.snr = None
+            return
+        snr = np.atleast_2d(np.asarray(snr))
+        self.snr = np.broadcast_to(snr, (self.num_runs, snr.shape[-1]))
 
     # ------------------------------------------------------------------
     # Scalar logging
@@ -197,10 +207,10 @@ class WandbMultiSeedLogger:
 
             for tag, value in run_arrays.items():
                 arr = np.asarray(value)
-                if snr is not None and len(arr) == len(snr):
+                if snr is not None and len(arr) == snr.shape[-1]:
                     table = wandb.Table(
                         columns=["log2_snr", "value"],
-                        data=[[float(log2_snr[i]), float(arr[i])] for i in range(len(arr))],
+                        data=[[float(log2_snr[s][i]), float(arr[i])] for i in range(len(arr))],
                     )
                 else:
                     table = wandb.Table(

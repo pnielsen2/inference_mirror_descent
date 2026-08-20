@@ -26,8 +26,9 @@ import numpy as np
 import pandas as pd
 
 ENVS = ["Ant-v3", "HalfCheetah-v3", "Hopper-v3", "Humanoid-v3", "Swimmer-v3", "Walker2d-v3"]
-SWEEPS_MAIN = [89, 90, 91]
+SWEEPS_MAIN = [89, 90, 91, 94]
 SWEEP_ADVNORM = 92
+SWEEPS_DANIEL = [104, 105, 112]  # eta/T/lr_q "Daniel tricks" sweeps (+112: extra T)
 GUIDANCE_GRADIENT_SPACES = ["xt", "x0hatclipped"]
 IDENTITY_KEY = "Identity"
 INCREASING_KEY = "increasing"
@@ -38,7 +39,8 @@ TOPSIS_OUT_ROOT = SCRIPT_DIR / "topsis_out"
 def _format_t(v: float) -> str:
     if np.isclose(v, 0.0):
         return "0"
-    return f"{v:.3f}".rstrip("0").rstrip(".")
+    # %g keeps small values distinct (e.g. 0.0005 vs 0.001) without trailing zeros.
+    return f"{v:g}"
 
 
 def _strength_key(denoiser, gsm_raw) -> str:
@@ -184,9 +186,11 @@ def _plot_main_figure(df, value_col, value_fmt, suptitle, colorbar_label, out_pa
     plt.close(fig)
 
 
-def _plot_advnorm_figure(env_df, overall_df, suptitle, out_path, t_vals, e_vals):
+def _plot_advnorm_figure(env_df, overall_df, suptitle, out_path, t_vals, e_vals,
+                         color_bounds=None):
     """One figure: overall + 6 envs, each a single T x eta heatmap of
-    fraction-of-baseline, on a shared colorbar."""
+    fraction-of-baseline, on a shared colorbar. Pass ``color_bounds=(vmin, vmax)``
+    to force a fixed color scale (e.g. to share it across sibling figures)."""
     panels = [("Overall", overall_df, "fraction_of_baseline")]
     for env in ENVS:
         panels.append((env, env_df[env_df["env"] == env], "fraction_env"))
@@ -194,7 +198,7 @@ def _plot_advnorm_figure(env_df, overall_df, suptitle, out_path, t_vals, e_vals)
     for _, sub, col in panels:
         piv = sub.pivot_table(index="T", columns="eta", values=col, aggfunc="mean")
         mats.append(piv.reindex(index=t_vals, columns=e_vals).to_numpy(dtype=float))
-    vmin, vmax = _color_bounds(mats)
+    vmin, vmax = _color_bounds(mats) if color_bounds is None else color_bounds
     fig, axes = plt.subplots(2, 4, figsize=(4.0 * 4, 4.4 * 2), constrained_layout=True)
     axes = axes.ravel()
     last_im = None
@@ -205,6 +209,164 @@ def _plot_advnorm_figure(env_df, overall_df, suptitle, out_path, t_vals, e_vals)
     fig.suptitle(suptitle, fontsize=15)
     cbar = fig.colorbar(last_im, ax=axes.tolist(), shrink=0.9)
     cbar.set_label("Fraction of baseline (2^log_score)")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=170, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _format_lr(v: float) -> str:
+    """Compact scientific label for an lr value, e.g. 0.00015 -> '1.5e-04'."""
+    return f"{v:.1e}"
+
+
+def _lr_token(v: float) -> str:
+    """Filename-safe (dot/dash-free) lr token, e.g. 0.00015 -> '0p00015'."""
+    return f"{v:g}".replace(".", "p").replace("-", "m")
+
+
+def _load_daniel():
+    """Load + combine the eta/T/lr_q sweeps (104 + 105 + 112). Adds a numeric
+    lr_q column and fraction-of-baseline columns. The sweeps use disjoint
+    (T, eta, lr_q) cells and distinct config_tags, so concatenating and pivoting
+    is unambiguous -- no cross-sweep per-cell aggregation is required. Sweep 112
+    only adds finer T values at lr_q=1.5e-4, so it only affects that figure."""
+    cis, pes, ovs = [], [], []
+    for sw in SWEEPS_DANIEL:
+        ci, pe, ov = _load_sweep(sw)
+        cis.append(ci)
+        pes.append(pe)
+        ovs.append(ov)
+    ci = pd.concat(cis, ignore_index=True)
+    pe = pd.concat(pes, ignore_index=True)
+    ov = pd.concat(ovs, ignore_index=True)
+    ci["lr_q"] = pd.to_numeric(ci["lr_q"], errors="coerce")
+    axes_cols = ["config_tag", "T", "eta", "lr_q", "guidance_gradient_space", "strength_key"]
+    env_df = pe.merge(ci[axes_cols], on="config_tag", how="inner")
+    env_df["fraction_env"] = np.power(2.0, env_df["log_score"])
+    overall_df = ov.merge(ci[axes_cols], on="config_tag", how="inner")
+    return ci, env_df, overall_df
+
+
+def _advnorm_panel_matrices(env_df, overall_df, t_vals, e_vals):
+    """Overall + per-env fraction-of-baseline T x eta matrices for one slice."""
+    panels = [("Overall", overall_df, "fraction_of_baseline")]
+    for env in ENVS:
+        panels.append((env, env_df[env_df["env"] == env], "fraction_env"))
+    mats = []
+    for _, sub, col in panels:
+        piv = sub.pivot_table(index="T", columns="eta", values=col, aggfunc="mean")
+        mats.append(piv.reindex(index=t_vals, columns=e_vals).to_numpy(dtype=float))
+    return mats
+
+
+def _daniel_lr_axes(edf, odf):
+    """(T, eta) axes actually present in one lr_q slice, sorted ascending."""
+    t_vals = sorted(float(x) for x in pd.unique(pd.concat([edf["T"], odf["T"]]).dropna()))
+    e_vals = sorted(float(x) for x in pd.unique(pd.concat([edf["eta"], odf["eta"]]).dropna()))
+    return t_vals, e_vals
+
+
+def _plot_daniel_advnorm_figures(env_df, overall_df, out_dir):
+    """One advnorm-style figure (overall + 6 envs, T x eta fraction-of-baseline)
+    per lr_q value. Each lr_q uses its OWN (T, eta) axes -- so a slide shows
+    exactly the cells swept at that learning rate (e.g. sweep 112's finer T
+    values only appear at lr_q=1.5e-4) -- while all figures share a single
+    color scale so the learning rates stay directly comparable across slides."""
+    lr_vals = sorted(float(v) for v in pd.unique(overall_df["lr_q"].dropna()))
+    lr_axes, all_mats = {}, []
+    for lr in lr_vals:
+        edf = env_df[np.isclose(env_df["lr_q"], lr)]
+        odf = overall_df[np.isclose(overall_df["lr_q"], lr)]
+        t_vals, e_vals = _daniel_lr_axes(edf, odf)
+        lr_axes[lr] = (t_vals, e_vals)
+        all_mats.extend(_advnorm_panel_matrices(edf, odf, t_vals, e_vals))
+    bounds = _color_bounds(all_mats)
+    outputs = []
+    for lr in lr_vals:
+        edf = env_df[np.isclose(env_df["lr_q"], lr)]
+        odf = overall_df[np.isclose(overall_df["lr_q"], lr)]
+        t_vals, e_vals = lr_axes[lr]
+        out_path = out_dir / f"sweep104_105_advnorm_lr_q_{_lr_token(lr)}.png"
+        _plot_advnorm_figure(
+            edf, odf,
+            suptitle=f"With deep learning tricks (Identity, grad=xt), lr_q={_format_lr(lr)}: "
+                     "fraction of baseline",
+            out_path=out_path, t_vals=t_vals, e_vals=e_vals, color_bounds=bounds,
+        )
+        outputs.append(out_path)
+    return outputs
+
+
+def _alpha_beta_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Add composite-MD (alpha, beta) columns derived from (T, eta):
+        alpha = 1 / (1 + eta*T),  beta = eta / (1 + eta*T)
+    (matches relax/cli/train_setup.py). T=0 -> alpha=1, beta=eta."""
+    out = df.copy()
+    T = pd.to_numeric(out["T"], errors="coerce").to_numpy(dtype=float)
+    eta = pd.to_numeric(out["eta"], errors="coerce").to_numpy(dtype=float)
+    denom = 1.0 + eta * T
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out["alpha"] = np.where(denom != 0.0, 1.0 / denom, np.nan)
+        out["beta"] = np.where(denom != 0.0, eta / denom, np.nan)
+    return out
+
+
+def _draw_scatter_panel(ax, sub, value_col, vmin, vmax, title, xlim, ylim):
+    cmap = plt.get_cmap("RdYlGn")
+    ax.set_title(title, fontsize=10)
+    ax.set_xlabel(r"$\alpha = 1/(1+\eta T)$")
+    ax.set_ylabel(r"$\beta = \eta/(1+\eta T)$")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    if xlim is not None:
+        ax.set_xlim(xlim)
+    if ylim is not None:
+        ax.set_ylim(ylim)
+    ax.grid(True, which="both", linewidth=0.3, color="#cccccc")
+    if sub is None or sub.empty:
+        ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                transform=ax.transAxes, color="grey", fontsize=9)
+        return None
+    a = sub["alpha"].to_numpy(dtype=float)
+    b = sub["beta"].to_numpy(dtype=float)
+    v = sub[value_col].to_numpy(dtype=float)
+    mask = np.isfinite(a) & np.isfinite(b) & np.isfinite(v) & (a > 0) & (b > 0)
+    a, b, v = a[mask], b[mask], v[mask]
+    if a.size == 0:
+        ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                transform=ax.transAxes, color="grey", fontsize=9)
+        return None
+    sc = ax.scatter(a, b, c=v, cmap=cmap, vmin=vmin, vmax=vmax,
+                    s=130, edgecolors="black", linewidths=0.5, zorder=3)
+    return sc
+
+
+def _plot_main_scatter(df, value_col, suptitle, colorbar_label, out_path, strength_keys):
+    df = _alpha_beta_cols(df)
+    sel = df[df["guidance_gradient_space"].isin(GUIDANCE_GRADIENT_SPACES)
+             & df["strength_key"].isin(strength_keys)]
+    vmin, vmax = _color_bounds([sel[value_col].to_numpy(dtype=float)])
+    aa = sel["alpha"].to_numpy(dtype=float)
+    bb = sel["beta"].to_numpy(dtype=float)
+    aa = aa[np.isfinite(aa) & (aa > 0)]
+    bb = bb[np.isfinite(bb) & (bb > 0)]
+    xlim = (aa.min() / 1.3, aa.max() * 1.3) if aa.size else None
+    ylim = (bb.min() / 1.3, bb.max() * 1.3) if bb.size else None
+    nrow, ncol = len(GUIDANCE_GRADIENT_SPACES), len(strength_keys)
+    fig, axes = plt.subplots(nrow, ncol, figsize=(3.4 * ncol, 4.2 * nrow),
+                             constrained_layout=True, squeeze=False)
+    last_sc = None
+    for r, ggs in enumerate(GUIDANCE_GRADIENT_SPACES):
+        for c, sk in enumerate(strength_keys):
+            sub = df[(df["guidance_gradient_space"] == ggs) & (df["strength_key"] == sk)]
+            title = f"grad={ggs}, {_strength_title(sk)}"
+            sc = _draw_scatter_panel(axes[r][c], sub, value_col, vmin, vmax, title, xlim, ylim)
+            if sc is not None:
+                last_sc = sc
+    fig.suptitle(suptitle, fontsize=15)
+    if last_sc is not None:
+        cbar = fig.colorbar(last_sc, ax=axes, shrink=0.9)
+        cbar.set_label(colorbar_label)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=170, bbox_inches="tight")
     plt.close(fig)
@@ -244,6 +406,26 @@ def main():
     )
     outputs.append(overall_out)
 
+    # ---- Scatter versions (alpha vs beta) of the same main figures ----
+    for env in ENVS:
+        out_path = out_dir / f"{env.replace('-', '_')}_tail_return_scatter.png"
+        _plot_main_scatter(
+            env_df[env_df["env"] == env], "mean",
+            suptitle=fr"{env}: tail return mean across runs ($\alpha$ vs $\beta$)",
+            colorbar_label="Average episode return in final 50k env steps",
+            out_path=out_path, strength_keys=strength_keys,
+        )
+        outputs.append(out_path)
+
+    overall_scatter = out_dir / "overall_fraction_of_baseline_scatter.png"
+    _plot_main_scatter(
+        overall_df, "fraction_of_baseline",
+        suptitle=r"Average fraction of baseline ($\alpha$ vs $\beta$)",
+        colorbar_label="Average fraction of baseline (2^log_score)",
+        out_path=overall_scatter, strength_keys=strength_keys,
+    )
+    outputs.append(overall_scatter)
+
     # ---- Advantage-normalization figure: sweep 92 ----
     ci92, pe92, ov92 = _load_sweep(SWEEP_ADVNORM)
     axes_cols = ["config_tag", "T", "eta", "guidance_gradient_space", "strength_key"]
@@ -259,6 +441,10 @@ def main():
         out_path=adv_out, t_vals=t92, e_vals=e92,
     )
     outputs.append(adv_out)
+
+    # ---- Daniel-tricks eta/T/lr_q sweeps: 104 + 105 + 112 (one advnorm fig per lr_q) ----
+    _, denv, dov = _load_daniel()
+    outputs.extend(_plot_daniel_advnorm_figures(denv, dov, out_dir))
 
     for p in outputs:
         print(p)

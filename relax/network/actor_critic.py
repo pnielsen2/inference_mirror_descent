@@ -4,8 +4,8 @@ Holds the haiku-applied callables for:
 
 * the Q ensemble (``q``),
 * the energy-based diffusion policy, exposed as a noise predictor
-  ``eps_pred(params, s, a, t) = ε̂(s, a, t)`` and as the presentation
-  scalar energy ``energy_fn(params, s, a, t) = E(s, a, t)``,
+  ``eps_pred(params, level, s, a) = ε̂(s, a, t)`` and as the presentation
+  scalar energy ``energy_fn(params, level, s, a) = E(s, a, t)``,
 
 plus the precomputed DDPM noise schedule (``schedule``) and a handful of
 scalar config fields (``num_timesteps``, ``act_dim``, ``x_recon_clip_radius``,
@@ -22,7 +22,13 @@ import jax, jax.numpy as jnp
 import haiku as hk
 
 from relax.network.blocks import Activation, Identity, QNet, mlp, scaled_sinusoidal_encoding
-from relax.utils.diffusion import BetaScheduleCoefficients, build_beta_schedule
+from relax.utils.diffusion import (
+    BetaScheduleCoefficients,
+    NoiseLevel,
+    build_beta_schedule,
+    schedule_from_log_snr,
+    shift_schedule,
+)
 from relax.utils.jax_utils import fix_repr
 
 
@@ -38,6 +44,7 @@ class ScalarPolicyNet(hk.Module):
     activation: Activation
     output_activation: Activation = Identity
     time_dim: int = 16
+    time_theta: int = 1000          # see scaled_sinusoidal_encoding: sets the resolved range
     policy_final_layer: str = "default"
     w_init: Any = None
     name: str = None
@@ -55,7 +62,8 @@ class ScalarPolicyNet(hk.Module):
             act: Action, shape [..., act_dim]
             t: Diffusion timestep
         """
-        te = scaled_sinusoidal_encoding(t, dim=self.time_dim, batch_shape=obs.shape[:-1])
+        te = scaled_sinusoidal_encoding(t, dim=self.time_dim, theta=self.time_theta,
+                                        batch_shape=obs.shape[:-1])
         te = hk.Linear(self.time_dim * 2, w_init=self.w_init)(te)
         te = self.activation(te)
         te = hk.Linear(self.time_dim, w_init=self.w_init)(te)
@@ -74,6 +82,10 @@ class ActorCriticParams(NamedTuple):
     q: Tuple  # tuple of N Q network params
     target_q: Tuple  # tuple of N target Q network params
     policy: hk.Params
+    # Polyak-averaged copy of ``policy``, materialized by MGMD only under
+    # --use_target_policy_training. ``None`` is an empty pytree node (no
+    # leaves), so leaving it unset keeps every vmap/jit signature identical.
+    target_policy: hk.Params = None
 
 
 @dataclass
@@ -95,9 +107,9 @@ class ActorCritic:
     """
     _q_net: Any                     # hk.Transformed for the Q ensemble member
     _policy_scalar: Any             # hk.Transformed raw scalar output network; used by init_params
-    energy_fn: Any                  # (params, obs, act, t) -> scalar E_theta; set at create() time
-    eps_pred: Any                   # (params, obs, act, t) -> action-shaped ε̂; set at create() time
-    schedule: BetaScheduleCoefficients
+    energy_fn: Any                  # (params, level, obs, act) -> scalar E_theta; set at create() time
+    eps_pred: Any                   # (params, level, obs, act) -> action-shaped ε̂; set at create() time
+    schedule: Optional[BetaScheduleCoefficients]  # fixed base; None for 'adaptive', which has none
     num_timesteps: int
     obs_dim: int
     act_dim: int
@@ -106,19 +118,30 @@ class ActorCritic:
     policy_final_layer: str = "default"
     x_recon_clip_radius: Optional[float] = 1.0
     mala_steps: int = 1
+    adaptive_schedule: bool = False
 
     def q(self, params: hk.Params, obs: jax.Array, act: jax.Array) -> jax.Array:
         """Q(s, a) for a single ensemble member's params."""
         return self._q_net.apply(params, obs, act)
 
-    def q_sample(self, t: jax.Array, x_0: jax.Array, noise: jax.Array) -> jax.Array:
-        """Forward diffusion q(x_t | x_0): x_t = sqrt(ṱ_t)·x_0 + sqrt(1-ṱ_t)·ε.
+    def q_sample(self, level: NoiseLevel, x_0: jax.Array, noise: jax.Array) -> jax.Array:
+        """Forward diffusion q(x_t | x_0): x_t = sqrt(ṱ_t)·x_0 + sqrt(1-ṱ_t)·ε."""
+        return level.sqrt_abar[..., None] * x_0 + level.sqrt_omac[..., None] * noise
 
-        Shapes: ``t`` is ``(B,)`` and ``x_0`` / ``noise`` are ``(B, act_dim)``.
+    def schedule_for(self, hp, log_snr_levels=None) -> BetaScheduleCoefficients:
+        """The noise schedule this seed is currently running on.
+
+        Every caller goes through here rather than reading :attr:`schedule`,
+        because the layout is traced per-seed state -- so it can differ by vmap
+        slot and move during training. ``adaptive`` reads its levels straight off
+        the free knots and ignores ``s_hat`` (the knots already say where the
+        ladder sits, so the two would double-count, and the combination is
+        rejected); every other family is the fixed base translated by
+        ``-2 log s_hat`` and ignores ``log_snr_levels``.
         """
-        sqrt_ac = self.schedule.sqrt_alphas_cumprod[t][:, None]
-        sqrt_omac = self.schedule.sqrt_one_minus_alphas_cumprod[t][:, None]
-        return sqrt_ac * x_0 + sqrt_omac * noise
+        if self.adaptive_schedule:
+            return schedule_from_log_snr(log_snr_levels)
+        return shift_schedule(self.schedule, hp.s_hat)
 
     @staticmethod
     def create(
@@ -136,6 +159,7 @@ class ActorCritic:
         policy_parameterization: str = "E",
         policy_final_layer: str = "default",
         orthogonal_init: bool = False,
+        noise_cond_theta: int = 1000,
     ) -> "ActorCritic":
         """Build the architecture: haiku transforms + DDPM schedule.
 
@@ -153,7 +177,7 @@ class ActorCritic:
 
         policy_scalar = hk.without_apply_rng(
             hk.transform(
-                lambda obs, act, t: ScalarPolicyNet(diffusion_hidden_sizes, activation, policy_final_layer=policy_final_layer, w_init=w_init)(
+                lambda obs, act, t: ScalarPolicyNet(diffusion_hidden_sizes, activation, time_theta=noise_cond_theta, policy_final_layer=policy_final_layer, w_init=w_init)(
                     obs,
                     act,
                     t,
@@ -161,7 +185,9 @@ class ActorCritic:
             )
         )
 
-        schedule = build_beta_schedule(
+        # 'adaptive' has no fixed base to precompute: schedule_for lays its levels
+        # out from the per-seed theta on every call.
+        schedule = None if beta_schedule_type == "adaptive" else build_beta_schedule(
             num_timesteps=num_timesteps,
             beta_schedule_type=beta_schedule_type,
             snr_max=snr_max,
@@ -170,17 +196,20 @@ class ActorCritic:
         def raw_scalar(params, obs, act, t):
             return policy_scalar.apply(params, obs, act, t)
 
+        # Both callables take the whole ``level`` so the interface is uniform,
+        # even though each parameterization only needs sigma_t in one of the
+        # two. ``level.cond`` is the network's noise conditioning.
         if policy_parameterization == "E":
-            energy_fn = raw_scalar
-            def eps_pred(params, obs, act, t):
-                energy_grad = jax.grad(lambda a: raw_scalar(params, obs, a, t).sum())(act)
-                sigma_t = jnp.expand_dims(schedule.sqrt_one_minus_alphas_cumprod[t], axis=-1)
-                return sigma_t * energy_grad
+            def energy_fn(params, level, obs, act):
+                return raw_scalar(params, obs, act, level.cond)
+            def eps_pred(params, level, obs, act):
+                energy_grad = jax.grad(lambda a: raw_scalar(params, obs, a, level.cond).sum())(act)
+                return level.sqrt_omac[..., None] * energy_grad
         else:  # "f"
-            def energy_fn(params, obs, act, t):
-                return raw_scalar(params, obs, act, t) / schedule.sqrt_one_minus_alphas_cumprod[t]
-            def eps_pred(params, obs, act, t):
-                return jax.grad(lambda a: raw_scalar(params, obs, a, t).sum())(act)
+            def energy_fn(params, level, obs, act):
+                return raw_scalar(params, obs, act, level.cond) / level.sqrt_omac
+            def eps_pred(params, level, obs, act):
+                return jax.grad(lambda a: raw_scalar(params, obs, a, level.cond).sum())(act)
 
         return ActorCritic(
             _q_net=q_net,
@@ -196,6 +225,7 @@ class ActorCritic:
             policy_final_layer=policy_final_layer,
             x_recon_clip_radius=x_recon_clip_radius,
             mala_steps=mala_steps,
+            adaptive_schedule=(beta_schedule_type == "adaptive"),
         )
 
     def init_params(self, key: jax.Array) -> "ActorCriticParams":

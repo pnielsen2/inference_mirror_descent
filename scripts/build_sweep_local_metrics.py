@@ -56,6 +56,21 @@ EXTRA_KEYS = [
     "advantage_normalization",
     "batch_advantage_normalization",
     "q_loss_normalization",
+    "num_denoised_actions",
+    "distillation_buffer_size",
+    "distillation_steps",
+    "ema_within_advantage_normalization",
+    "estimate_s_hat",
+    "s_hat",
+    "lr_q",
+    "lr_policy",
+    "x0_hat_clip_radius",
+    "diffusion_steps",
+    "latent_action",
+    "q_polyak_tau",
+    "policy_polyak_tau",
+    "use_target_q_sampling_training",
+    "use_target_policy_training",
 ]
 
 

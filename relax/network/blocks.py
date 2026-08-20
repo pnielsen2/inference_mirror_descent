@@ -45,7 +45,30 @@ def mlp(hidden_sizes: Sequence[int], output_size: int, activation: Activation, o
     return hk.Sequential(layers)
 
 
-def scaled_sinusoidal_encoding(t: jax.Array, *, dim: int, theta: int = 10000, batch_shape = None) -> jax.Array:
+def scaled_sinusoidal_encoding(t: jax.Array, *, dim: int, theta: int = 1000, batch_shape = None) -> jax.Array:
+    """Sinusoidal encoding of a noise level; ``theta`` sets the range it resolves.
+
+    The ``dim/2`` angular frequencies sit geometrically between ``1`` and
+    ``theta**(-(dim/2-1)/(dim/2))`` radians per unit of ``t``. Two things follow:
+    the top channel gives ~1 rad per unit whatever ``theta`` is, and the bottom
+    sweeps ``range * theta**(-(dim/2-1)/(dim/2))`` radians end to end. A channel
+    that sweeps far under a radian is a near-constant, so ``theta`` decides how
+    many of the ``dim/2`` channels carry anything over a given input range.
+
+    ``theta = 10000`` over ``[0, 1000)`` is what DDPM inherited from Transformer
+    positional encodings; that is an observed pairing, not a derived law, but it
+    does leave 7 of 8 channels informative and the last monotone. The default
+    here reproduces that shape for a log-SNR range of ``[-50, 50]``: at ``theta =
+    1000, dim = 16`` the frequencies are ``[1, .42, .18, .075, .032, .013,
+    .0056, .0024]``, sweeping ``[100, 42, 18, 7.5, 3.2, 1.3, .56, .24]`` radians
+    -- 6 informative, 1 monotone. Under ``theta = 10000`` five of the eight
+    would instead vary by under a radian end to end, i.e. be wasted.
+
+    Note what this does NOT change: the top frequency is 1 rad per unit either
+    way, so the separation between two *adjacent* noise levels is untouched.
+    This is about how many embedding dimensions carry signal, not about
+    sensitivity to nearby levels; only rescaling the input itself moves that.
+    """
     assert dim % 2 == 0
     if batch_shape is not None:
         assert is_broadcastable(jnp.shape(t), batch_shape)
