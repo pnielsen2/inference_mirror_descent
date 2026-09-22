@@ -60,6 +60,14 @@ VENV_BY_ENV_VERSION = {
     5: Path.home() / ".venvs" / "general",
 }
 
+# DeepMind Control ids (``dmc/<domain>-<task>-v0``, registered in relax/dmc.py)
+# are dispatched separately rather than through VENV_BY_ENV_VERSION: they all
+# end in -v0, but that is shimmy's compatibility version, NOT a mujoco
+# generation, so the -v<N> lookup would be a category error -- and adding a
+# ``0:`` entry would silently claim every future -v0 env too.
+DMC_ENV_PREFIX = "dmc/"
+DMC_VENV = Path.home() / ".venvs" / "general"
+
 
 # An ablation on any of these flags, whose values are all parseable as floats,
 # is automatically treated as "easy" -- its values go into a per-seed hp_pack
@@ -95,13 +103,14 @@ FLAG_TO_HP_KEY = {f: f for f in (
     "reward_scale",
     "x0_hat_clip_radius",
     "mala_adapt_rate",
+    "mala_target_acceptance_rate",
+    "mala_step_size_max",
     "q_td_huber_width",
     "alpha",
     "T",
     "eta",
     "s_hat",
     "noise_schedule_gamma",
-    "noise_schedule_warmup",
 )}
 
 
@@ -166,13 +175,8 @@ echo "Finished at: $(date)"
 #   * ~/.local fills the login-node home quota when a 24-slot pack streams
 #     directly, and wandb.ai rate-limits filestream registration when 300+
 #     concurrent runs across a sweep hit init in the same second.
-# The background _wandb_sync_loop uploads partial run data to wandb.ai every
-# {sync_interval}s so the user can still monitor in-progress runs from the
-# dashboard (live eval curves show up; run stays "running" until the final
-# sync). trap EXIT catches normal exit, errors, and SIGTERM (scancel /
-# slurm time limit) so the last sync runs whenever the job ends.
-# Per-job WANDB_DIR (includes ${{SLURM_JOB_ID}}) prevents concurrent
-# sbatch jobs' sync loops from racing on the same offline-run subdirs.
+# Sync offline runs periodically for dashboard progress, but discard CLI output
+# and remove its debug log after every invocation to prevent quota growth.
 _WANDB_OFFLINE_BLOCK = """
 export WANDB_MODE=offline
 export WANDB_DIR="{wandb_dir}"
@@ -180,16 +184,15 @@ mkdir -p "$WANDB_DIR/wandb"
 echo "WANDB_MODE=$WANDB_MODE"
 echo "WANDB_DIR=$WANDB_DIR"
 
-# wandb sync --sync-all has a quirk: passing an explicit PATH makes it
-# treat PATH as one run dir (which ours isn't -- ours is a parent of
-# offline-run-* subdirs), giving "Nothing to sync". Only the cwd-relative
-# form ("cd <parent> && wandb sync --sync-all") correctly walks offline-run-*
-# subdirs. So we cd into WANDB_DIR (whose `./wandb` child holds all this
-# job's offline-run dirs) before each sync call.
+_wandb_sync() {{
+  (cd "$WANDB_DIR" && nice -n 19 wandb sync --sync-all --include-synced >/dev/null 2>&1) || true
+  rm -f "$WANDB_DIR/wandb/debug-cli.$USER.log"
+}}
+
 _wandb_sync_loop() {{
   while true; do
     sleep {sync_interval}
-    (cd "$WANDB_DIR" && nice -n 19 wandb sync --sync-all --include-synced) >> "$WANDB_DIR/sync.log" 2>&1 || true
+    _wandb_sync
   done
 }}
 _wandb_sync_loop &
@@ -197,12 +200,9 @@ _WANDB_SYNC_PID=$!
 
 _wandb_cleanup() {{
   kill $_WANDB_SYNC_PID 2>/dev/null || true
+  wait $_WANDB_SYNC_PID 2>/dev/null || true
   echo "Final wandb sync at $(date)"
-  # NB: no --include-synced here. The background loop above already re-uploads
-  # every run each interval; at exit we only need to flush runs not yet synced.
-  # Re-syncing all (large) offline runs from scratch made jobs sit "running" for
-  # hours after training finished while the final upload churned.
-  (cd "$WANDB_DIR" && nice -n 19 wandb sync --sync-all) >> "$WANDB_DIR/sync.log" 2>&1 || true
+  _wandb_sync
 }}
 trap _wandb_cleanup EXIT INT TERM
 """
@@ -268,26 +268,21 @@ def parse_args():
     parser.add_argument("--requeue", action="store_true",
                         help="Enable --requeue and --signal=SIGTERM@120 for preemptible partitions")
 
-    # Offline wandb + background sync. On by default because (a) login-node
-    # home dirs are too small for a 24-slot pack's filestream buffer and
-    # (b) offline-then-sync insulates us from wandb.ai rate-limiting at init.
+    # Offline wandb with periodic quota-safe sync. On by default because login-node
+    # home dirs are small and direct initialization is vulnerable to API rate limits.
     parser.add_argument("--no-wandb-offline", dest="wandb_offline",
                         action="store_false", default=True,
-                        help="Disable offline wandb + background sync. "
+                        help="Disable offline wandb and periodic sync. "
                              "Runs stream directly to wandb.ai (the pre-2026 "
                              "behavior). Use only for small local smoke tests.")
     parser.add_argument("--wandb-offline-base", "--wandb_offline_base",
                         type=str, default=None, dest="wandb_offline_base",
                         help="Base dir for offline wandb run dirs. "
                              "Default: /n/netscratch/kdbrantley_lab/Lab/$USER/wandb. "
-                             "Each sbatch job gets <base>/sweep_<N>/job_<slurm_id>/, "
-                             "so concurrent jobs' sync loops never race on the "
-                             "same offline-run subdirs.")
+                             "Each sbatch job gets <base>/sweep_<N>/job_<slurm_id>/.")
     parser.add_argument("--wandb-sync-interval", "--wandb_sync_interval",
                         type=int, default=60, dest="wandb_sync_interval",
-                        help="Seconds between background `wandb sync --sync-all` "
-                             "calls during training (default: 60). A final sync "
-                             "runs on job exit via trap EXIT.")
+                        help="Seconds between quota-safe dashboard syncs (default: 60).")
 
     # Utility options
     parser.add_argument("--dry-run", action="store_true",
@@ -315,6 +310,8 @@ def parse_args():
                              "pending will affect those runs. Useful for quick smoke tests.")
     
     args = parser.parse_args()
+    if args.wandb_sync_interval <= 0:
+        parser.error("--wandb-sync-interval must be positive")
     if args.seas:
         args.partition = args.partition or "seas_gpu"
         args.gpu_type = args.gpu_type or "nvidia_h200"
@@ -715,29 +712,34 @@ def venv_for_command(cmd: str) -> Path:
     the command has no ``--env``, the name has no version suffix, or the
     version has no registered venv — we'd rather stop the sweep than
     silently ship jobs to the wrong interpreter.
+
+    ``dmc/`` ids bypass that lookup and go to ``DMC_VENV``; see its comment.
     """
     env_match = re.search(r'--env\s+(\S+)', cmd)
     if not env_match:
         sys.exit(f"launch.py: command has no --env flag, can't pick a venv:\n  {cmd}")
     env_name = env_match.group(1)
-    ver_match = re.search(r'-v(\d+)$', env_name)
-    if not ver_match:
-        sys.exit(
-            f"launch.py: env '{env_name}' has no -v<N> version suffix; "
-            f"don't know which venv to use."
-        )
-    version = int(ver_match.group(1))
-    if version not in VENV_BY_ENV_VERSION:
-        known = ", ".join(f"v{v}" for v in sorted(VENV_BY_ENV_VERSION))
-        sys.exit(
-            f"launch.py: no venv registered for env version v{version} "
-            f"(env='{env_name}'). Known versions: {known}. "
-            f"Add an entry to VENV_BY_ENV_VERSION in launch.py."
-        )
-    venv_path = VENV_BY_ENV_VERSION[version].resolve()
+    if env_name.startswith(DMC_ENV_PREFIX):
+        venv_path, label = DMC_VENV.resolve(), "dm_control"
+    else:
+        ver_match = re.search(r'-v(\d+)$', env_name)
+        if not ver_match:
+            sys.exit(
+                f"launch.py: env '{env_name}' has no -v<N> version suffix; "
+                f"don't know which venv to use."
+            )
+        version = int(ver_match.group(1))
+        if version not in VENV_BY_ENV_VERSION:
+            known = ", ".join(f"v{v}" for v in sorted(VENV_BY_ENV_VERSION))
+            sys.exit(
+                f"launch.py: no venv registered for env version v{version} "
+                f"(env='{env_name}'). Known versions: {known}. "
+                f"Add an entry to VENV_BY_ENV_VERSION in launch.py."
+            )
+        venv_path, label = VENV_BY_ENV_VERSION[version].resolve(), f"v{version}"
     if not (venv_path / "bin" / "python").exists():
         sys.exit(
-            f"launch.py: venv for v{version} envs is {venv_path} but "
+            f"launch.py: venv for {label} envs is {venv_path} but "
             f"{venv_path / 'bin' / 'python'} does not exist."
         )
     return venv_path
@@ -926,7 +928,7 @@ def main():
                        f"nosweep_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         wandb_dir_template = f"{base}/{sweep_subdir}/job_${{SLURM_JOB_ID}}"
         print(f"[launch.py] offline wandb: WANDB_DIR template = "
-              f"{wandb_dir_template}  (sync every {args.wandb_sync_interval}s)")
+              f"{wandb_dir_template}  (sync every {args.wandb_sync_interval}s and on exit)")
     else:
         wandb_dir_template = None
         print("[launch.py] offline wandb: DISABLED (runs will stream to "

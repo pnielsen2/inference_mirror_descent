@@ -9,6 +9,7 @@ import gymnasium
 from gymnasium.spaces import Box
 import numpy as np
 
+from relax.dmc import register_dmc_envs
 from relax.env.vector.base import VectorEnv
 from relax.futex import futex_server_wait, futex_server_notify
 
@@ -25,6 +26,7 @@ class ProcessVectorEnv(VectorEnv):
         self.num_workers = num_workers
         self.env_per_worker = num_envs // num_workers
 
+        register_dmc_envs(name)
         dummy_env = gymnasium.make(name)
         self.single_observation_space = dummy_env.observation_space
         self.single_action_space = dummy_env.action_space

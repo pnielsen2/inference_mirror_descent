@@ -37,7 +37,8 @@ from relax.utils.diffusion import NoiseLevel, tweedie_x0
 
 OBS_DIM, ACT_DIM, BATCH, T = 5, 3, 32, 8
 NEW = "Identity_then_DDPM_mean"
-PREDICTORS = ["Identity", NEW, "DDPM_mean", "DDIM", "DDIM_unguided"]
+NEW_K = "Identity_then_DDPM_mean_final_k"
+PREDICTORS = ["Identity", NEW, NEW_K, "DDPM_mean", "DDIM", "DDIM_unguided"]
 
 
 def make_model(timesteps=T, mala_steps=2):
@@ -170,8 +171,9 @@ def main():
 
     print(f"--- 4. one guided predictor pass per call, not T={T} ---")
     st = make_state(model)
-    n = {p: matmuls(model, st, p, obs) for p in PREDICTORS}
-    for p in PREDICTORS:
+    counted_predictors = ["Identity", NEW, "DDPM_mean", "DDIM", "DDIM_unguided"]
+    n = {p: matmuls(model, st, p, obs) for p in counted_predictors}
+    for p in counted_predictors:
         print(f"  {p:<24} {n[p]:>8,d} matmuls  ({n[p] / n['Identity']:.3f}x Identity)")
     # DDPM_mean pays the predictor at all T levels, so its excess over Identity is
     # exactly T times one pass -- and the new predictor's excess is exactly one.
@@ -180,6 +182,37 @@ def main():
     ok &= exact
     print(f"  extra over Identity = {extra} = 1/{per_pass / max(extra, 1):.0f} of "
           f"DDPM_mean's {per_pass}; == one of T passes: {exact}")
+
+    print("--- 5. final-k endpoints agree at k=1 and k=T ---")
+    for k, reference in ((1, NEW), (T, "DDPM_mean")):
+        result = sample(model, st, NEW_K, obs, ddpm_mean_final_steps=k)
+        expected = sample(model, st, reference, obs)
+        for name in ("action", "per_level_acc", "log_eta_scales"):
+            d = maxdiff(getattr(result, name), getattr(expected, name))
+            ok &= d == 0.0
+            print(f"  k={k:<2} {name:<16} max|diff| = {d:.3e}  identical={d == 0.0}")
+
+    print("--- 6. --predictor_final_steps restricts any predictor to the last k ---")
+    # The generic flag must reproduce the DDPM_mean-specific predictor exactly, and at
+    # k = 0 / k = T leave the unrestricted predictor's graph untouched.
+    for k in (1, 2, T):
+        a = sample(model, st, "DDPM_mean", obs, predictor_final_steps=k)
+        b = sample(model, st, NEW_K, obs, ddpm_mean_final_steps=k)
+        d = maxdiff(a.action, b.action)
+        ok &= d == 0.0
+        print(f"  DDPM_mean k={k:<2} vs {NEW_K} k={k:<2}: max|diff| = {d:.3e}  identical={d == 0.0}")
+    for predictor in ("DDPM_mean", "DDIM", "DDIM_unguided"):
+        full = sample(model, st, predictor, obs).action
+        for k, expect_same in ((0, True), (T, True), (1, False)):
+            d = maxdiff(sample(model, st, predictor, obs, predictor_final_steps=k).action, full)
+            same = d == 0.0
+            ok &= same == expect_same
+            print(f"  {predictor:<14} k={k:<2} {'==' if same else '!='} unrestricted "
+                  f"(expected {'==' if expect_same else '!='})")
+        # Restricting to the last k must leave the MALA chain itself untouched.
+        d = maxdiff(sample(model, st, predictor, obs, predictor_final_steps=2).per_level_acc,
+                    sample(model, st, "Identity", obs).per_level_acc)
+        print(f"  {predictor:<14} k=2 acceptance vs Identity: max|diff| = {d:.3e}")
 
     print("\nALL PASS" if ok else "\nFAILURES PRESENT")
     return 0 if ok else 1

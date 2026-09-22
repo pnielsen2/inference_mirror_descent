@@ -16,14 +16,16 @@ Two entry points used by the denoiser-gap analysis:
     restricted to ``keys``).
 
 ``read_level_tables(run_dir, tag)``
-    Load the per-diffusion-level ``wandb.Table`` JSONs that the trainer writes
-    for ``MALA/acceptance_rate`` / ``MALA/clip_frac`` / ``MALA/eta_scale``,
-    returning a DataFrame ``(step, level_or_log2_snr, value)``.
+    Load historical per-diffusion-level ``wandb.Table`` JSONs from runs created
+    before table logging was removed, returning a DataFrame
+    ``(step, level_or_log2_snr, value)``.
 """
 from __future__ import annotations
 
 import json
 import re
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
@@ -63,6 +65,12 @@ CONFIG_FIELDS = [
     "lr_anneal",
     "orthogonal_init",
     "fused_denoising",
+    "mala_adapt_rate",
+    "mala_target_acceptance_rate",
+    "mala_step_size_max",
+    "mala_step_size_max_effective",
+    "mcmc_proposal_type",
+    "rollout_alpha",
     "sweep_id",
     "seed",
 ]
@@ -155,7 +163,15 @@ def read_history(run_dir, keys: Optional[Iterable[str]] = None) -> pd.DataFrame:
     keys = set(keys) if keys is not None else None
 
     ds = datastore.DataStore()
-    ds.open_for_scan(str(wandb_files[0]))
+    # wandb's DataStore opens the log "r+b", so a sweep owned by another user is
+    # unreadable in place even when world-readable; scan a scratch copy instead.
+    tmp_copy = None
+    try:
+        ds.open_for_scan(str(wandb_files[0]))
+    except PermissionError:
+        tmp_copy = Path(tempfile.mkdtemp(prefix="offline_wandb_")) / wandb_files[0].name
+        shutil.copy2(wandb_files[0], tmp_copy)
+        ds.open_for_scan(str(tmp_copy))
     recs = []
     while True:
         try:
@@ -192,6 +208,8 @@ def read_history(run_dir, keys: Optional[Iterable[str]] = None) -> pd.DataFrame:
             continue
         for k, v in vals.items():
             recs.append((step, k, v))
+    if tmp_copy is not None:
+        shutil.rmtree(tmp_copy.parent, ignore_errors=True)
     return pd.DataFrame(recs, columns=["step", "key", "value"])
 
 

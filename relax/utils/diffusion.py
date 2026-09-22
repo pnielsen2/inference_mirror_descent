@@ -44,6 +44,37 @@ class NoiseLevel(NamedTuple):
                           jnp.exp(-half_log_abar), jnp.exp(-lam / jnp.float32(2.0)))
 
 
+def sample_vlb_log_snr(key, n: int, log_snr_min: float, log_snr_max: float,
+                       batch_sampling: str = "iid"):
+    """Sample the Gaussian near-convergence functional-space optimal proposal.
+
+    This is not an exact natural-gradient sampler for the neural parameterization.
+    Returns ``(level, 1 / q)`` for the finite log-SNR interval.
+    """
+    if log_snr_min >= log_snr_max:
+        raise ValueError("log_snr_min must be smaller than log_snr_max")
+    lam_min, lam_max = jnp.float32(log_snr_min), jnp.float32(log_snr_max)
+    y_min = jnp.arcsinh(jnp.exp(lam_min / jnp.float32(2.0)))
+    y_max = jnp.arcsinh(jnp.exp(lam_max / jnp.float32(2.0)))
+    if batch_sampling == "iid":
+        u = jax.random.uniform(key, (n,))
+    elif batch_sampling == "stratified":
+        jitter_key, permutation_key = jax.random.split(key)
+        u = (jnp.arange(n, dtype=jnp.float32) + jax.random.uniform(jitter_key, (n,))) / n
+        u = jax.random.permutation(permutation_key, u)
+    else:
+        raise ValueError(f"Unknown policy noise batch sampling: {batch_sampling!r}")
+    y = y_min + (y_max - y_min) * u
+    lam = jnp.float32(2.0) * jnp.log(jnp.sinh(y))
+    inverse_density = jnp.float32(2.0) * (y_max - y_min) / jnp.tanh(y)
+    return NoiseLevel.from_log_snr(lam), inverse_density
+
+
+def continuous_vlb_loss(error: jax.Array, inverse_density: jax.Array) -> jax.Array:
+    """Monte Carlo estimate of the continuous VLB integral in nats."""
+    return jnp.float32(0.5) * jnp.mean(inverse_density * jnp.sum(error * error, axis=-1))
+
+
 def tweedie_x0(level: NoiseLevel, x: jax.Array, noise_pred: jax.Array) -> jax.Array:
     """Tweedie clean estimate ``x_0_hat = (x - sqrt(1-abar) eps) / sqrt(abar)``.
 
@@ -273,6 +304,38 @@ def schedule_from_log_snr(levels: jax.Array) -> BetaScheduleCoefficients:
     return BetaScheduleCoefficients.from_parts(
         -jnp.expm1(log_abar - log_abar_prev), jnp.exp(log_abar), jax.nn.sigmoid(-levels),
     )._replace(t_cond=levels)
+
+
+def build_log_snr_schedule(
+    num_timesteps: int,
+    log_snr_min: float,
+    log_snr_max: float,
+    spacing: str,
+    karras_rho: float = 7.0,
+) -> BetaScheduleCoefficients:
+    """Build an endpoint-pinned ladder, stored cleanest-first.
+
+    The reverse sampler traverses it noisiest-first, including Karras sigma_max
+    to sigma_min.
+    """
+    if num_timesteps < 2:
+        raise ValueError("A log-SNR inference schedule requires at least two levels")
+    if log_snr_min >= log_snr_max:
+        raise ValueError("log_snr_min must be smaller than log_snr_max")
+    if spacing == "uniform":
+        levels = np.linspace(log_snr_max, log_snr_min, num_timesteps, dtype=np.float64)
+    elif spacing == "karras":
+        if karras_rho <= 0:
+            raise ValueError("karras_rho must be positive")
+        sigma_min, sigma_max = np.exp(-log_snr_max / 2), np.exp(-log_snr_min / 2)
+        ramp = np.linspace(0.0, 1.0, num_timesteps, dtype=np.float64)
+        sigma = (sigma_min ** (1 / karras_rho)
+                 + ramp * (sigma_max ** (1 / karras_rho) - sigma_min ** (1 / karras_rho))) ** karras_rho
+        levels = -2 * np.log(sigma)
+    else:
+        raise ValueError(f"Unknown inference spacing: {spacing!r}")
+    levels[0], levels[-1] = log_snr_max, log_snr_min
+    return schedule_from_log_snr(jnp.asarray(levels, dtype=jnp.float32))
 
 
 def build_beta_schedule(

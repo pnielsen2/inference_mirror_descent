@@ -65,10 +65,18 @@ EXTRA_KEYS = [
     "lr_q",
     "lr_policy",
     "x0_hat_clip_radius",
+    "mala_target_acceptance_rate",
+    "mala_step_size_max",
+    "mala_step_size_max_effective",
+    "mcmc_proposal_type",
+    "rollout_alpha",
     "diffusion_steps",
     "latent_action",
     "q_polyak_tau",
     "policy_polyak_tau",
+    "use_target_networks",
+    # Retired in favour of --use_target_networks; kept so sweeps launched before
+    # that change (e.g. 131/132) still expose them as plot axes.
     "use_target_q_sampling_training",
     "use_target_policy_training",
 ]

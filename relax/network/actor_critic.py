@@ -26,6 +26,7 @@ from relax.utils.diffusion import (
     BetaScheduleCoefficients,
     NoiseLevel,
     build_beta_schedule,
+    build_log_snr_schedule,
     schedule_from_log_snr,
     shift_schedule,
 )
@@ -83,7 +84,7 @@ class ActorCriticParams(NamedTuple):
     target_q: Tuple  # tuple of N target Q network params
     policy: hk.Params
     # Polyak-averaged copy of ``policy``, materialized by MGMD only under
-    # --use_target_policy_training. ``None`` is an empty pytree node (no
+    # --use_target_networks. ``None`` is an empty pytree node (no
     # leaves), so leaving it unset keeps every vmap/jit signature identical.
     target_policy: hk.Params = None
 
@@ -119,6 +120,7 @@ class ActorCritic:
     x_recon_clip_radius: Optional[float] = 1.0
     mala_steps: int = 1
     adaptive_schedule: bool = False
+    absolute_log_snr_schedule: bool = False
 
     def q(self, params: hk.Params, obs: jax.Array, act: jax.Array) -> jax.Array:
         """Q(s, a) for a single ensemble member's params."""
@@ -136,11 +138,13 @@ class ActorCritic:
         slot and move during training. ``adaptive`` reads its levels straight off
         the free knots and ignores ``s_hat`` (the knots already say where the
         ladder sits, so the two would double-count, and the combination is
-        rejected); every other family is the fixed base translated by
-        ``-2 log s_hat`` and ignores ``log_snr_levels``.
+        rejected); the explicit ``log_snr`` family keeps its configured absolute
+        endpoints; every other family is translated by ``-2 log s_hat``.
         """
         if self.adaptive_schedule:
             return schedule_from_log_snr(log_snr_levels)
+        if self.absolute_log_snr_schedule:
+            return self.schedule
         return shift_schedule(self.schedule, hp.s_hat)
 
     @staticmethod
@@ -160,6 +164,10 @@ class ActorCritic:
         policy_final_layer: str = "default",
         orthogonal_init: bool = False,
         noise_cond_theta: int = 1000,
+        inference_spacing: str = "uniform",
+        log_snr_min: float = -8.0,
+        log_snr_max: float = 15.0,
+        karras_rho: float = 7.0,
     ) -> "ActorCritic":
         """Build the architecture: haiku transforms + DDPM schedule.
 
@@ -187,11 +195,17 @@ class ActorCritic:
 
         # 'adaptive' has no fixed base to precompute: schedule_for lays its levels
         # out from the per-seed theta on every call.
-        schedule = None if beta_schedule_type == "adaptive" else build_beta_schedule(
-            num_timesteps=num_timesteps,
-            beta_schedule_type=beta_schedule_type,
-            snr_max=snr_max,
-        )
+        if beta_schedule_type == "adaptive":
+            schedule = None
+        elif beta_schedule_type == "log_snr":
+            schedule = build_log_snr_schedule(
+                num_timesteps, log_snr_min, log_snr_max, inference_spacing, karras_rho)
+        else:
+            schedule = build_beta_schedule(
+                num_timesteps=num_timesteps,
+                beta_schedule_type=beta_schedule_type,
+                snr_max=snr_max,
+            )
 
         def raw_scalar(params, obs, act, t):
             return policy_scalar.apply(params, obs, act, t)
@@ -226,6 +240,7 @@ class ActorCritic:
             x_recon_clip_radius=x_recon_clip_radius,
             mala_steps=mala_steps,
             adaptive_schedule=(beta_schedule_type == "adaptive"),
+            absolute_log_snr_schedule=(beta_schedule_type == "log_snr"),
         )
 
     def init_params(self, key: jax.Array) -> "ActorCriticParams":

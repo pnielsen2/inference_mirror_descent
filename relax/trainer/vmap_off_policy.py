@@ -15,6 +15,7 @@ Layout (Option B):
 """
 from pathlib import Path
 from typing import List, Optional
+import errno
 import os
 
 import jax
@@ -30,6 +31,7 @@ from relax.buffer import TreeBuffer
 from relax.env.vector import VectorEnv
 from relax.trainer.accumulator import Interval, SampleLog, UpdateLog
 from relax.trainer.evaluation import Evaluator
+from relax.dmc import is_dmc_id
 from relax.trainer.sample_metrics import SampleMetricsRecorder
 from relax.trainer.wandb_logging import WandbMultiSeedLogger, build_config_tag  # noqa: F401  (build_config_tag re-exported for analysis scripts)
 from relax.utils.experience import Experience
@@ -48,6 +50,13 @@ def _detect_env_can_terminate(env_name: str) -> bool:
     ``_terminate_when_unhealthy=False``). Falls back to ``True`` (treat as
     terminating) when the probe fails for any reason.
     """
+    if is_dmc_id(env_name):
+        # dm_control suite tasks have no terminal states -- episodes end only at
+        # the 1000-step time limit, as truncation. Answered without a probe
+        # because neither branch below can detect it (there is no
+        # ``_terminate_when_unhealthy``, and the source check is for gym mujoco),
+        # so the probe would wrongly fall through to True.
+        return False
     try:
         import gymnasium
         probe = gymnasium.make(env_name)
@@ -280,19 +289,27 @@ class VmapOffPolicyTrainer:
         }
 
         for target in due_steps:
-            path = save_diagnostic_snapshot(
-                root_dir=self.diagnostic_snapshot_dir,
-                env_name=self.env_name,
-                step=target,
-                algorithm_state=self.algorithm.state,
-                rollout_obs=rollout_obs,
-                replay_batches=replay_batches,
-                replay_indices=replay_indices,
-                metadata={**base_metadata, "target_step": int(target)},
-                hparams=self.hparams,
-                replay_buffer_subset=replay_buffer_subset,
-                replay_buffer_subset_indices=replay_buffer_subset_indices,
-            )
+            try:
+                path = save_diagnostic_snapshot(
+                    root_dir=self.diagnostic_snapshot_dir,
+                    env_name=self.env_name,
+                    step=target,
+                    algorithm_state=self.algorithm.state,
+                    rollout_obs=rollout_obs,
+                    replay_batches=replay_batches,
+                    replay_indices=replay_indices,
+                    metadata={**base_metadata, "target_step": int(target)},
+                    hparams=self.hparams,
+                    replay_buffer_subset=replay_buffer_subset,
+                    replay_buffer_subset_indices=replay_buffer_subset_indices,
+                )
+            except OSError as exc:
+                if exc.errno not in (errno.EDQUOT, errno.ENOSPC):
+                    raise
+                print(f"[diagnostic_snapshot] disabling snapshots after storage failure: {exc}",
+                      flush=True)
+                self.save_diagnostic_snapshots = False
+                return
             print(f"[diagnostic_snapshot] saved {path}")
             self._diagnostic_snapshot_saved_steps.add(target)
 
@@ -308,7 +325,6 @@ class VmapOffPolicyTrainer:
         self.progress = tqdm(total=self.total_step, desc="Sample Step (per run)", disable=None, dynamic_ncols=True)
 
         self.recorder.init()
-        self.logger.set_snr(getattr(self.algorithm, "_snr", None))
         self.logger.init_runs()
 
     def _to_env_action(self, action: np.ndarray) -> np.ndarray:
@@ -437,14 +453,13 @@ class VmapOffPolicyTrainer:
         stacked_batches = jax.tree.map(lambda *xs: jnp.stack([jnp.asarray(x) for x in xs], axis=0), *batches)
         # Env-step count (shared across runs, stepped in lockstep) drives --lr_anneal.
         env_step = self.sample_logs[0].sample_step
-        scalar_info, array_info, _ = self.algorithm.update_vmap(update_key, stacked_batches, env_step=env_step)
-        self._log_update(scalar_info, array_info)
+        scalar_info, _, _ = self.algorithm.update_vmap(update_key, stacked_batches, env_step=env_step)
+        self._log_update(scalar_info)
 
-    def _log_update(self, info: dict, array_info: dict):
+    def _log_update(self, info: dict):
         # info: dict tag -> np.ndarray[num_runs]
         # Log per-run; use per-run update step = UpdateLog.update_step * 5
         # (existing convention from UpdateLog.log at line 291 of accumulator.py).
-        self.logger.accumulate_arrays(array_info)
         self.update_log.update_step += 1
         current_env_step = self.sample_logs[0].sample_step
         log_this_step = (
@@ -453,7 +468,6 @@ class VmapOffPolicyTrainer:
         if log_this_step:
             self._last_update_log_env_step = current_env_step
             sample_steps = [int(self.sample_logs[s].sample_step) for s in range(self.num_runs)]
-            self.logger.flush_accumulated_arrays(sample_steps)
             for tag, vals in info.items():
                 arr = np.asarray(vals)
                 for s in range(self.num_runs):
@@ -563,8 +577,8 @@ class VmapOffPolicyTrainer:
         stacked = jax.tree.map(lambda *xs: jnp.stack([jnp.asarray(x) for x in xs], axis=0), *batches)
 
         env_step = self.sample_logs[0].sample_step
-        scalar_info, array_info, actions = self.algorithm.update_vmap(update_key, stacked, jnp.asarray(critic_weight), env_step=env_step)
-        self._log_update(scalar_info, array_info)
+        scalar_info, _, actions = self.algorithm.update_vmap(update_key, stacked, jnp.asarray(critic_weight), env_step=env_step)
+        self._log_update(scalar_info)
 
         action_nm = np.asarray(actions[:, -E:])  # [num_runs, E, act_dim]
         q_per_env, v_per_env = self.algorithm.eval_q_v_vmap(obs_nm, action_nm)

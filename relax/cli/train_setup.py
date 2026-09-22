@@ -160,6 +160,10 @@ def build_per_seed_state(
         policy_final_layer=args.policy_final_layer,
         orthogonal_init=args.orthogonal_init,
         noise_cond_theta=args.noise_cond_theta,
+        inference_spacing=args.inference_spacing,
+        log_snr_min=args.log_snr_min,
+        log_snr_max=args.log_snr_max,
+        karras_rho=args.karras_rho,
     )
     params_list = [model.init_params(k) for k in seeds.init_keys]
     return model, params_list, buffers_list

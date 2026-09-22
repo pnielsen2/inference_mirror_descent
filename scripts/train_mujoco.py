@@ -36,6 +36,11 @@ if __name__ == "__main__":
         per_entry_action_seeds=seeds.per_entry_action_seeds,
     )
 
+    # Which two of alpha/beta/T/eta the CLI pinned. Captured BEFORE
+    # resolve_kl_budget fills in all four, because a hp_pack that overrides one
+    # of them per slot has to re-derive the other two from this pair.
+    cmd_specified = {n for n in ("alpha", "beta", "T", "eta") if getattr(args, n) is not None}
+
     # Apply --kl_budget / --kl_budget_per_dim / --T promotion to beta + V-net.
     resolve_kl_budget(args, act_dim)
 
@@ -49,7 +54,8 @@ if __name__ == "__main__":
     algorithm.state = algorithm.make_vmapped_state(params_list)
     if _hp_loaded is not None:
         from relax.algorithm import hp_pack
-        algorithm.state = hp_pack.apply(algorithm.state, _hp_loaded, args.parallel_runs)
+        algorithm.state = hp_pack.apply(algorithm.state, _hp_loaded, args.parallel_runs,
+                                        cmd_specified=cmd_specified)
         if seeds.per_entry_masters is not None:
             print(f"[hp_pack] applied per-entry master seeds "
                   f"(buffers + init networks + train keys): {seeds.per_entry_masters}")
@@ -60,6 +66,7 @@ if __name__ == "__main__":
     # Allow the algorithm to override or augment these with its own effective
     # hyperparameters (e.g., internally clamped / derived values).
     args_dict = dict(vars(args))
+    args_dict["noise_schedule_type"] = args.beta_schedule_type
     if hasattr(algorithm, "get_effective_hparams"):
         args_dict.update(algorithm.get_effective_hparams())
 

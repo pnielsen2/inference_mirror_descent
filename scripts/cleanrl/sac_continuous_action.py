@@ -8,8 +8,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List
 
-# Ensure cleanrl_utils is importable from the scripts/ directory
+# Ensure cleanrl_utils is importable from the scripts/ directory, and relax/
+# (for the dm_control env registration) from the repo root above it.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import gymnasium as gym
 import numpy as np
@@ -21,6 +23,7 @@ import tyro
 from torch.utils.tensorboard import SummaryWriter
 
 from cleanrl_utils.buffers import ReplayBuffer
+from relax.dmc import register_dmc_envs
 
 
 @dataclass
@@ -272,6 +275,10 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # env setup
+    # Teaches gymnasium the dmc/ ids and puts the FlattenObservation for
+    # dm_control's Dict observations behind them. SyncVectorEnv builds its envs
+    # in THIS process, so this one call also covers the eval envs made below.
+    register_dmc_envs(args.env_id)
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
     )

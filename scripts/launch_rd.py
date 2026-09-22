@@ -63,6 +63,8 @@ FLAG_TO_HP_KEY = {f"--{k}": k for k in (
     "reward_scale",
     "x0_hat_clip_radius",
     "mala_adapt_rate",
+    "mala_target_acceptance_rate",
+    "mala_step_size_max",
     "q_td_huber_width",
     "q_critic_agg_idx",
 )}

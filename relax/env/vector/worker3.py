@@ -8,6 +8,7 @@ import gymnasium
 import numpy as np
 
 import setproctitle
+from relax.dmc import register_dmc_envs
 from relax.prctl import set_client_pdeathsig
 from relax.futex import futex_client_wait, futex_client_notify
 
@@ -32,6 +33,8 @@ def main():
     indices = [int(i) for i in args.index.split(",")]
     seeds = [int(i) for i in args.seed.split(",")]
     assert len(indices) == len(seeds)
+
+    register_dmc_envs(args.env)
 
     envs = []
     for seed in seeds:

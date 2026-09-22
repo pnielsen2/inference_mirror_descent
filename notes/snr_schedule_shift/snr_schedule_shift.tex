@@ -1,0 +1,1905 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1.05in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue!55!black,citecolor=blue!55!black,
+            urlcolor=blue!55!black]{hyperref}
+
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}[proposition]{Corollary}
+\theoremstyle{definition}
+\newtheorem{remark}[proposition]{Remark}
+\newtheorem{recipe}[proposition]{Recipe}
+
+\newcommand{\abar}{\bar\alpha}
+\newcommand{\snr}{\mathrm{SNR}}
+\newcommand{\sig}{\tilde\sigma}
+\newcommand{\Var}{\mathrm{Var}}
+\newcommand{\dd}{\mathrm{d}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Tr}{\mathrm{tr}}
+\newcommand{\mmse}{\mathrm{mmse}}
+\newcommand{\leff}{\lambda^{\mathrm{eff}}}
+
+\title{\bf The noise schedule should be specified in effective log-SNR\\
+\large What the cosine schedule assumes about the data, and how to remove it}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+\vspace{-2.4em}
+
+\begin{abstract}
+\noindent
+A diffusion schedule is a plan for spending $T$ steps along the noise axis. We
+show that every criterion one might use to lay out those steps --- information
+delivered, or variance transported by the sampler --- is a function of the
+\emph{effective} log-SNR $\leff=\lambda+2\log s$, where $s$ is the standard
+deviation of the clean data, and never of the nominal $\lambda$ alone. The
+information statement is exact and distribution-free: by the I-MMSE relation,
+$\dd I/\dd\lambda=\tfrac12 e^{\leff}\mmse(e^{\leff})$, with no high-SNR
+approximation anywhere. Since a schedule controls $\lambda$ while the process
+responds to $\leff$, and the two differ by the constant $2\log s$, any
+schedule specified purely in terms of $\abar$ has silently assumed $s=1$. The
+correction is a rigid translation of the log-SNR curve by $2\log(1/\hat s)$,
+which is two lines of code and is \emph{exactly} equivalent to the
+reparametrization by polar angle in the signal--noise plane --- the latter is a
+derived consequence, not a premise. We compute the exact per-step DDIM variance
+deficit $s^2\sin^2(\Delta\theta_k)/v_k$, obtain $D_{\min}=\pi^2/(4T)$ and
+$D=\pi^2/(4T)\cdot\cosh\log(s/\hat s)$, and show the unshifted cosine schedule is
+the special case $\hat s=1$. For heterogeneous or state-dependent $s$, two
+scalars suffice: $M_+=\E[s]$ and $M_-=\E[1/s]$ give the best global shift
+$\hat s=\sqrt{M_+/M_-}$ and the irreducible penalty $\sqrt{M_+M_-}$. Because the
+penalty sees only the log-error it cannot distinguish spread from estimation
+noise, so the same rule applied to a posterior turns the cost into a loss: from
+$K$ samples per state the optimal single-state shift \emph{inflates} the sample
+width to $\hat s_K\sqrt{\nu/(\nu-1)}$, $\nu=K-1$, at residual cost
+$\sqrt{f(\nu)}\approx1+1/(4\nu)$. Having identified the log-error as what costs,
+the estimator itself needs no further decision theory: a global shift is obtained
+by averaging $\log\hat s_K$ and removing the exact additive bias
+$\tfrac12(\psi(\nu/2)-\log(\nu/2))$, whose second moment simultaneously supplies
+the heterogeneity floor. That targets the geometric mean, and since the risk in
+$\log\hat s$ is itself exactly a $\cosh$, the substitution costs precisely
+$\cosh$ of its log-distance to $\sqrt{M_+/M_-}$ --- zero when $\log s$ is
+symmetric. Nothing depends on the mean. All closed forms are verified
+numerically.
+\end{abstract}
+
+\section{The claim, and the fix}
+
+A variance-preserving diffusion is usually specified by a sequence
+$\abar_k\in(0,1)$, equivalently by a trajectory of log-SNR values
+$\lambda_k=\log[\abar_k/(1-\abar_k)]$. The cosine schedule
+\cite{nichol2021improved} is one such trajectory and it is close to universal in
+practice.
+
+This note makes one point. The quantity that a schedule writes down is
+$\lambda_k$, but the quantity that the process responds to is the log-SNR
+\emph{of the actual data},
+\begin{equation}
+  \leff_k \;=\; \lambda_k + 2\log s,
+  \label{eq:shift0}
+\end{equation}
+with $s$ the standard deviation of the clean distribution. Sections
+\ref{sec:info} and \ref{sec:transport} show that both natural design criteria
+--- how much information the channel delivers, and how much variance the sampler
+fails to transport --- are functions of $\leff$ alone. A trajectory written in
+$\lambda$ is therefore a claim about $\leff$ only when $s=1$. Since \eqref{eq:shift0}
+is a constant offset, the repair is a rigid vertical translation:
+
+\begin{recipe}[shifted schedule]
+\label{rec:main}
+Let $\lambda^{\rm target}_k$ be any trajectory you trust for unit-variance data
+(e.g.\ cosine's), and let $\hat s$ estimate the clean standard deviation. Use
+\begin{equation}
+  \boxed{\;
+  \lambda_k \;=\; \lambda^{\rm target}_k - 2\log\hat s,
+  \qquad
+  \abar_k \;=\; \frac{1}{1+e^{-\lambda_k}}
+  \;}
+  \label{eq:recipe}
+\end{equation}
+equivalently $\sig_k=\hat s\,\sig^{\rm target}_k$, equivalently
+$\abar_k=1/(1+\hat s^2\,\sig^{{\rm target}\,2}_k)$, where
+$\sig^2=(1-\abar)/\abar$. Then $\leff_k=\lambda^{\rm target}_k$ exactly.
+\end{recipe}
+
+Everything else here is either a justification of \eqref{eq:recipe}, a
+computation of what it buys, or a statement of what to do when a single $\hat s$
+is not enough. Three facts about \eqref{eq:recipe} are worth stating up front
+because they are easy to get wrong:
+
+\begin{itemize}\itemsep2pt
+  \item \textbf{It is exact, not approximate.} Applying \eqref{eq:recipe} to the
+  cosine trajectory produces precisely the schedule whose steps are uniform in
+  the polar angle $\psi=\arctan(\sig/s)$ of the signal--noise plane
+  (Proposition~\ref{prop:equiv}); verified to $10^{-14}$ in
+  Section~\ref{sec:verify}. The angle description and the shift description are
+  the same object.
+  \item \textbf{It is not a reshaping.} A translation in $\lambda$ is not in the
+  family swept out by cosine's shape parameters, which is why one cannot obtain
+  it by retuning them \cite{chen2023importance}. This is a statement about that
+  family, not an impossibility: \eqref{eq:recipe} implements the translation
+  directly, in two lines.
+  \item \textbf{It is equivalent to standardizing the data.} Diffusing $x_0/\hat s$
+  under $\lambda^{\rm target}$ and diffusing $x_0$ under \eqref{eq:recipe} give
+  the same geometry. Which one to use is an engineering choice
+  (Section~\ref{sec:beyond}); for anisotropic data only standardization can act
+  per coordinate.
+\end{itemize}
+
+\section{Setup: nominal versus effective log-SNR}
+\label{sec:setup}
+
+Fix a clean distribution $p_0$ on $\R^d$ with mean $\mu$ and covariance
+$\Sigma$. The forward process is
+\begin{equation}
+  x_k \;=\; \sqrt{\abar_k}\,x_0 \;+\; \sqrt{1-\abar_k}\,\varepsilon,
+  \qquad \varepsilon\sim\mathcal N(0,I),
+  \label{eq:forward}
+\end{equation}
+with $\abar_k$ decreasing in $k$; we index so that \textbf{$k=0$ is cleanest},
+matching the code, so the reverse process steps $k\to k-1$. Since $\varepsilon$
+is centered and isotropic and \eqref{eq:forward} is affine,
+\begin{equation}
+  \E[x_k]=\sqrt{\abar_k}\,\mu,
+  \qquad
+  V_k \;=\; \abar_k\Sigma + (1-\abar_k)I .
+  \label{eq:marginal}
+\end{equation}
+Note that $V_k$ contains no $\mu$; Section~\ref{sec:mean} draws the consequence.
+
+We use four equivalent coordinates for a noise level, and one derived one:
+\begin{equation}
+  \abar\in(0,1),
+  \quad
+  \sig=\sqrt{\tfrac{1-\abar}{\abar}},
+  \quad
+  \lambda=\log\tfrac{\abar}{1-\abar}=-2\log\sig,
+  \quad
+  \theta=\arctan\sig,
+  \quad
+  \psi=\arctan\tfrac{\sig}{s}.
+  \label{eq:coords}
+\end{equation}
+Thus $\abar=\cos^2\theta$, with $\theta=0$ clean and $\theta=\pi/2$ pure noise.
+
+\paragraph{The two SNRs.} Take $d=1$ and $\Sigma=s^2$ for the moment. The
+schedule's nominal SNR is $\snr=\abar/(1-\abar)=e^{\lambda}$, which is what
+\eqref{eq:forward} would deliver if the clean variance were $1$. The ratio the
+process actually realizes is
+\begin{equation}
+  \snr^{\rm eff}_k
+  \;=\; \frac{\Var(\text{signal part of }x_k)}{\Var(\text{noise part})}
+  \;=\; \frac{\abar_k s^2}{1-\abar_k}
+  \;=\; s^2\,e^{\lambda_k},
+  \qquad\text{so}\qquad
+  \leff_k=\lambda_k+2\log s .
+  \label{eq:shift}
+\end{equation}
+Writing $v_k=\abar_ks^2+(1-\abar_k)$ for the marginal variance, note
+$\cos^2\psi_k=s^2\abar_k/v_k$ is the signal's share of it, so $\psi$ is just
+$\leff$ on a compact scale: $\leff=-2\log\tan\psi$. These are three names for
+one thing.
+
+The rest of this section is the only assumption we need to make explicit.
+\emph{A schedule chooses $\lambda_k$. If the criterion by which we judge a
+schedule is a function of $\leff$, then by \eqref{eq:shift} the schedule is
+under-determined by one constant until $s$ is named, and setting that constant
+by ignoring $s$ amounts to asserting $s=1$.} Sections \ref{sec:info} and
+\ref{sec:transport} establish the antecedent, twice, from independent premises.
+
+\begin{remark}[a notation collision]
+The Nichol--Dhariwal cosine schedule contains a small offset conventionally
+also written $s$ (value $0.008$), whose only job is to keep $\beta_1$ away from
+$0$. Here $s$ and $s_i$ always denote clean-data standard deviations; we write
+$\delta$ for that offset.
+\end{remark}
+
+\section{The information clock, exactly}
+\label{sec:info}
+
+The usual argument for log-SNR is that equal steps in $\lambda$ deliver equal
+information, justified through the high-SNR limit or through the diffusion
+ELBO. Neither is necessary, and the high-SNR version understates the case: the
+information rate has an exact closed form at every noise level, for every clean
+distribution.
+
+\subsection{The exact rate}
+
+Dividing \eqref{eq:forward} by $\sqrt{1-\abar_k}$ is invertible, so
+\begin{equation}
+  I(x_0;x_k) \;=\; I\big(x_0;\ \sqrt{\gamma_k}\,x_0+\varepsilon\big),
+  \qquad \gamma_k=\frac{\abar_k}{1-\abar_k}=e^{\lambda_k}.
+  \label{eq:channel}
+\end{equation}
+Level $k$ of a diffusion \emph{is} a Gaussian channel of SNR $\gamma_k$. For
+that channel the I-MMSE relation of Guo, Shamai and Verd\'u
+\cite{guo2005mutual} states that, in nats,
+\begin{equation}
+  \frac{\dd}{\dd\gamma}I(x_0;\sqrt\gamma x_0+\varepsilon)
+  \;=\; \tfrac12\,\mmse(\gamma),
+  \qquad
+  \mmse(\gamma)=\E\big\|x_0-\E[x_0\mid \sqrt\gamma x_0+\varepsilon]\big\|^2,
+  \label{eq:immse}
+\end{equation}
+for \emph{any} $x_0$ with finite variance. This is an identity, not an
+expansion. Since $\dd\gamma=\gamma\,\dd\lambda$,
+\begin{equation}
+  \boxed{\;
+  \frac{\dd I}{\dd\lambda}
+  \;=\; \underbrace{\frac{\gamma}{2}}_{\substack{\text{channel}\\\text{quality}}}
+        \times
+        \underbrace{\mmse(\gamma)}_{\substack{\text{how much is}\\\text{still unknown}}}
+  \;}
+  \label{eq:rate}
+\end{equation}
+Equation \eqref{eq:rate} is the precise form of the intuition that two effects
+compete. At low SNR there is a great deal left to learn --- $\mmse\to\Var(x_0)$,
+the whole prior variance --- but the channel is so poor that almost none of it
+arrives per unit $\lambda$. At high SNR the channel is excellent but there is
+almost nothing left: $\mmse\sim1/\gamma$, and the two effects cancel exactly,
+leaving a constant rate. Neither factor alone is the right clock; their product
+is.
+
+\subsection{The clock depends on the data only through $\leff$ and a shape}
+
+\begin{proposition}
+\label{prop:clock}
+Write $x_0=\mu+sZ$ with $Z$ standardized ($\E Z=0$, $\Var Z=1$) of shape $p_Z$.
+Then
+\begin{equation}
+  \frac{\dd I}{\dd\lambda}
+  \;=\; \tfrac12\,R_{p_Z}\!\big(\leff\big),
+  \qquad
+  R_{p_Z}(u)\;=\;e^{u}\,\mmse_Z(e^{u}),
+  \qquad \leff=\lambda+2\log s .
+  \label{eq:clockdep}
+\end{equation}
+The rate depends on the schedule and the data scale \textbf{only through
+$\leff$}, and on the data otherwise only through its shape. Moreover
+\begin{equation}
+  R_{p_Z}(u)\;\xrightarrow[u\to-\infty]{}\;e^{u},
+  \qquad
+  R_{p_Z}(u)\;\xrightarrow[u\to+\infty]{}\;1
+  \quad\text{for every continuous }p_Z,
+  \label{eq:asympt}
+\end{equation}
+and for the Gaussian shape $R(u)=\sigma(u)=(1+e^{-u})^{-1}$ exactly, which
+dominates every other shape pointwise.
+\end{proposition}
+
+\begin{proof}
+With $x_0=\mu+sZ$, the channel $\sqrt\gamma x_0+\varepsilon$ has the same
+posterior structure as $\sqrt{\gamma s^2}Z+\varepsilon$ after the invertible
+shift and scaling, so $\mmse_{x_0}(\gamma)=s^2\mmse_Z(\gamma s^2)$; the mean
+$\mu$ drops out because it is known. Then
+$\tfrac\gamma2\mmse_{x_0}(\gamma)=\tfrac12(\gamma s^2)\mmse_Z(\gamma s^2)$, and
+$\gamma s^2=e^{\leff}$. As $u\to-\infty$, $\mmse_Z\to\Var Z=1$, giving $e^u$; as
+$u\to+\infty$ the posterior of a continuous $Z$ is asymptotically Gaussian with
+variance $e^{-u}$, giving $R\to1$. For Gaussian $Z$, $\mmse_Z(\gamma')=1/(1+\gamma')$
+so $R(u)=e^u/(1+e^u)$. Pointwise dominance is the standard fact that among all
+$Z$ of unit variance the Gaussian has the largest MMSE at every SNR.
+\end{proof}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\textwidth]{figs/fig_information.pdf}
+  \caption{\textbf{The exact information clock.} (a) $\dd I/\dd\leff$ from
+  \eqref{eq:clockdep}. For Gaussian data it is exactly $\tfrac12\sigma(\leff)$
+  --- no approximation --- rising from the universal low-SNR asymptote
+  $\tfrac12e^{\leff}$ to a plateau of $\tfrac12$ nat per unit $\leff$. A
+  two-point prior has the same low-SNR asymptote but collapses at high SNR
+  because it holds only $\log2$ nats in total. (b) The two competing factors of
+  \eqref{eq:rate}: one falls, one rises, and their product saturates. (c)
+  Cumulative information. For continuous data it grows without bound at slope
+  $\tfrac12$, so no finite schedule can deliver all of it.}
+  \label{fig:information}
+\end{figure}
+
+Proposition~\ref{prop:clock} is the primal statement this note rests on, and it
+already forces Recipe~\ref{rec:main}:
+
+\begin{corollary}[the shift is forced]
+\label{cor:forced}
+Any schedule criterion built from the information the channel delivers is a
+functional of the sequence $\leff_k$ alone. Two schedules with the same
+$\{\leff_k\}$ are indistinguishable to it, and a target trajectory expressed in
+$\lambda$ realizes the intended $\{\leff_k\}$ if and only if it is translated by
+$-2\log s$, which is \eqref{eq:recipe}.
+\end{corollary}
+
+Note what this does \emph{not} require: no Gaussian assumption, no high-SNR
+limit, and no appeal to the ELBO. It also explains why the correction cannot be
+absorbed into a reshaping. Shape changes reparametrize the path
+$k\mapsto\lambda_k$; the offset $2\log s$ changes which physical noise levels
+those $\lambda_k$ name.
+
+\subsection{Why equal information per step cannot be the whole criterion}
+
+Corollary~\ref{cor:forced} fixes the \emph{coordinate} in which a schedule
+should be written. It does not fix the \emph{spacing}, and it cannot, for a
+reason visible in Figure~\ref{fig:information}c. Integrating
+\eqref{eq:clockdep} for continuous data,
+\begin{equation}
+  I(\leff) \;=\; \tfrac12\log\big(1+e^{\leff}\big)
+  \;\xrightarrow[\leff\to\infty]{}\;\infty
+  \qquad\text{at slope }\tfrac12 .
+  \label{eq:divergence}
+\end{equation}
+The total information required to resolve continuous data exactly is infinite,
+and it is spread at a constant rate over an infinite stretch of $\leff$. So:
+
+\begin{itemize}\itemsep2pt
+  \item \textbf{``Equal information per step'' has no finite-$T$ solution.} Any
+  schedule delivering $\Delta I$ per step covers only a bounded range of $\leff$,
+  and the endpoints $\abar\to1$, $\abar\to0$ stay infinitely far away
+  (Figure~\ref{fig:coordinates}a). To use this criterion one must first truncate
+  $\leff$ to a finite window, and the two cutoffs become hyperparameters. That is
+  exactly what a uniform-$\lambda$ schedule with an \texttt{snr\_max} cutoff
+  does.
+  \item \textbf{The divergence is one-sided and structural.} It sits at the
+  \emph{clean} end, and only for continuous data: the two-point prior in
+  Figure~\ref{fig:information} saturates at $\log2$ nats and needs no cutoff.
+  Real data lies between, which is why the cutoff is a modeling choice rather
+  than a fact.
+\end{itemize}
+
+We therefore need a criterion with a \emph{finite} total, so that minimizing it
+at fixed $T$ has a solution. Section~\ref{sec:transport} uses the error the
+sampler actually makes. It will return the same coordinate $\leff$ --- which is
+the real content of Corollary~\ref{cor:forced} --- and, in addition, a spacing.
+
+\section{What the cosine schedule is, and the identification it makes}
+\label{sec:cosine}
+
+The cosine schedule sets $\abar_k=\cos^2\theta_k$ with $\theta_k$ uniform,
+\begin{equation}
+  \theta_k=\frac{k+1}{T}\cdot\frac{\pi}{2},
+  \qquad
+  \abar_k=\cos^2\!\Big(\frac{k+1}{T}\frac{\pi}{2}\Big),
+  \label{eq:cosine}
+\end{equation}
+up to the offset $\delta$. Two observations place it relative to
+Section~\ref{sec:info}.
+
+\paragraph{It compactifies rather than truncates.} $\theta$ ranges over the
+bounded interval $[0,\pi/2]$ (Figure~\ref{fig:coordinates}b), so
+\eqref{eq:cosine} reaches the endpoints of the path in finitely many steps with
+no cutoff hyperparameter. It is not a truncated uniform-$\lambda$ schedule; it is
+a different response to the divergence \eqref{eq:divergence}. Differentiating
+$\lambda=-2\log\tan\theta$,
+\begin{equation}
+  \Big|\frac{\dd\lambda}{\dd\theta}\Big| = \frac{4}{\sin2\theta} \;\geq\; 4,
+  \label{eq:speed}
+\end{equation}
+with equality only at $\theta=\pi/4$, i.e.\ $\snr=1$. So cosine coincides with
+uniform-$\lambda$ spacing near $\snr=1$ and takes ever larger log-SNR strides
+toward both ends (Figure~\ref{fig:trajectories}).
+
+\paragraph{It is written in $\lambda$, not $\leff$.} Equation \eqref{eq:cosine}
+specifies $\abar_k$ and nothing else. By Corollary~\ref{cor:forced} it is a
+claim about the process only once $s$ is named, and reading it directly as a
+trajectory of $\leff$ sets $s=1$. Everything in the remainder of this note is
+the quantification of that step.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\textwidth]{figs/fig_coordinates.pdf}
+  \caption{\textbf{The unboundedness of $\lambda$ and the compactness of
+  $\theta$.} (a) $\lambda$ diverges at both ends of the path. (b)
+  $\theta=\arctan\sig$ covers the path in $[0,\pi/2]$. (c) When $s=1$ the point
+  (signal amplitude, noise amplitude) traverses the unit circle, on which
+  $\theta$ is the polar angle and the arc length. Section~\ref{sec:transport}
+  shows what replaces $\theta$ when $s\neq1$.}
+  \label{fig:coordinates}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\textwidth]{figs/fig_trajectories.pdf}
+  \caption{\textbf{Cosine is not a truncated uniform-$\lambda$ schedule.} (a)
+  Log-SNR against step index. Uniform $\lambda$ is a straight line but needs the
+  cutoffs $|\lambda|\le12$; cosine is steep at both ends; linear $\beta$ stays
+  noisy far too long and then jumps, the pathology cosine was introduced to fix.
+  (b) Cosine's log-SNR speed \eqref{eq:speed}, minimized at $\snr=1$.}
+  \label{fig:trajectories}
+\end{figure}
+
+\section{A criterion that terminates: what the sampler actually loses}
+\label{sec:transport}
+
+Section~\ref{sec:info} fixed the coordinate but could not fix the spacing,
+because the total information is infinite. We now use a cost that is finite: the
+error the reverse sampler makes. Take $p_0=\mathcal N(\mu,\Sigma)$ so the score
+is exact and no network error is involved --- by
+Proposition~\ref{prop:clock} the Gaussian is also the hardest shape at every
+noise level, so this is the conservative choice. Then a deterministic DDIM
+sampler makes exactly one kind of error, and we can compute it in closed form.
+
+\subsection{The exact per-step deficit}
+
+\begin{proposition}[exact per-step DDIM deficit]
+\label{prop:deficit}
+Let $d=1$, $p_0=\mathcal N(m,s^2)$, and let DDIM with $\eta=0$ be fed the exact
+$\E[\varepsilon\mid x_k]$. Then the update is affine, $x_{k-1}=c_kx_k+b_km$,
+with
+\begin{equation}
+  c_k=\frac{\sqrt{\abar_{k-1}\abar_k}\,s^2+\sqrt{(1-\abar_{k-1})(1-\abar_k)}}{v_k},
+  \qquad v_k=\abar_ks^2+(1-\abar_k),
+\end{equation}
+it transports the mean \emph{exactly}, $\E[x_{k-1}]=\sqrt{\abar_{k-1}}\,m$, and
+its variance deficit is
+\begin{equation}
+  \boxed{\;v_{k-1}-\Var(x_{k-1}) \;=\; \frac{s^2\sin^2(\Delta\theta_k)}{v_k}\;},
+  \qquad \Delta\theta_k=\theta_k-\theta_{k-1}.
+  \label{eq:deficit}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Write $u=\cos\theta_k$, $w=\sin\theta_k$, $u'=\cos\theta_{k-1}$,
+$w'=\sin\theta_{k-1}$, so $\abar_k=u^2$, $1-\abar_k=w^2$, $v_k=s^2u^2+w^2$. For a
+Gaussian, $\E[\varepsilon\mid x_k]=w(x_k-um)/v_k$, hence
+$\hat x_0=(x_k-w\hat\varepsilon)/u=(us^2x_k+w^2m)/v_k$. Substituting into
+$x_{k-1}=u'\hat x_0+w'\hat\varepsilon$ gives $c_k=(u'us^2+w'w)/v_k$ and
+$b_k=(u'w^2-w'wu)/v_k$. For the mean, $c_ku+b_k=u'(u^2s^2+w^2)/v_k=u'$, exactly.
+For the variance, $\Var(x_{k-1})=c_k^2v_k=(c_kv_k)^2/v_k$ and
+\begin{align}
+  v_kv_{k-1}-(c_kv_k)^2
+  &=(s^2u^2+w^2)(s^2u'^2+w'^2)-(s^2uu'+ww')^2\nonumber\\
+  &=s^2\big[u^2w'^2+w^2u'^2-2uu'ww'\big]
+  =s^2(uw'-wu')^2=s^2\sin^2(\Delta\theta_k),
+\end{align}
+so $v_{k-1}-c_k^2v_k=s^2\sin^2(\Delta\theta_k)/v_k$.
+\end{proof}
+
+\begin{corollary}[the criterion is about spread, not location]
+\label{cor:pointmass}
+The deficit is $O(s^2)$ and vanishes at $s=0$: DDIM is exact on a point mass
+under \emph{every} schedule. Together with the exact mean transport, this says the
+sampler's only Gaussian error is a loss of spread, and that questions about
+schedules are questions about spread.
+\end{corollary}
+
+\begin{corollary}[what cosine equalizes]
+\label{cor:cosines1}
+If $s=1$ then $v_k\equiv1$ and \eqref{eq:deficit} reduces to
+$\sin^2(\Delta\theta_k)$, which uniform $\theta$ makes equal at every step. So
+the cosine schedule equalizes the per-step deficit \textbf{if and only if
+$s=1$}. This is the geometric fact behind Figure~\ref{fig:coordinates}c, and it
+is conditional in exactly the way Section~\ref{sec:cosine} anticipated.
+\end{corollary}
+
+\subsection{The cost is a metric on the $\leff$ axis, and it has finite length}
+
+Composing \eqref{eq:deficit} along the chain, the total relative deficit is
+\begin{equation}
+  D \;=\; 1-\prod_{k}\Big(1-\frac{s^2\sin^2(\Delta\theta_k)}{v_kv_{k-1}}\Big)
+    \;\approx\; \sum_k\frac{s^2\Delta\theta_k^2}{v_k^2}
+  \qquad\text{for small steps.}
+  \label{eq:total}
+\end{equation}
+The following reduction is the counterpart of Proposition~\ref{prop:clock} for
+this second criterion.
+
+\begin{proposition}[the cost is a sum of squared arc-length steps]
+\label{prop:metric}
+Let $g=\sig/s=e^{-\leff/2}$ be the noise level in units of the data scale. Then
+\begin{equation}
+  D \;\approx\; \sum_k\left(\frac{\Delta g_k}{1+g_k^2}\right)^{\!2}
+    \;\approx\; \sum_k (\Delta\psi_k)^2,
+  \qquad
+  \psi=\arctan g=\arctan\frac{\sig}{s},
+  \label{eq:sumsq}
+\end{equation}
+and in terms of effective log-SNR the arc-length element is
+\begin{equation}
+  \boxed{\;
+  |\dd\psi| \;=\; \frac{\dd\leff}{4\cosh(\leff/2)}\;},
+  \qquad
+  \int_{-\infty}^{\infty}\frac{\dd\leff}{4\cosh(\leff/2)} \;=\; \frac{\pi}{2}.
+  \label{eq:metric}
+\end{equation}
+So the cost depends on schedule and data only through $\leff$, it is a
+\emph{metric} on the $\leff$ axis whose density peaks at $\leff=0$ and decays
+like $e^{-|\leff|/2}$, and unlike the information metric of
+Section~\ref{sec:info} its total length is \emph{finite}.
+\end{proposition}
+
+\begin{proof}
+Substituting $\sig=\tan\theta$ gives $\dd\theta=\cos^2\!\theta\,\dd\sig$ and
+$v=\cos^2\!\theta\,(s^2+\sig^2)$, so
+$s^2\dd\theta^2/v^2=s^2\dd\sig^2/(s^2+\sig^2)^2$; putting $\sig=sg$ makes this
+$\dd g^2/(1+g^2)^2$, which is $\dd\psi^2$ since $\psi=\arctan g$. For
+\eqref{eq:metric}, $g=e^{-\leff/2}$ gives
+$\dd g=-\tfrac12e^{-\leff/2}\dd\leff$ and
+$1+g^2=1+e^{-\leff}$, so
+$|\dd\psi|=\tfrac12 e^{-\leff/2}\dd\leff/(1+e^{-\leff})
+=\dd\leff/[2(e^{\leff/2}+e^{-\leff/2})]$. The total is
+$\int\mathrm{sech}(u/2)\,\dd u/4=\tfrac12\int\mathrm{sech}\,t\,\dd t=\pi/2$.
+\end{proof}
+
+Two things follow immediately, and they are the answers to ``why this notion of
+uniformity?''
+
+\begin{corollary}[the shift, again, from an independent premise]
+\label{cor:forced2}
+The transport cost is a functional of $\{\leff_k\}$ alone. Hence
+Corollary~\ref{cor:forced} holds for it verbatim, and Recipe~\ref{rec:main} is
+forced a second time --- now by the sampler's measured error rather than by
+information flow. \emph{Two unrelated criteria pick out the same coordinate};
+this, rather than any appeal to angles, is why $\leff$ is the right axis.
+\end{corollary}
+
+\begin{corollary}[equal steps, and the closed form]
+\label{cor:equalsteps}
+By \eqref{eq:sumsq} the design problem is: minimize $\sum_k(\Delta\psi_k)^2$
+subject to $\sum_k\Delta\psi_k=\Psi$ fixed. By Cauchy--Schwarz (equivalently
+convexity of $x\mapsto x^2$) the unique minimizer is $\Delta\psi_k=\Psi/T$, with
+value
+\begin{equation}
+  D_{\min}=\frac{\Psi^2}{T}=\frac{\pi^2}{4T}
+  \qquad\text{for the full path }\Psi=\pi/2,
+  \label{eq:dmin}
+\end{equation}
+independent of $s$. \textbf{Equal steps in $\psi$ is not a desideratum but a
+conclusion}: $\psi$ is by construction the arc length of the cost, so ``spend
+the budget uniformly in $\psi$'' is a restatement of ``spread a fixed total cost
+as evenly as possible over $T$ steps'', which is optimal because the cost is
+quadratic in the step.
+\end{corollary}
+
+This settles the question of what makes one coordinate preferable to another.
+Neither $\theta$ nor $\psi$ is privileged as an angle. What is privileged is the
+\emph{cost density} \eqref{eq:metric}, which says: place steps in proportion to
+where the sampler loses variance, namely near $\leff=0$, where the data variance
+and the injected noise are comparable. Integrating that density produces a clock,
+and that clock is $\psi$. Since the density is a function of $\leff$, so is the
+clock; and since $\leff=\lambda+2\log s$, reading the clock requires knowing $s$.
+At $s=1$ the clock is $\theta$, which is why cosine looked canonical.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.86\textwidth]{figs/fig_geometry.pdf}
+  \caption{\textbf{Picture of the conclusion, not the premise.} Plotting the
+  marginal as (signal amplitude, noise amplitude)
+  $=(s\sqrt{\abar},\sqrt{1-\abar})$ traces an ellipse of semi-axes $(s,1)$, on
+  which $\psi$ of \eqref{eq:sumsq} is the polar angle and $\theta$ is only the
+  eccentric angle. The optimum of Corollary~\ref{cor:equalsteps} spaces the polar
+  angles evenly (right); the unshifted cosine schedule crowds them into the
+  noise-dominated corner (left). When $s=1$ the ellipse is the unit circle and
+  the two coincide.}
+  \label{fig:geometry}
+\end{figure}
+
+\section{The recipe is exactly the reparametrization}
+\label{sec:equiv}
+
+We can now verify the first claim made in Section~\ref{sec:setup}.
+
+\begin{proposition}[shift $=$ uniform $\psi$]
+\label{prop:equiv}
+Apply Recipe~\ref{rec:main} with estimate $\hat s$ to a target trajectory
+$\lambda^{\rm target}_k$ whose angles are $\theta^{\rm target}_k
+=\arctan\sig^{\rm target}_k$. If the true scale is $s=\hat s$, the resulting
+schedule satisfies
+\begin{equation}
+  \psi_k \;=\; \theta^{\rm target}_k \qquad\text{for every }k,
+\end{equation}
+identically. In particular, shifting the cosine trajectory by $-2\log\hat s$
+produces exactly the schedule that is uniform in $\psi$, which by
+Corollary~\ref{cor:equalsteps} is optimal.
+\end{proposition}
+
+\begin{proof}
+The recipe sets $\lambda_k=\lambda^{\rm target}_k-2\log\hat s$, i.e.\
+$\sig_k^2=\hat s^2\,\sig^{{\rm target}\,2}_k$, i.e.\ $\sig_k=\hat s\,\sig^{\rm
+target}_k$. Then
+$\psi_k=\arctan(\sig_k/s)=\arctan(\sig^{\rm target}_k)=\theta^{\rm target}_k$
+when $s=\hat s$. Uniform $\theta^{\rm target}$ therefore gives uniform $\psi$.
+\end{proof}
+
+So the two descriptions --- ``translate the log-SNR curve'' and ``make the polar
+angle uniform'' --- are one statement, and the translation is the more primitive
+of the two: it is what Corollaries~\ref{cor:forced} and \ref{cor:forced2} deliver
+directly, whereas $\psi$ requires the extra step of integrating the cost
+density. Numerically the identity holds to $10^{-14}$
+(Section~\ref{sec:verify}).
+
+\begin{remark}[what ``cannot be reproduced by reshaping'' means]
+\label{rem:reshape}
+Cosine's tunable knobs (the exponent, the offset $\delta$, a logit-SNR range)
+change the map $k\mapsto\lambda_k$ while leaving the meaning of each $\lambda$
+untouched. The correction of \eqref{eq:shift} instead relabels which physical
+noise level a given $\lambda$ denotes. No amount of reshaping performs a
+relabeling, which is the content of Chen's observation
+\cite{chen2023importance}; it is a statement about the reshaping family, and
+\emph{not} an obstruction. Recipe~\ref{rec:main} performs the relabeling in one
+line.
+\end{remark}
+
+\begin{remark}[endpoints are a separate choice]
+Proposition~\ref{prop:equiv} matches the \emph{shape} of the schedule exactly.
+Where to start and stop --- the noisiest and cleanest levels actually visited ---
+is an independent decision. Translating the trajectory as written carries
+cosine's endpoints along with it, so the noisiest level moves from
+$\sig_{T-1}$ to $\hat s\,\sig_{T-1}$. If instead one wants to keep the original
+terminal SNR and re-space only the interior, replace $\Psi=\pi/2$ in
+\eqref{eq:dmin} by $\Psi=\arctan(\sig_{T-1}/\hat s)$; the optimum is still equal
+steps in $\psi$ and $D_{\min}=\Psi^2/T$.
+\end{remark}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\textwidth]{figs/fig_shift.pdf}
+  \caption{\textbf{The correction is a rigid translation.} (a) One nominal
+  schedule induces a different effective clock \eqref{eq:shift} in each
+  coordinate; the curves are vertical translates. The band marks
+  $|\lambda|\le4$, where signal and noise are comparable and, by
+  \eqref{eq:metric}, where the cost lives. (b) Recipe~\ref{rec:main} at $s=0.3$:
+  the unshifted schedule's effective trajectory is $2\log(1/s)$ too noisy, and
+  translating the nominal curve by the same amount restores it. (c) The
+  translated schedule advances the cost-metric arc length $\psi$ at exactly
+  constant rate (Proposition~\ref{prop:equiv}); the unshifted one does not.}
+  \label{fig:shift}
+\end{figure}
+
+\section{The cost of the wrong scale}
+\label{sec:robust}
+
+One computation now yields both the price of ignoring $s$ and the price of
+estimating it badly, because they are the same quantity.
+
+\begin{proposition}[the $\cosh$ law]
+\label{prop:cosh}
+Build the schedule by Recipe~\ref{rec:main} from a full-path uniform-$\theta$
+target using estimate $\hat s$, and run it on data of true scale $s$. Then, to
+leading order in $1/T$,
+\begin{equation}
+  \boxed{\;
+  D(\hat s) \;=\; \frac{\pi^2}{4T}\cdot\frac{1+\rho^2}{2\rho}
+  \;=\; D_{\min}\cosh(\log\rho),
+  \qquad \rho=\frac{s}{\hat s}. \;}
+  \label{eq:cosh}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+The schedule has $\sig_k=\hat s\tan\phi_k$ with $\phi_k$ uniform,
+$\Delta\phi=\pi/(2T)$, so $g_k=\sig_k/s=\tan\phi_k/\rho$. Then
+$\Delta g_k=\rho^{-1}\sec^2\!\phi_k\,\Delta\phi$ and
+$1+g_k^2=(\rho^2+\tan^2\phi_k)/\rho^2$, so by \eqref{eq:sumsq}
+\begin{equation}
+  D=\rho^2\Delta\phi^2\sum_k\frac{\sec^4\phi_k}{(\rho^2+\tan^2\phi_k)^2}
+   \;\approx\;\rho^2\frac{\pi}{2T}\int_0^{\pi/2}\frac{\sec^4\phi\,\dd\phi}{(\rho^2+\tan^2\phi)^2}
+   =\rho^2\frac{\pi}{2T}\int_0^{\infty}\frac{(1+t^2)\,\dd t}{(\rho^2+t^2)^2},
+\end{equation}
+using $t=\tan\phi$. Splitting $1+t^2=(\rho^2+t^2)+(1-\rho^2)$ and using
+$\int_0^\infty(\rho^2+t^2)^{-1}\dd t=\pi/(2\rho)$ and
+$\int_0^\infty(\rho^2+t^2)^{-2}\dd t=\pi/(4\rho^3)$ gives
+$\pi(1+\rho^2)/(4\rho^3)$, hence $D=\pi^2(1+\rho^2)/(8T\rho)$.
+\end{proof}
+
+\begin{corollary}[the unshifted cosine schedule]
+\label{cor:cosprice}
+Taking $\hat s=1$ in \eqref{eq:cosh} --- that is, declining to shift at all ---
+gives $\rho=s$ and
+\begin{equation}
+  D_{\cos}=\frac{\pi^2(1+s^2)}{8Ts}=D_{\min}\cosh(\log s).
+  \label{eq:dcos}
+\end{equation}
+\end{corollary}
+
+So there is no separate theory for ``the cosine schedule is suboptimal'' and
+``a mis-estimated $\hat s$ is suboptimal'': the unshifted schedule is simply the
+maximally mis-specified member of the family, the one that asserts $\hat s=1$.
+The penalty $\cosh(\log\rho)$ is symmetric under $\rho\mapsto1/\rho$ and flat at
+the optimum --- $\cosh(\log2)=1.25$, $\cosh(\log4)=2.125$ --- so a coarse
+estimate captures nearly all of the available gain
+(Figure~\ref{fig:penalty}). At $s=0.45$, for instance, not shifting costs
+$1.34\times$, while shifting by an estimate wrong by a factor of two costs
+$1.25\times$.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\textwidth]{figs/fig_penalty.pdf}
+  \caption{\textbf{One law, two readings.} (a) Equation~\eqref{eq:cosh}: the
+  penalty for using $\hat s$ when the truth is $s$, with measured composed
+  deficits at $T=80$. (b) The same curve read as \eqref{eq:dcos}: the price of
+  leaving the schedule unshifted is $\cosh(\log s)$, the case $\hat s=1$.}
+  \label{fig:penalty}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\textwidth]{figs/fig_allocation.pdf}
+  \caption{\textbf{Where the budget goes.} (a) Noise level per step at $T=20$.
+  (b) Fraction of steps with $\sig_k<s$, i.e.\ with $\leff_k>0$. By
+  \eqref{eq:metric} the cost is symmetric about $\leff=0$, so the optimum spends
+  exactly half the budget on each side --- which the shifted schedule does for
+  every $s$, while the unshifted one starves the signal-dominated half as $s$
+  shrinks.}
+  \label{fig:allocation}
+\end{figure}
+
+\section{When one scale is not enough}
+\label{sec:beyond}
+
+Everything so far assumed a single number $s$. Three refinements matter, in
+increasing order of practical importance.
+
+\subsection{Anisotropic data: diagonal and general $\Sigma$}
+
+For $\Sigma=\mathrm{diag}(s_1^2,\dots,s_d^2)$, equation \eqref{eq:shift} holds
+per coordinate with its own offset $2\log s_i$, so a scalar schedule supplies one
+translation where $d$ are wanted (Figure~\ref{fig:shift}a). For general
+$\Sigma=U\Lambda U^{\!\top}$ nothing new happens, because the injected noise is
+isotropic:
+\begin{equation}
+  V_k=\abar_kU\Lambda U^{\!\top}+(1-\abar_k)UU^{\!\top}
+     =U\big[\abar_k\Lambda+(1-\abar_k)I\big]U^{\!\top},
+  \label{eq:eig}
+\end{equation}
+so \textbf{the eigenbasis is the same at every noise level}, the forward process
+never mixes principal axes, the exact DDIM map (built from $V_k^{-1}$ and
+$\Sigma$) is diagonal in that basis, and the problem splits into $d$ scalar
+problems with $s_i^2=\ell_i(\Sigma)$. Whitening by $\Sigma^{-1/2}$ is defined
+only up to a rotation, and the choice is immaterial for the same reason.
+
+Two responses, then. \emph{Standardize} --- diffuse
+$z_0=\Sigma^{-1/2}(x_0-\mu)$ --- which sets every $s_i=1$, makes the target
+trajectory optimal in every coordinate, and attains $d\cdot\pi^2/(4T)$; this is
+the only exact fix, and it is what offline diffusion policies do with a
+per-dimension normalizer \cite{chi2023diffusion}. Or \emph{compromise} on a
+single $\hat s$, which is the next subsection with the expectation taken over
+coordinates.
+
+\subsection{Heterogeneous scale: the two scalars to track}
+\label{sec:hetero}
+
+In an RL setting the relevant width is not a single dataset statistic. What the
+reverse chain must land on is the \emph{conditional} law $\pi(a\mid o)$ at the
+current state, so the scale is a random variable $s_i(o)$ --- indexed by
+coordinate and by state, and drifting as the policy trains. Averaging it and
+plugging the average in is not obviously the right move. The $\cosh$ law settles
+what to do, because it is exactly the right shape for taking expectations.
+
+\begin{proposition}[best global shift under heterogeneity]
+\label{prop:hetero}
+Let $s$ denote the random variable $s_i(o)$ under the joint law of coordinate and
+state-visitation, and let a single global $\hat s$ be used. Then by
+\eqref{eq:cosh} the expected relative deficit is
+\begin{equation}
+  \frac{\mathcal L(\hat s)}{D_{\min}}
+  \;=\; \E\big[\cosh(\log s-\log\hat s)\big]
+  \;=\; \tfrac12\Big(\frac{M_+}{\hat s}+\hat s\,M_-\Big),
+  \qquad
+  M_+:=\E[s],\quad M_-:=\E[1/s],
+  \label{eq:hetcost}
+\end{equation}
+which is convex in $\log\hat s$ and minimized at
+\begin{equation}
+  \boxed{\;
+  \hat s_\star=\sqrt{\frac{M_+}{M_-}},
+  \qquad
+  \frac{\mathcal L(\hat s_\star)}{D_{\min}}=\sqrt{M_+M_-}\;\geq\;1,
+  \;}
+  \label{eq:hetopt}
+\end{equation}
+with equality if and only if $s$ is almost surely constant.
+\end{proposition}
+
+\begin{proof}
+Expand $\cosh(b-\beta)=\tfrac12(e^{-\beta}e^{b}+e^{\beta}e^{-b})$ with
+$b=\log s$, $\beta=\log\hat s$ and take expectations, giving \eqref{eq:hetcost}.
+Differentiating in $\beta$ gives $-e^{-\beta}M_++e^{\beta}M_-=0$, hence
+$\hat s_\star^2=M_+/M_-$ and the value $\sqrt{M_+M_-}$. Cauchy--Schwarz gives
+$M_+M_-=\E[s]\,\E[1/s]\ge\big(\E[\sqrt s\cdot1/\sqrt s]\big)^2=1$ with equality
+iff $s$ is degenerate.
+\end{proof}
+
+This answers the measurement question completely: \textbf{two scalars suffice,
+and they are $\E[s]$ and $\E[1/s]$}, accumulated over states, coordinates and
+whatever time window one trusts. Their ratio gives the shift to use; their
+product gives the price of insisting on a single shift at all. It is worth
+reading the second quantity carefully, because it is the useful one:
+
+\begin{corollary}[$\sqrt{M_+M_-}$ is a decision rule]
+\label{cor:decide}
+$\sqrt{M_+M_-}$ is a floor: no choice of global $\hat s$ beats it. So if it is
+close to $1$, tuning $\hat s$ is worthwhile and nothing else is; if it is large,
+\emph{no} global scalar helps and the only remedy is to make the correction
+state-dependent (Section~\ref{sec:perstate}).
+\end{corollary}
+
+\begin{remark}[the log-normal reading, and what to report]
+\label{rem:lognormal}
+If $\log s\sim\mathcal N(m,\tau^2)$ then $M_\pm=e^{\pm m+\tau^2/2}$, so
+\begin{equation}
+  \hat s_\star=e^{m}\ \ (\text{the geometric mean}),
+  \qquad
+  \frac{\mathcal L(\hat s_\star)}{D_{\min}}=e^{\tau^2/2}.
+  \label{eq:lognormal}
+\end{equation}
+Equivalently, track $m=\E[\log s]$ and $\tau^2=\Var(\log s)$: the mean of the
+logs sets the shift and their variance sets the irreducible penalty. This is the
+precise sense in which one should ``average the logarithms, not the variances'':
+using $\E[s]$ instead of $e^{m}$ costs an extra factor $\cosh(\tau^2/2)$, which is
+$1.13$ at $\tau=1$ and $1.70$ at $\tau=1.5$. As a rule of thumb, $\tau\lesssim0.5$
+(scale varying by less than about $1.6\times$) gives a floor below $1.13$ and a
+global shift is essentially optimal; $\tau\gtrsim1$ gives a floor above $1.65$ and
+calls for Section~\ref{sec:perstate}.
+\end{remark}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\textwidth]{figs/fig_heterogeneity.pdf}
+  \caption{\textbf{A heterogeneous scale.} (a) Equation~\eqref{eq:hetcost} for
+  log-normal populations: the same $\cosh$ shape as
+  Figure~\ref{fig:penalty}, lifted off $1$ by the floor $e^{\tau^2/2}$ (dotted),
+  which no global $\hat s$ can reach below. (b) The floor against
+  $\tau=\mathrm{sd}(\log s)$, with sampled values of $\sqrt{M_+M_-}$, and the
+  extra cost of using the arithmetic mean $\E[s]$ in place of the geometric mean.}
+  \label{fig:heterogeneity}
+\end{figure}
+
+\begin{remark}[measuring it in this code base]
+\label{rem:measuring}
+The quantity needed is the spread of the sampler's own output at fixed state.
+Where $K$ parallel chains are already materialized as a
+$[K,\text{batch},d]$ tensor, $s_i(o)^2$ is its variance over the $K$ axis, and
+the two accumulators of \eqref{eq:hetopt} are batch means of $s_i(o)$ and
+$1/s_i(o)$. Note this is not the same as the variance \emph{across} the $d$
+action components at a single sample, which is what an ``action variance''
+diagnostic typically reports; that statistic measures the shape of one action
+vector, not the policy's conditional width, and is not the quantity here.
+Since $K$ is finite, both accumulators need the correction of
+Section~\ref{sec:finite}; Recipe~\ref{rec:estimate} is the complete procedure.
+\end{remark}
+
+\subsection{Finite samples: turning the cost into a loss}
+\label{sec:finite}
+
+Proposition~\ref{prop:hetero} averaged \eqref{eq:cosh} over a population of
+states and coordinates, treating $s$ as \emph{known} at each. It never is: the
+conditional width must itself be estimated, from the $K$ actions the sampler
+draws at a given state. Section~\ref{sec:robust} priced a wrong $\hat s$ and
+Proposition~\ref{prop:hetero} priced a single $\hat s$ for a spread-out
+population; neither yet prices \emph{not knowing} $s$. Doing so is what converts
+\eqref{eq:cosh} from a diagnostic into an objective one can minimize.
+
+The observation that makes this easy is that $\cosh(\log s-\log\hat s)$ depends
+on $(s,\hat s)$ only through the log-error, so \emph{it cannot tell where that
+error came from}. A log-error of $0.3$ costs $1.045$ whether it arose because
+states genuinely differ in width or because $\hat s$ was computed from five
+samples at one state. Heterogeneity and estimation noise are quoted in the same
+currency, and an accounting that charges for one but not the other is incomplete.
+
+\begin{proposition}[the Bayes rule is the ratio of the $\pm1$ moments]
+\label{prop:bayes}
+Let $Q$ be any law expressing one's uncertainty about $s$: a population, a
+sampling distribution, or a posterior. Then
+\begin{equation}
+  \E_Q\big[\cosh(\log s-\log\hat s)\big]
+  \;=\;\tfrac12\Big(\frac{M_+}{\hat s}+\hat s\,M_-\Big),
+  \qquad M_\pm=\E_Q\big[s^{\pm1}\big],
+  \label{eq:bayesrisk}
+\end{equation}
+which is \eqref{eq:hetcost} verbatim. It is minimized at
+$\hat s_\star=\sqrt{M_+/M_-}$ with value $\sqrt{M_+M_-}$, and at that point the
+two terms of \eqref{eq:bayesrisk} are equal --- the rule balances the price of
+over- against under-estimating. It is in general \emph{not} the mean, median or
+mode of $Q$, and it exists only if both $M_+$ and $M_-$ are finite.
+\end{proposition}
+
+So the recipe for turning the cost into a loss is: \textbf{name the uncertainty,
+take its $\pm1$ moments, form the ratio}. Nothing beyond the algebra of
+Proposition~\ref{prop:hetero} is needed; what changes is only which $Q$ the
+expectation is taken over. Two choices of $Q$ matter here, and they answer
+different questions.
+
+\subsubsection*{$Q$ as a posterior: the estimate to use at one state}
+
+Let $a_1,\dots,a_K$ be iid draws of one action coordinate at a fixed state, and
+$\hat s_K^2=\frac{1}{K-1}\sum_j(a_j-\bar a)^2$ the usual sample variance. If the
+conditional is Gaussian then $\nu\hat s_K^2/s^2\sim\chi^2_\nu$ with
+$\nu=K-1$ degrees of freedom.
+
+\begin{proposition}[finite-$K$ Bayes estimate and its risk]
+\label{prop:finiteK}
+Under the scale-invariant prior $p(s)\propto1/s$ (flat in $\log s$, the natural
+choice since the loss depends only on $\log s$), the posterior of $1/s^2$ is
+$\mathrm{Gamma}(\nu/2,\ \nu\hat s_K^2/2)$, whence
+\begin{equation}
+  M_+=\hat s_K\sqrt{\tfrac\nu2}\,\frac{\Gamma(\frac{\nu-1}{2})}{\Gamma(\frac\nu2)},
+  \qquad
+  M_-=\frac{1}{\hat s_K}\sqrt{\tfrac2\nu}\,\frac{\Gamma(\frac{\nu+1}{2})}{\Gamma(\frac\nu2)},
+\end{equation}
+and therefore, using $\Gamma(\frac{\nu+1}{2})=\frac{\nu-1}{2}\Gamma(\frac{\nu-1}{2})$,
+\begin{equation}
+  \boxed{\;
+  \hat s_\star=\hat s_K\sqrt{\frac{\nu}{\nu-1}},
+  \qquad
+  \frac{\mathcal L(\hat s_\star)}{D_{\min}}=\sqrt{f(\nu)},
+  \quad
+  f(\nu)=\frac{\Gamma(\frac{\nu-1}{2})\Gamma(\frac{\nu+1}{2})}{\Gamma(\frac{\nu}{2})^{2}}
+  \;}
+  \label{eq:finiteK}
+\end{equation}
+with $\sqrt{f(\nu)}=1+\frac{1}{4\nu}+O(\nu^{-2})$. The risk does not depend on the
+observed $\hat s_K$: the factors of $\hat s_K$ cancel in $M_+M_-$.
+\end{proposition}
+
+Three things to read off \eqref{eq:finiteK}.
+
+\begin{itemize}\itemsep2pt
+  \item \textbf{The optimal estimate \emph{inflates} the sample width.} Not
+  because the sample variance is biased --- $\hat s_K^2$ is unbiased --- but
+  because the posterior of $\log s$ is right-skewed, and \eqref{eq:bayesrisk}
+  charges symmetrically in $\log s$. Plugging in $\hat s_K$ under-shifts.
+  \item \textbf{$K\ge3$ is required for this route.} At $\nu=1$,
+  $\Gamma(\frac{\nu-1}{2})$ diverges: $M_+=\infty$, the risk is infinite, and no
+  finite $\hat s$ is admissible. The obstruction is specific to the $-1$
+  moment, not to small samples as such --- a per-state \emph{variance} is
+  perfectly well behaved at $K=2$, and so is the log-space route of
+  Proposition~\ref{prop:logroute} below, which is why that route is the one to
+  prefer.
+  \item \textbf{The penalty falls off fast.} $\sqrt{f(\nu)}$ is $1.25$ at $K=3$,
+  $1.085$ at $K=5$, $1.036$ at $K=9$ and $1.017$ at $K=17$
+  (Table~\ref{tab:finiteK}). Since not shifting at all typically costs
+  $1.2$--$1.4$, $K$ of five to nine already recovers most of the available gain,
+  and there is little reason to go further.
+\end{itemize}
+
+\subsubsection*{$Q$ as a sampling law: the global shift, debiased}
+
+For the \emph{global} shift of Proposition~\ref{prop:hetero} one does not want a
+per-state posterior; one wants to accumulate $M_\pm$ across states and
+coordinates. The natural estimator replaces $s$ by $\hat s_K$ in both
+accumulators, and this needs a correction, because
+\begin{equation}
+  \E[\hat s_K]=c(\nu)\,s,
+  \quad
+  \E[1/\hat s_K]=\frac{c'(\nu)}{s},
+  \qquad
+  c(\nu)=\sqrt{\tfrac2\nu}\frac{\Gamma(\frac{\nu+1}{2})}{\Gamma(\frac\nu2)},
+  \quad
+  c'(\nu)=\sqrt{\tfrac\nu2}\frac{\Gamma(\frac{\nu-1}{2})}{\Gamma(\frac\nu2)} .
+  \label{eq:chibias}
+\end{equation}
+The two biases run in \emph{opposite} directions --- $c(\nu)<1$ while
+$c'(\nu)>1$, since $\hat s_K$ understates $s$ on average while $1/\hat s_K$
+overstates $1/s$ --- so they compound in the ratio and partially cancel in the
+product. Since $c(\nu)c'(\nu)=f(\nu)$ and $c(\nu)/c'(\nu)=(\nu-1)/\nu$:
+
+\begin{corollary}[what to correct, and by how much]
+\label{cor:debias}
+Write $\widehat{M}_\pm$ for the accumulators built from raw sample widths
+$\hat s_K$. Then
+\begin{equation}
+  \sqrt{\frac{\widehat M_+}{\widehat M_-}}
+  =\hat s_\star\sqrt{\frac{\nu-1}{\nu}},
+  \qquad
+  \sqrt{\widehat M_+\widehat M_-}
+  =\sqrt{M_+M_-}\cdot\sqrt{f(\nu)} .
+  \label{eq:debias}
+\end{equation}
+So the shift is recovered by multiplying by $\sqrt{\nu/(\nu-1)}$ --- the
+\emph{same} factor as \eqref{eq:finiteK}, so one correction serves both readings
+--- and the heterogeneity floor by dividing by $\sqrt{f(\nu)}$. Without the
+second correction the measured floor is inflated by finite $K$ and
+Corollary~\ref{cor:decide} will over-report the case for a state-dependent shift.
+\end{corollary}
+
+The distinction matters operationally. Estimation noise in a \emph{global} shift
+averages out over states, so the $\sqrt{f(\nu)}$ term is a bias to be removed
+from the reported floor, not a cost that is actually paid. In a \emph{per-state}
+shift there is no averaging and $\sqrt{f(\nu)}$ is paid in full at every state.
+That is the trade-off the next subsection has to resolve.
+
+\subsubsection*{The route to actually use: accumulate in log space}
+
+Proposition~\ref{prop:bayes} is what identifies the log-error as the thing that
+costs; once that is known, the point estimate needs no further decision theory.
+A global shift only ever wanted a location statistic for $\log s$, and there is a
+simpler and better-behaved estimator of it than $\widehat M_\pm$.
+
+\begin{proposition}[the log-space accumulators]
+\label{prop:logroute}
+With $\nu\hat s_K^2/s^2\sim\chi^2_\nu$,
+\begin{equation}
+  \boxed{\;
+  \E\big[\log\hat s_K\big]=\log s+\beta(\nu),
+  \qquad
+  \beta(\nu)=\tfrac12\big(\psi(\nu/2)-\log(\nu/2)\big),
+  \qquad
+  \Var\big(\log\hat s_K\big)=\kappa(\nu),
+  \;}
+  \label{eq:logroute}
+\end{equation}
+both exactly, with $\psi$ the digamma function and $\kappa$ as in
+\eqref{eq:kappa}. Hence tracking only the first two moments of
+$\log\hat s_i(o)$ over states and coordinates gives
+\begin{equation}
+  \log\hat s_\star=\E\big[\log\hat s_K\big]-\beta(\nu),
+  \qquad
+  \tau^2=\Var\big(\log\hat s_K\big)-\kappa(\nu),
+  \qquad
+  \text{floor}=e^{\tau^2/2}.
+  \label{eq:logaccum}
+\end{equation}
+\end{proposition}
+
+Three advantages over $\widehat M_\pm$, and one caveat.
+
+\begin{itemize}\itemsep2pt
+  \item \textbf{Both corrections are exact additive constants} in the coordinate
+  one is averaging in, and neither assumes anything about the population of $s$.
+  The $\widehat M_\pm$ route instead needs two multiplicative corrections
+  \eqref{eq:debias} applied to two separate accumulators.
+  \item \textbf{One accumulator pair does both jobs.} The mean gives the shift
+  and the variance gives $\tau^2$, hence the decision statistic of
+  Corollary~\ref{cor:decide}, with no extra bookkeeping.
+  \item \textbf{It is admissible at $K=2$.} $\beta(1)=-0.635$ and
+  $\kappa(1)=1.234$ are finite, so two actions per state suffice for a global
+  shift; the per-state noise is large ($\mathrm{sd}=1.11$ in $\log$) but it is
+  unbiased and averages out over states. Nothing in
+  Proposition~\ref{prop:finiteK} survives at $\nu=1$.
+  \item \textbf{Caveat: it targets the geometric mean}, $e^{\E[\log s]}$, not
+  $\sqrt{M_+/M_-}$. Writing $K_{\log s}$ for the cumulant generating function of
+  $\log s$, $\log\sqrt{M_+/M_-}=\tfrac12[K_{\log s}(1)-K_{\log s}(-1)]$, so the
+  two differ by the odd cumulants above the first:
+  \begin{equation}
+    \log\sqrt{M_+/M_-}-\E[\log s]
+    =\frac{\kappa_3}{6}+\frac{\kappa_5}{120}+\cdots,
+    \label{eq:oddcum}
+  \end{equation}
+  vanishing whenever $\log s$ is symmetric --- in particular for the log-normal
+  case of Remark~\ref{rem:lognormal}, where the two coincide exactly. What that
+  gap costs is settled exactly by Proposition~\ref{prop:selfsim} below.
+\end{itemize}
+
+The geometric mean is therefore \emph{not} the minimizer of the $\cosh$ cost
+under heterogeneity, and it is worth being precise about what it is instead, and
+about what the substitution costs. Both follow from one identity.
+
+\begin{proposition}[the risk in $\log\hat s$ is again the $\cosh$ law]
+\label{prop:selfsim}
+For any law of $s$ with finite $M_\pm$, write $\beta=\log\hat s$ and
+$\beta_\star=\log\sqrt{M_+/M_-}$. Then \eqref{eq:bayesrisk} is
+\begin{equation}
+  \boxed{\;
+  \mathcal L(\beta)\;=\;\sqrt{M_+M_-}\,\cosh\!\big(\beta-\beta_\star\big)
+  \;}
+  \label{eq:selfsim}
+\end{equation}
+\emph{exactly}. Consequently the optimum is characterized by
+\begin{equation}
+  \E\big[\sinh(\log s-\beta_\star)\big]=0,
+  \label{eq:sinhbalance}
+\end{equation}
+and \textbf{any} summary statistic $\beta$ costs exactly $\cosh(\beta-\beta_\star)$
+relative to the optimum. In particular the geometric mean costs exactly
+$\cosh(\Delta)$, with $\Delta=\beta_\star-\E[\log s]$ given by \eqref{eq:oddcum}.
+\end{proposition}
+
+\begin{proof}
+Write $M_\pm=\sqrt{M_+M_-}\,e^{\pm\beta_\star}$, which is just the definition of
+$\beta_\star$ together with $\sqrt{M_+M_-}$, and substitute into
+$\tfrac12(e^{-\beta}M_++e^{\beta}M_-)$. Equation \eqref{eq:sinhbalance} is
+$\mathcal L'(\beta_\star)=0$ written before the moments are collected.
+\end{proof}
+
+So Section~\ref{sec:robust}'s $\cosh$ law is self-similar: the penalty for a
+misplaced \emph{summary of a population} has the same form as the penalty for a
+misplaced $\hat s$ against a single $s$, because it is the same statement.
+
+\begin{remark}[why the optimum is not the geometric mean]
+\label{rem:whynotgeo}
+Compare the two stationarity conditions: the geometric mean solves
+$\E[\log s-\beta]=0$, i.e.\ it minimizes the \emph{squared} log-error, whereas
+\eqref{eq:sinhbalance} weights deviations by $\sinh x=x+x^3/6+\cdots$. The
+$\cosh$ cost therefore charges large log-errors far more than a quadratic does,
+and its optimum is pulled toward the \emph{longer tail} of $\log s$ --- it buys
+insurance against the states that would otherwise be badly mis-scheduled. Right-
+skewed $\log s$ gives $\Delta>0$, i.e.\ a shift above the geometric mean.
+Numerically, with $\Delta\approx\gamma_1\tau^3/6$ to leading order in the
+log-skewness $\gamma_1$:
+\begin{center}\small
+\begin{tabular}{llll}
+\toprule
+$\tau$ & $\gamma_1$ & $\cosh\Delta$ (cost of geometric mean)
+  & floor $e^{\tau^2/2}$ \\
+\midrule
+$0.6$ & $1$ & $1.0007$ & $1.197$ \\
+$0.6$ & $2$ & $1.0043$ & $1.197$ \\
+$1.0$ & $1$ & $1.020$  & $1.649$ \\
+$1.0$ & $2$ & $1.328$  & $1.649$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+So the substitution is harmless in the moderate regime but \emph{not}
+unconditionally: at large $\tau$ and strong skew it becomes comparable to the
+floor it is approximating. Note also that $\kappa_3/6$ is only the leading term
+--- for a heavy right tail (log-skewness $2.8$) the true $\Delta=0.187$ against
+$\kappa_3/6=0.103$.
+\end{remark}
+
+\begin{remark}[measuring $\Delta$ for free]
+\label{rem:measuredelta}
+One need not assume the approximation is safe. If $\widehat M_\pm$ are
+accumulated alongside $\E[\log\hat s_K]$ --- three running scalars rather than
+two, and available whenever $K\ge3$ --- then
+$\Delta=\log\sqrt{\widehat M_+/\widehat M_-}+\tfrac12\log\frac{\nu}{\nu-1}
+-\E[\log\hat s_K]+\beta(\nu)$ estimates the asymmetry of $\log s$ directly, and by
+Proposition~\ref{prop:selfsim} $\cosh\Delta$ is exactly what the geometric mean
+is costing. Report it; switch to $\sqrt{\widehat M_+/\widehat M_-}$ only if it is
+materially above $1$. This keeps the log-space route as the default while making
+its one approximation an observable rather than an assumption.
+\end{remark}
+
+\begin{remark}[two different corrections, two different questions]
+\label{rem:twocorrections}
+It is worth noting that $e^{-\beta(\nu)}\neq\sqrt{\nu/(\nu-1)}$: at $K=3$ they
+are $1.335$ and $1.414$. They are not competing estimates of the same thing.
+$\sqrt{\nu/(\nu-1)}$ is the Bayes hedge for \emph{one state's} $s$ under
+\eqref{eq:bayesrisk}, and must pay for the posterior spread at that state;
+$e^{-\beta(\nu)}$ merely makes $\log\hat s_K$ unbiased so that an average over
+many states converges to $\E[\log s]$, the spread having been averaged away.
+Using the former inside a global average over-shifts by
+$\tfrac12\log\frac{\nu}{\nu-1}-\beta(\nu)$, a factor $1.06$ at $K=3$.
+\end{remark}
+
+\subsubsection*{Combining the two: shrinkage in log space}
+
+Both effects are variances of $\log s$, so they simply add. Write
+\begin{equation}
+  \log\hat s_K(o)=\log s(o)+\epsilon,
+  \qquad
+  \Var(\epsilon)=\kappa(\nu):=\tfrac14\psi_1(\nu/2),
+  \label{eq:kappa}
+\end{equation}
+$\psi_1$ being the trigamma function (unrelated to the polar angle $\psi$ of
+\eqref{eq:sumsq}, which carries no subscript); $\kappa(\nu)\to1/(2\nu)$ for large
+$\nu$, but the limit is poor where it matters --- at $K=3$ the exact
+$\kappa=0.411$ against $1/(2\nu)=0.25$, understating the noise by $39\%$ --- so
+use the closed form. With $\tau^2=\Var(\log s)$ as in
+Remark~\ref{rem:lognormal}, the three candidate policies cost, in the log-normal
+reading,
+\begin{equation}
+  \underbrace{e^{\tau^2/2}}_{\text{global}},
+  \qquad
+  \underbrace{e^{\kappa(\nu)/2}}_{\text{raw per-state}},
+  \qquad
+  \underbrace{e^{h/2}}_{\text{shrunk per-state}},
+  \quad
+  h=\Big(\tfrac{1}{\tau^2}+\tfrac{1}{\kappa(\nu)}\Big)^{-1},
+  \label{eq:threecosts}
+\end{equation}
+the last obtained by shrinking toward the global geometric mean,
+\begin{equation}
+  \boxed{\;
+  \log\hat s(o)=\log\hat s_\star+w\big(\log\hat s_K(o)-\log\hat s_\star\big),
+  \qquad
+  w=\frac{\tau^2}{\tau^2+\kappa(\nu)} .
+  \;}
+  \label{eq:shrink}
+\end{equation}
+
+\begin{corollary}[shrinkage is never the wrong choice]
+\label{cor:shrink}
+$h<\min(\tau^2,\kappa(\nu))$ strictly, so \eqref{eq:shrink} beats both the global
+shift and the raw per-state estimate for every $\tau$ and every $K$. It
+degenerates gracefully at both ends: $w\to0$ recovers the global shift when
+samples are few or the population is homogeneous, and $w\to1$ recovers the raw
+per-state estimate when $K$ is large. Raw per-state estimates beat a global shift
+only when $\kappa(\nu)<\tau^2$, i.e.\ $\tau>\sqrt{\kappa(\nu)}$, which is
+$0.64$ at $K=3$ and $0.27$ at $K=9$ --- so with few samples the ``more
+adaptive'' choice is often the worse one, and \eqref{eq:shrink} is what removes
+the need to guess.
+\end{corollary}
+
+\begin{table}[t]
+  \centering
+  \small
+  \begin{tabular}{rrrrrr}
+    \toprule
+    $K$ & $\nu$ & $\sqrt{\nu/(\nu-1)}$ & $\sqrt{f(\nu)}$ & $\kappa(\nu)$
+        & $\sqrt{\kappa(\nu)}$ \\
+    & & \eqref{eq:finiteK} shift & \eqref{eq:finiteK} penalty & \eqref{eq:kappa}
+        & break-even $\tau$ \\
+    \midrule
+    2  & 1  & $\infty$ & $\infty$ & --      & --     \\
+    3  & 2  & 1.4142   & 1.2533   & 0.4112  & 0.6413 \\
+    4  & 3  & 1.2247   & 1.1284   & 0.2337  & 0.4834 \\
+    5  & 4  & 1.1547   & 1.0854   & 0.1612  & 0.4015 \\
+    7  & 6  & 1.0954   & 1.0509   & 0.0987  & 0.3142 \\
+    9  & 8  & 1.0690   & 1.0362   & 0.0710  & 0.2664 \\
+    17 & 16 & 1.0328   & 1.0168   & 0.0333  & 0.1824 \\
+    33 & 32 & 1.0160   & 1.0081   & 0.0161  & 0.1270 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Finite-sample constants. Column 3 multiplies the raw sample width (or
+  the raw $\sqrt{\widehat M_+/\widehat M_-}$) to give the estimate to use;
+  column 4 is the residual penalty and also the factor by which a measured
+  heterogeneity floor is inflated; column 6 is the population spread above which
+  a raw per-state shift beats a global one. $K=2$ is inadmissible:
+  the $-1$ moment diverges.}
+  \label{tab:finiteK}
+\end{table}
+
+\begin{recipe}[estimating $\hat s$ from $K$ samples per state]
+\label{rec:estimate}
+With the sampler's $K$ actions per state materialized as a $[K,\text{batch},d]$
+tensor, and $\nu=K-1$:
+\begin{enumerate}\itemsep1pt
+  \item Per state and coordinate, $\hat s_i(o)^2=$ variance over the $K$ axis
+  (\texttt{ddof}$=1$). Not over the $d$ axis (Remark~\ref{rem:measuring}).
+  \item Accumulate the running \emph{mean and variance of
+  $\log\hat s_i(o)$} over states and coordinates. Two scalars; nothing else is
+  needed.
+  \item Global shift and decision statistic by \eqref{eq:logaccum}:
+  $\hat s_\star=\exp(\E[\log\hat s_K]-\beta(\nu))$ and
+  $\tau^2=\Var(\log\hat s_K)-\kappa(\nu)$, both corrections being exact additive
+  constants.
+  \item Report the floor $e^{\tau^2/2}$. Below $\approx1.13$, stop and tune
+  $\hat s_\star$; above $\approx1.65$, go per-state via \eqref{eq:perstate} with
+  the shrinkage \eqref{eq:shrink}.
+\end{enumerate}
+Step 4 is the cheap experiment: it is a diagnostic computable at fixed $\hat s$,
+before anything is allowed to affect training. If $K\ge3$, accumulate
+$\widehat M_\pm$ as well and report $\cosh\Delta$ by
+Remark~\ref{rem:measuredelta}: that is exactly what step 3's geometric mean
+costs against the true optimum $\sqrt{M_+/M_-}$, and it is the only assumption in
+the procedure worth checking rather than trusting. Switch step 3 to
+$\sqrt{\widehat M_+/\widehat M_-}\cdot\sqrt{\nu/(\nu-1)}$ if it is materially
+above $1$.
+\end{recipe}
+
+\begin{remark}[what is still idealized]
+Two gaps between \eqref{eq:finiteK} and practice. The $\chi^2$ law assumes the
+$K$ draws are iid Gaussian at fixed $o$; a diffusion sampler's outputs are
+neither exactly Gaussian nor, if the chains share noise, exactly independent, so
+$\nu$ is an upper bound on the effective degrees of freedom and the corrections
+of Table~\ref{tab:finiteK} are best read as lower bounds. And $\tau^2$ estimated
+by step 2 of Recipe~\ref{rec:estimate} conflates genuine state dependence with
+anisotropy across the $d$ coordinates; the two call for different remedies
+(\S\ref{sec:beyond} versus \S\ref{sec:perstate}), so it is worth accumulating
+per-coordinate and pooled versions separately.
+\end{remark}
+
+\subsection{Making the correction state-dependent}
+\label{sec:perstate}
+
+When Corollary~\ref{cor:decide} says a global scalar is inadequate, note that
+Proposition~\ref{prop:metric} leaves two ways to fix the ratio $\sig_k/s$: move
+the numerator, or move the denominator. The schedule is usually a compile-time
+constant, but the data is not. Standardizing per state,
+\begin{equation}
+  z_0=\frac{a-\hat\mu(o)}{\hat s(o)},
+  \qquad\text{diffuse } z_0 \text{ under the fixed target schedule},
+  \qquad a=\hat\mu(o)+\hat s(o)\,z_0,
+  \label{eq:perstate}
+\end{equation}
+realizes a \emph{per-state} translation of $\leff$ while the schedule itself
+never changes. This is the conditional version of the dataset-level normalizer of
+\cite{chi2023diffusion}, and by Proposition~\ref{prop:equiv} it is exactly a
+state-dependent shift. Its cost is an estimate of $\hat s(o)$ --- a small extra
+head, or a running per-state statistic --- and its benefit is a portion of the
+gap $\sqrt{M_+M_-}$ of Proposition~\ref{prop:hetero}: the whole gap only in the
+limit of a perfectly known $\hat s(o)$, and in practice the fraction that
+survives the estimation noise of \eqref{eq:threecosts}. Estimating $\hat s(o)$
+from $K$ samples per state and using it raw can be \emph{worse} than a global
+shift (Corollary~\ref{cor:shrink}); the shrinkage \eqref{eq:shrink} is what makes
+this step safe.
+
+\begin{remark}[why to sweep rather than trust, in online RL]
+Two caveats specific to policy learning. First, the criterion of
+Section~\ref{sec:transport} rewards fidelity to the target law, whereas in online
+RL some of the sampler's variance loss is doing useful work as exploration noise
+\cite{ren2024dppo}; sharpening the clean end of the schedule removes it. Second,
+$s_i(o)$ is a property of the \emph{current} policy and moves during training, so
+a frozen $\hat s$ is correct only for the window in which it was measured. Both
+argue for treating $\hat s$ as a swept hyperparameter whose optimum is informed,
+not determined, by \eqref{eq:hetopt}. The flatness of $\cosh$ is what makes this
+tolerable.
+\end{remark}
+
+\subsection{Standardizing in the architecture: preconditioning and reuse under a drifting scale}
+\label{sec:precond}
+
+The two realizations above put the correction in the \emph{data}: standardize
+the sample (\S\ref{sec:beyond}) or shift it per state (\S\ref{sec:perstate}).
+Both bake $\hat s$ into the training target, so the previous remark's second
+caveat --- that $s_i(o)$ drifts as the policy trains --- forces a moving target
+and, in the naive reading, periodic retraining. A third realization removes the
+offset \emph{inside the network} and makes tracking a drifting $\hat s$ exactly
+free. It is the preconditioning of \cite{karras2022elucidating}, read through the
+lens of \eqref{eq:shift0}.
+
+Work in the signal frame $y_k:=x_k/\sqrt{\abar_k}=x_0+\sig_k\varepsilon$ on
+centered data (the mean is removed by the exact coordinate shift of
+\S\ref{sec:mean} and added back at the end). Write the denoiser as
+\begin{equation}
+  \hat x_0 \;=\; D(y,\sig)\;=\;c_{\rm skip}(\sig)\,y\;+\;c_{\rm out}(\sig)\,
+  f_\theta\!\big(c_{\rm in}(\sig)\,y;\;\leff\big),
+  \qquad
+  c_{\rm in}=\tfrac{1}{\sqrt{s^2+\sig^2}},\;\;
+  c_{\rm skip}=\tfrac{s^2}{s^2+\sig^2},\;\;
+  c_{\rm out}=\tfrac{s\,\sig}{\sqrt{s^2+\sig^2}},
+  \label{eq:precond}
+\end{equation}
+where --- and this is the part that matters here --- the network's noise argument
+is the effective log-SNR $\leff=-2\log(\sig/s)$ of \eqref{eq:shift0}, not the bare
+$\sig$ or the step index. The three coefficients are fixed by demanding that the
+network input and its regression target each have unit variance at every $\sig$.
+
+\begin{proposition}[scale invariance of the preconditioned target]
+\label{prop:precond}
+Write $x_0=s\,u$ with $u$ the standardized shape (zero mean, unit variance) and
+$\rho=\sig/s$, so $\leff=-2\log\rho$. Under \eqref{eq:precond} both the network
+input and its regression target are functions of $(u,\varepsilon,\rho)$ alone:
+\begin{equation}
+  c_{\rm in}\,y=\frac{u+\rho\,\varepsilon}{\sqrt{1+\rho^2}},
+  \qquad
+  \frac{x_0-c_{\rm skip}\,y}{c_{\rm out}}=\frac{\rho\,u-\varepsilon}{\sqrt{1+\rho^2}}.
+  \label{eq:precond-inv}
+\end{equation}
+Hence the supervised problem $f_\theta$ solves --- map the former to the
+conditional mean of the latter at each $\leff$ --- depends on the data only
+through the law of $u$ and the value $\rho$, never on $s$. Its minimizer
+$f_\theta^\star$ is invariant to the scale.
+\end{proposition}
+
+\begin{proof}
+Substitute $x_0=su$ and $\sig=\rho s$ into \eqref{eq:precond}. Both denominators
+are $\sqrt{s^2+\sig^2}=s\sqrt{1+\rho^2}$, and every numerator carries one power of
+$s$, so $s$ cancels in each ratio, giving \eqref{eq:precond-inv}. The conditioning
+$\leff=-2\log\rho$ carries no further $s$. The population risk at each $\leff$ is
+thus a functional of the law of $(u,\varepsilon)$ only, and so is its minimizer.
+\end{proof}
+
+Equivalently, the optimal denoiser is homogeneous, $D(y;s)=s\,D_1(y/s)$ with $D_1$
+the fixed $s{=}1$ denoiser: preconditioning \eqref{eq:precond} is exactly the
+reparametrization that exposes this homogeneity to the optimizer, in the same way
+Recipe~\ref{rec:main} exposes it to the sampler grid.
+
+\begin{corollary}[reuse under a drifting scale]
+\label{cor:reuse}
+Let $\hat s$ (per coordinate, and $\hat\mu$ for the mean) be maintained online.
+Updating it between steps recomputes only $c_{\rm in},c_{\rm skip},c_{\rm out}$
+and the $\leff$ grid; by Proposition~\ref{prop:precond} the weights $\theta$
+remain valid --- indeed remain the same optimum. There is no retraining and no
+distribution shift for the network. Because the modeled clean law is
+$D(\cdot;\hat s)=\hat s\,D_1(\cdot/\hat s)$, changing $\hat s$ moves no
+probability mass the network must relearn: it is an exact reparametrization in
+the sense of Recipe~\ref{rec:main}, so a policy defined through the sampler stays
+valid across the update.
+\end{corollary}
+
+\begin{remark}[three ways to remove the same offset]
+The $2\log s$ of \eqref{eq:shift0} can be taken out on the sampler grid
+(Recipe~\ref{rec:main}: shift which $\lambda$'s are visited), in the data
+(\S\ref{sec:beyond}, \S\ref{sec:perstate}: diffuse $(a-\hat\mu)/\hat s$), or in
+the architecture (\eqref{eq:precond}: precondition and condition on $\leff$). The
+three agree when $s$ is known and fixed. Preconditioning is the only one that is
+at once per-$\sig$, per-coordinate --- replace $s$ by $\mathrm{diag}(s_i)$ and
+$u=\Sigma^{-1/2}(x_0-\mu)$, everything staying diagonal by \eqref{eq:eig} --- and
+free to track a drifting $\hat s$ (Corollary~\ref{cor:reuse}). Two boundaries are
+worth stating. First, the invariance is to scale and mean \emph{only}: if the
+standardized shape law of $u$ itself drifts, as it does while the policy improves,
+that is genuine new signal the network must learn, preconditioning
+notwithstanding. Second, it requires conditioning on $\leff$; a network keyed to
+the step index or to bare $\sig$ forfeits Proposition~\ref{prop:precond} the
+instant $s$ changes, because the same key then denotes a different $\rho$.
+\end{remark}
+
+\section{A different loss, a different summary: the advantage normalizer}
+\label{sec:advnorm}
+
+Proposition~\ref{prop:hetero} answered a population question: given one true
+$s(o)$ per state and a budget of one global scalar, which scalar? The answer was
+dictated entirely by the shape of the penalty, $\cosh$ of a log-ratio. A guided
+diffusion policy carries a second global scalar of exactly this type --- the
+divisor $\hat\sigma$ that normalizes the advantage before it tilts the policy ---
+and it is worth working out, because the loss is different and so, it turns out,
+is the summary. Nothing about ``average the per-state estimates in the log''
+survives the change. What survives is the method: identify the coordinate in
+which the cost is natural, then minimize.
+
+\subsection{The tilt is an exponential family, so the cost is a Bregman divergence}
+
+Let $\pi(a|o)$ be the current policy, $Q(o,a)$ the critic and $\beta$ the
+guidance strength, and consider the tilted target
+\begin{equation}
+  p_{\hat\sigma}(a|o)\;\propto\;\pi(a|o)\,
+  \exp\!\Big(\frac{\beta}{\hat\sigma}\,Q(o,a)\Big).
+  \label{eq:tilt}
+\end{equation}
+Two observations fix the entire problem. First, \eqref{eq:tilt} is a natural
+exponential family in $\eta=\beta/\hat\sigma$, with base measure $\pi(\cdot|o)$,
+sufficient statistic $Q(o,\cdot)$ and log-partition
+\begin{equation}
+  \psi_o(\eta)=\log\E_{a\sim\pi(\cdot|o)}\big[e^{\eta Q(o,a)}\big],
+  \label{eq:cgf}
+\end{equation}
+the cumulant generating function of $Q$ \emph{at fixed $o$}. Second, only that
+conditional law can matter: replacing $Q(o,a)$ by $Q(o,a)+c(o)$ multiplies
+numerator and denominator of \eqref{eq:tilt} by the same $e^{\beta c(o)/\hat\sigma}$
+and leaves $p_{\hat\sigma}$ untouched. \textbf{The across-state spread of $Q$ is
+pure gauge.} A normalizer built from the spread of $Q$ pooled over a batch of
+states is therefore measuring the wrong quantity --- and by a factor
+$\sqrt{1+\Sigma^2/\sigma_Q^2}$ that \emph{grows} as the critic's range $\Sigma$
+across states grows, so it silently anneals the tilt away over training.
+
+\begin{proposition}[cost of a wrong normalizer]
+\label{prop:advkl}
+Write $p_\eta$ for \eqref{eq:tilt}. For any $Q$ with finite CGF,
+\begin{equation}
+  \mathrm{KL}(p_{\eta_1}\|p_{\eta_2})
+  =\psi_o(\eta_2)-\psi_o(\eta_1)-(\eta_2-\eta_1)\psi_o'(\eta_1),
+  \label{eq:bregman}
+\end{equation}
+the Bregman divergence generated by the CGF, with $\psi_o'(\eta_1)=\E_{p_{\eta_1}}[Q]$.
+If moreover $Q$ is Gaussian under $\pi(\cdot|o)$ with standard deviation
+$\sigma_Q(o)$, then $\psi_o$ is quadratic, \eqref{eq:bregman} is exactly
+quadratic and symmetric in its two arguments, and with $\eta_1=\beta/\hat\sigma$,
+$\eta_2=\beta/\sigma_Q$,
+\begin{equation}
+  \boxed{\;
+  \mathrm{KL}\big(p_{\hat\sigma}\,\|\,p_\star\big)
+  =\frac{\beta^2}{2}\Big(\frac{\sigma_Q}{\hat\sigma}-1\Big)^{2}
+  =\frac{\beta^2}{2}\big(e^{u}-1\big)^{2},\qquad
+  u=\log\frac{\sigma_Q}{\hat\sigma}.
+  \;}
+  \label{eq:advcost}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+$\log(p_{\eta_1}/p_{\eta_2})=(\eta_1-\eta_2)Q-\psi_o(\eta_1)+\psi_o(\eta_2)$;
+take $\E_{p_{\eta_1}}$ and use $\psi_o'(\eta_1)=\E_{p_{\eta_1}}[Q]$. For Gaussian
+$Q$, $\psi_o(\eta)=\eta\mu_Q+\tfrac12\eta^2\sigma_Q^2$, whose Bregman divergence
+is $\tfrac12\sigma_Q^2(\eta_2-\eta_1)^2$; substituting the two $\eta$'s cancels
+$\sigma_Q^2$ against $\beta^2(1/\hat\sigma-1/\sigma_Q)^2$.
+\end{proof}
+
+\begin{remark}[why $\sigma_Q$ is the target: it equalizes the KL spend]
+For Gaussian $Q$ the tilt is a pure mean shift, and the ideally normalized
+target satisfies $\mathrm{KL}(p_\star\|\pi)=\beta^2/2$ \emph{at every state,
+independent of $\sigma_Q$}. That is what advantage normalization is for:
+dividing by the within-state $\sigma_Q(o)$ is exactly the choice that turns
+$\beta$ into a state-independent KL budget. Equation~\eqref{eq:advcost} then says
+that a wrong divisor spends the wrong budget at that state.
+\end{remark}
+
+\begin{remark}[the geometry is \emph{not} the $\cosh$ geometry]
+\label{rem:advasym}
+$(e^u-1)^2$ is not symmetric in $u$, and the asymmetry is the operative fact. As
+$\hat\sigma\to\infty$ we get $\eta\to0$, $p_{\hat\sigma}\to\pi$, and the cost
+saturates at
+\begin{equation}
+  \sup_{u<0}\ \frac{\beta^2}{2}\big(e^u-1\big)^2=\frac{\beta^2}{2}
+  =\mathrm{KL}(\pi\|p_\star),
+\end{equation}
+so \emph{under}-tilting can do no worse than abandoning the tilt altogether.
+Over-tilting is unbounded, growing like $e^{2u}$: at $u=\pm1$ the two costs are
+$2.95$ and $0.40$, at $u=\pm2$ they are $40.8$ and $0.75$. Where a wrong $\hat s$
+is penalized evenhandedly by $\cosh$, a wrong $\hat\sigma$ must be erred on the
+\emph{high} side.
+\end{remark}
+
+\subsection{The population minimizer is the contraharmonic mean}
+
+\begin{proposition}
+\label{prop:contraharm}
+Let $\sigma_Q(o)$ vary across states with $\E[\sigma_Q^2]<\infty$. The single
+global divisor minimizing $\E_o[\mathrm{KL}]$ under \eqref{eq:advcost} is the
+\emph{contraharmonic mean}
+\begin{equation}
+  \boxed{\;\hat\sigma_\star=\frac{\E[\sigma_Q^2]}{\E[\sigma_Q]}
+  =\E[\sigma_Q]\big(1+\mathrm{CV}^2\big)\;}
+  \qquad
+  \mathrm{CV}=\frac{\mathrm{sd}(\sigma_Q)}{\E[\sigma_Q]},
+  \label{eq:contraharm}
+\end{equation}
+and the residual risk at that choice is
+\begin{equation}
+  \E_o[\mathrm{KL}]_\star=\frac{\beta^2}{2}\cdot\frac{\mathrm{CV}^2}{1+\mathrm{CV}^2}.
+  \label{eq:advfloor}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Substitute $x=1/\hat\sigma$. The risk is
+$\tfrac{\beta^2}{2}\big(\E[\sigma_Q^2]x^2-2\E[\sigma_Q]x+1\big)$, a convex
+parabola in $x$ minimized at $x_\star=\E[\sigma_Q]/\E[\sigma_Q^2]$, which is
+\eqref{eq:contraharm}. Its value is
+$\tfrac{\beta^2}{2}\big(1-\E[\sigma_Q]^2/\E[\sigma_Q^2]\big)$, and
+$\E[\sigma_Q]^2/\E[\sigma_Q^2]=1/(1+\mathrm{CV}^2)$ by definition of $\mathrm{CV}$;
+the second form of \eqref{eq:contraharm} is the same identity.
+\end{proof}
+
+Unlike the discussion following Proposition~\ref{prop:selfsim}, the aggregation
+is not in question here. KL is additive over states, so $\E_o$ under the state
+distribution's own weights simply \emph{is} the KL between the joint policies;
+there is no equal-weight-versus-$s^2$-weight choice to make.
+
+\begin{remark}[three means, and which of them over-tilt]
+\label{rem:threemeans}
+By the power-mean inequality the arithmetic, quadratic and contraharmonic means
+are ordered,
+\begin{equation}
+  \E[\sigma_Q]\;\le\;\sqrt{\E[\sigma_Q^2]}\;\le\;\frac{\E[\sigma_Q^2]}{\E[\sigma_Q]},
+  \qquad\text{in the ratios } 1:\sqrt{1+\mathrm{CV}^2}:1+\mathrm{CV}^2 .
+\end{equation}
+Both of the first two are therefore \emph{too small}: they over-tilt, which by
+Remark~\ref{rem:advasym} is the expensive direction. This matters in practice
+because $\sqrt{\E_o \Var_K(Q)}$ --- the natural thing to write down from a batch
+of per-state sample variances --- is the quadratic mean, short of the optimum by
+exactly $\sqrt{1+\mathrm{CV}^2}$. Excess over the minimum \eqref{eq:advfloor}:
+\begin{center}\small
+\begin{tabular}{lccc}
+\toprule
+$\mathrm{CV}$ & $\E_o[\mathrm{KL}]_\star/(\beta^2/2)$
+  & excess of $\sqrt{\E[\sigma_Q^2]}$ & excess of $\E[\sigma_Q]$ \\
+\midrule
+$0.2$ & $0.038$ & $+1.0\%$  & $+4.0\%$ \\
+$0.5$ & $0.200$ & $+5.6\%$  & $+25.0\%$ \\
+$1.0$ & $0.500$ & $+17.1\%$ & $+99.9\%$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{remark}
+
+\begin{corollary}[what to accumulate]
+\label{cor:advaccum}
+From $K$ draws of $Q$ at a fixed state let $\hat\sigma_K(o)$ be the sample
+standard deviation, $\nu=K-1$. Then $\E[\hat\sigma_K^2]=\sigma_Q^2$ by Bessel and
+$\E[\hat\sigma_K]=c_4(\nu)\sigma_Q$ with
+$c_4(\nu)=\sqrt{2/\nu}\,\Gamma(\tfrac{\nu+1}{2})/\Gamma(\tfrac\nu2)$, so running
+averages of $\hat\sigma_K$ and $\hat\sigma_K^2$ over states give
+\begin{equation}
+  \hat\sigma_\star=c_4(\nu)\,\frac{\overline{\hat\sigma_K^2}}{\overline{\hat\sigma_K}},
+  \qquad
+  \mathrm{CV}^2=c_4(\nu)^2\,
+  \frac{\overline{\hat\sigma_K^2}}{\overline{\hat\sigma_K}^{\,2}}-1 .
+  \label{eq:advaccum}
+\end{equation}
+Two accumulators in \emph{linear} space, both corrections exact multiplicative
+constants. Unlike the $M_-$ route of Corollary~\ref{cor:debias} nothing diverges
+at $K=2$, where $c_4(1)=\sqrt{2/\pi}=0.7979$.
+\end{corollary}
+
+As in \eqref{eq:logaccum}, unbiasedness is the only criterion that matters for
+either accumulator, and for the same reason: a running average over states kills
+estimator variance but passes estimator bias through untouched. Ignoring $c_4$
+at $K=2$ inflates $\hat\sigma$ by $1/c_4=1.25$, a $25\%$ under-tilt --- the cheap
+direction by Remark~\ref{rem:advasym}, but free to fix.
+
+\begin{remark}[the two scalars, side by side]
+\label{rem:twoscalars}
+The contrast is the point of this section: the same population question, asked
+under two different losses, gives two different summaries and two different
+accumulators.
+\begin{center}\small
+\begin{tabular}{lll}
+\toprule
+ & schedule shift $\hat s$ & advantage divisor $\hat\sigma$ \\
+\midrule
+per-state target & policy width $s(o)$ & within-state $\sigma_Q(o)$ \\
+cost of an error & $\cosh u$, \eqref{eq:cosh}
+  & $\tfrac{\beta^2}{2}(e^u-1)^2$, \eqref{eq:advcost} \\
+symmetric in $u$? & yes & no --- err high \\
+global optimum & $\sqrt{M_+/M_-}\approx$ geometric mean
+  & contraharmonic $\E[\sigma^2]/\E[\sigma]$ \\
+accumulate & $\log\hat s_K,\ (\log\hat s_K)^2$
+  & $\hat\sigma_K,\ \hat\sigma_K^2$ \\
+in which space & log & linear \\
+debiased by & $-\beta(\nu)$, additive & $\times c_4(\nu)$, multiplicative \\
+dof from $K$ & $d(K-1)$, pooling coordinates & $K-1$ \\
+heterogeneity floor & $e^{\tau^2/2}$
+  & $\tfrac{\beta^2}{2}\mathrm{CV}^2/(1+\mathrm{CV}^2)$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+Both floors are diagnostics computable at a fixed scalar, before either estimate
+is allowed to drive anything --- which is how they should first be run.
+\end{remark}
+
+\section{The mean plays no role}
+\label{sec:mean}
+
+\begin{proposition}
+None of $V_k$, $\leff$, the information rate \eqref{eq:clockdep}, the deficit
+\eqref{eq:deficit}, the cost metric \eqref{eq:metric}, the optimum
+\eqref{eq:dmin} or the penalty \eqref{eq:cosh} depends on $\mu$.
+\end{proposition}
+
+The algebra appeared three times already: $V_k=\abar_k\Sigma+(1-\abar_k)I$ in
+\eqref{eq:marginal} contains no $\mu$; $\mu$ dropped out of
+Proposition~\ref{prop:clock} because a known additive constant carries no
+information; and $c_k$ in Proposition~\ref{prop:deficit} is built from $\abar$,
+$s$ and $V_k$ alone, with DDIM transporting the mean exactly. Three
+complementary reasons this had to happen:
+
+\paragraph{1. A translation is free and invertible.} Replacing $x_0$ by
+$x_0+\mu$ replaces $x_k$ by $x_k+\sqrt{\abar_k}\mu$, a known deterministic
+bijection at every level. It changes no entropy, no mutual information, and no KL
+between centered marginals. A schedule allocates steps to \emph{removing
+uncertainty}, and a mean carries none.
+
+\paragraph{2. SNR is a ratio of variances.} The ``signal'' in a denoising
+problem is the part of $x_0$ that is not predictable in advance. A mean is
+predictable by definition and a network absorbs it into an output bias, so
+$\snr=\Var(\text{signal})/\Var(\text{noise})$ correctly excludes it.
+
+\paragraph{3. The recursions are decoupled.} Mean and covariance propagate
+through \eqref{eq:forward} separately, $\E[x_k]=\sqrt{\abar_k}\E[x_0]$ and
+$V_k=\abar_kV_0+(1-\abar_k)I$, with no cross term.
+
+\paragraph{Two caveats.} Defining SNR from the raw second moment
+$\E\|x_0\|^2=\|\mu\|^2+\Tr\Sigma$ does make it move with $\mu$, but that is the
+wrong quantity for scheduling, by reason 2; the $\sigma_{\rm data}$ of EDM
+\cite{karras2022elucidating} is a centered standard deviation. And the mean
+\emph{does} enter a different notion of burden --- for scalar
+$p_0=\mathcal N(m,s^2)$,
+\begin{equation}
+  2\,\mathrm{KL}(q_{k-1}\|q_k)\approx\Delta\theta_k^2
+  \Big[\underbrace{\tfrac{\sin^2(2\theta)(1-s^2)^2}{2v^2}}_{\text{variance motion}}
+  +\underbrace{\tfrac{m^2\sin^2\theta}{v}}_{\text{mean motion}}\Big],
+  \label{eq:kl}
+\end{equation}
+so equalizing \emph{how far the marginal moves} per step is $\mu$-dependent,
+while equalizing the transport deficit is not. The two disagree: the variance
+term in \eqref{eq:kl} peaks at $\snr=1/s^2$ and vanishes at both ends, whereas the
+cost density \eqref{eq:metric} peaks at $\snr^{\rm eff}=1$. Centering the data
+remains good practice --- a large $\|\mu\|$ forces the network to emit a large
+offset --- but it is a conditioning question, not a scheduling one.
+
+\section{Numerical verification}
+\label{sec:verify}
+
+Closed forms were checked against direct computation using the schedules built by
+the code base, in \texttt{scripts/equal\_burden\_}\-\texttt{schedule.py}, with
+figures from \texttt{notes/snr\_schedule\_shift/}\-\texttt{make\_figures.py}. The
+finite-sample results of Section~\ref{sec:finite} --- and the constants of
+Table~\ref{tab:finiteK} --- are checked by Monte Carlo against their closed forms
+in \texttt{notes/snr\_schedule\_shift/}\-\texttt{verify\_finite\_k.py}.
+
+\begin{table}[h]
+  \centering
+  \small
+  \begin{tabular}{llll}
+    \toprule
+    Claim & Prediction & Measured & Agreement \\
+    \midrule
+    I-MMSE, Gaussian \eqref{eq:clockdep}
+      & $\dd I/\dd\leff=\tfrac12\sigma(\leff)$ & finite differences
+      & $4\times10^{-11}$ \\
+    I-MMSE, two-point prior
+      & $\int\!\dd I=\log2=0.693147$ & $0.693147$ & $<10^{-6}$ \\
+    Per-step deficit \eqref{eq:deficit}
+      & $s^2\sin^2(\Delta\theta_k)/v_k$ & direct affine map
+      & $4.4\times10^{-16}$ \\
+    Shift $=$ uniform $\psi$ (Prop.~\ref{prop:equiv})
+      & $\psi_k-\theta^{\rm target}_k=0$ & $1.1\times10^{-14}$ & exact \\
+    $D_{\min}$ \eqref{eq:dmin}, $T=300$
+      & $T\!\cdot\!D=\pi^2/4=2.4674$ & $2.4735$ & $0.2\%$ \\
+    \ \ same, $s=0.1,0.2,0.45,0.8,1.0$
+      & identical for all $s$ & $2.4734$--$2.4736$ & $10^{-4}$ \\
+    $\cosh$ law \eqref{eq:cosh}, $\rho=2$
+      & $1.250$ & $1.243$ & $0.6\%$ \\
+    $\cosh$ law \eqref{eq:cosh}, $\rho=4$
+      & $2.125$ & $2.080$ & $2.1\%$ \\
+    Unshifted cosine \eqref{eq:dcos}, $s=0.45$
+      & $1.336$ & $1.386$ & $3.7\%$ \\
+    Heterogeneity floor \eqref{eq:hetopt}
+      & $\sqrt{M_+M_-}$ & grid search over $\hat s$
+      & $<10^{-3}$ \\
+    \ \ log-normal form \eqref{eq:lognormal}
+      & $e^{\tau^2/2}$, $\hat s_\star=e^m$ & sampled populations & $<10^{-3}$ \\
+    Finite-$K$ shift \eqref{eq:finiteK}, $K=3$
+      & $\sqrt{\nu/(\nu-1)}=1.41421$ & posterior risk minimizer $1.41553$
+      & $0.1\%$ \\
+    \ \ residual risk, $K=3$--$33$
+      & $\sqrt{f(\nu)}$ & $\E_Q\cosh$ at the optimum & $<3\times10^{-4}$ \\
+    Plug-in bias \eqref{eq:debias}, $K=3$
+      & $\sqrt{(\nu-1)/\nu}=0.70711$ & $0.70692$ & $0.03\%$ \\
+    \ \ debiased floor, $K=3,5,9,17$
+      & $e^{\tau^2/2}=1.1972$ & $1.1964$--$1.1968$ & $0.06\%$ \\
+    Estimation noise \eqref{eq:kappa}
+      & $\kappa(\nu)=\tfrac14\psi_1(\nu/2)$ & $\Var(\log\hat s_K)$ sampled
+      & $<0.1\%$ \\
+    Shrinkage weight \eqref{eq:shrink}
+      & $w=\tau^2/(\tau^2+\kappa)$ & MC risk minimizer
+      & $\le0.3\%$ in risk \\
+    Log-bias \eqref{eq:logroute}, $K=2$--$33$
+      & $\beta(\nu)=\tfrac12(\psi(\tfrac\nu2)-\log\tfrac\nu2)$
+      & $\E[\log\hat s_K]$ sampled & $<10^{-3}$ \\
+    \ \ global shift \eqref{eq:logaccum}, $K=2$
+      & $e^{\E[\log s]}=0.39976$ & $0.39964$ & $0.03\%$ \\
+    Odd-cumulant gap \eqref{eq:oddcum}
+      & $\kappa_3/6=\pm0.0494$ & $\pm0.0556$ & $\kappa_5/120$ residual \\
+    \ \ its cost, $|\mathrm{skew}(\log s)|=1.4$
+      & $\cosh\Delta=1.00155$ & $1.00155$ & $<10^{-6}$ \\
+    Self-similar risk \eqref{eq:selfsim}
+      & $\mathcal L(\beta)=\sqrt{M_+M_-}\cosh(\beta-\beta_\star)$
+      & 4 populations $\times$ 41 $\beta$ & $3\times10^{-15}$ \\
+    \ \ sinh balance \eqref{eq:sinhbalance}
+      & $\E[\sinh(\log s-\beta_\star)]=0$ & sampled & $<10^{-15}$ \\
+    \addlinespace
+    Bregman form \eqref{eq:bregman}
+      & $\psi(\eta_2)-\psi(\eta_1)-\Delta\eta\,\psi'(\eta_1)$
+      & direct KL, non-Gaussian $Q$ & $2\times10^{-16}$ \\
+    \ \ Gaussian cost \eqref{eq:advcost}
+      & $\tfrac{\beta^2}{2}(\sigma_Q/\hat\sigma-1)^2$ & exact KL of the two tilts
+      & $0$ \\
+    Contraharmonic \eqref{eq:contraharm}
+      & $\E[\sigma^2]/\E[\sigma]$ & MC risk minimizer & $<10^{-4}$ \\
+    \ \ floor \eqref{eq:advfloor}
+      & $\mathrm{CV}^2/(1+\mathrm{CV}^2)$ & MC risk at optimum & $<10^{-3}$ \\
+    \ \ accumulators \eqref{eq:advaccum}, $K=2$
+      & $c_4\overline{\hat\sigma^2}/\overline{\hat\sigma}=1.358$ & true $1.361$ & $0.2\%$ \\
+    \bottomrule
+  \end{tabular}
+  \caption{Predictions against direct numerical evaluation; the last five rows are
+  produced by \texttt{verify\_adv\_norm.py}, the rest by
+  \texttt{verify\_finite\_k.py}. Residual gaps in the
+  $D$ rows are the $O(\Delta\psi^2)$ error of the small-step step of
+  Proposition~\ref{prop:metric}, which needs $T\gg\pi/(2s)$; the two exact
+  identities hold to machine precision.}
+\end{table}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\textwidth]{figs/fig_verification.pdf}
+  \caption{\textbf{Convergence of the closed forms.} (a) Unshifted, $T\!\cdot\!D$
+  tends to $\pi^2(1+s^2)/(8s)$ (dotted), a different constant for each $s$. (b)
+  With Recipe~\ref{rec:main} it tends to $\pi^2/4$ for every $s$; the four curves
+  coincide.}
+  \label{fig:verification}
+\end{figure}
+
+\section{Summary}
+
+\begin{enumerate}\itemsep3pt
+  \item \textbf{The clock is exact, not asymptotic.} By I-MMSE,
+  $\dd I/\dd\lambda=\tfrac12\gamma\,\mmse(\gamma)$ at every noise level for every
+  clean law. The two factors are ``how much is still unknown'' and ``how good the
+  channel is''; they trade off, and their product is the rate. For Gaussian data
+  it is exactly $\tfrac12\sigma(\leff)$, tending to $\tfrac12$ at high SNR --- the
+  usual high-SNR statement is the plateau of an exact curve.
+  \item \textbf{The rate is a function of $\leff=\lambda+2\log s$ alone}
+  (Proposition~\ref{prop:clock}), for any data shape. Since a schedule controls
+  $\lambda$, it is under-determined by one constant until $s$ is named; naming
+  nothing asserts $s=1$. This, not any statement about angles, is the primal
+  desideratum.
+  \item \textbf{Equal information per step cannot be the whole criterion}, because
+  for continuous data the total information is infinite and accumulates at
+  constant rate over an unbounded stretch of $\leff$. It fixes the coordinate, not
+  the spacing. Cosine responds by compactifying (uniform $\theta$, total range
+  $\pi/2$) rather than truncating, and coincides with uniform $\lambda$ only near
+  $\snr=1$, where $|\dd\lambda/\dd\theta|=4$ is minimal.
+  \item \textbf{The sampler's transport cost supplies the spacing.} Its exact
+  per-step value is $s^2\sin^2(\Delta\theta_k)/v_k$, it also depends only on
+  $\leff$ --- so it forces the same shift from an independent premise --- and it is
+  a metric $\dd\leff/[4\cosh(\leff/2)]$ on the $\leff$ axis of \emph{finite} total
+  length $\pi/2$, concentrated where signal and noise are comparable.
+  \item \textbf{Uniformity in $\psi$ is a conclusion, not an assumption.} Because
+  the cost is $\sum_k(\Delta\psi_k)^2$ with $\psi$ the arc length of that metric,
+  minimizing at fixed $T$ is just ``spread a fixed total evenly'', giving
+  $D_{\min}=\pi^2/(4T)$ independent of $s$. At $s=1$ the arc length is $\theta$,
+  which is why cosine looked canonical.
+  \item \textbf{The fix is Recipe~\ref{rec:main}}: $\lambda_k=\lambda^{\rm
+  target}_k-2\log\hat s$. It is exactly the uniform-$\psi$ reparametrization
+  (Proposition~\ref{prop:equiv}, verified to $10^{-14}$), it is exactly equivalent
+  to standardizing the data, and it is a relabeling rather than a reshaping ---
+  which is why cosine's shape knobs cannot express it, and why implementing it
+  directly is trivial.
+  \item \textbf{One law covers all the error.} $D=D_{\min}\cosh\log(s/\hat s)$;
+  the unshifted schedule is the case $\hat s=1$, costing $\cosh(\log s)$. The
+  penalty is flat --- a factor-of-two error costs $1.25\times$ --- so a coarse
+  frozen estimate captures nearly all of the gain.
+  \item \textbf{Anisotropy} reduces to $d$ scalar problems in the eigenbasis of
+  $\Sigma$, which is noise-level independent because the injected noise is
+  isotropic. Standardizing is the only exact fix; otherwise use the scalar
+  compromise below.
+  \item \textbf{For heterogeneous or state-dependent $s$, track two scalars:}
+  $M_+=\E[s]$ and $M_-=\E[1/s]$ over states and coordinates. Then
+  $\hat s_\star=\sqrt{M_+/M_-}$ and the irreducible penalty is
+  $\sqrt{M_+M_-}\ge1$ --- equivalently report $m=\E[\log s]$ and
+  $\tau^2=\Var(\log s)$, giving $\hat s_\star=e^m$ and floor $e^{\tau^2/2}$. The
+  floor is a decision rule: small means tune $\hat s$, large means no global
+  scalar helps and the correction must be made per state, which
+  \eqref{eq:perstate} does by rescaling the data while leaving the schedule fixed.
+  \item \textbf{Finite samples cost the same currency as heterogeneity.} Because
+  the penalty sees only the log-error, it cannot distinguish genuine spread from
+  estimation noise, so the $\pm1$-moment rule applies verbatim with $Q$ a
+  posterior (Proposition~\ref{prop:bayes}). From $K$ draws per state it gives
+  $\hat s_\star=\hat s_K\sqrt{\nu/(\nu-1)}$, $\nu=K-1$ --- an \emph{inflation} of
+  the sample width, since $\log s$ has a right-skewed posterior --- at residual
+  cost $\sqrt{f(\nu)}\approx1+1/(4\nu)$; that route needs $K\ge3$, since the $-1$
+  moment diverges at $\nu=1$. \textbf{For a global shift, however, no loss is
+  needed once the coordinate is known}: average $\log\hat s_K$ and subtract the
+  exact bias $\beta(\nu)=\tfrac12(\psi(\nu/2)-\log(\nu/2))$
+  (Proposition~\ref{prop:logroute}). Two accumulators, both corrections additive,
+  admissible at $K=2$, and the variance gives $\tau^2$ for free. Its one
+  approximation is that it targets the geometric mean, which is the minimizer of
+  the \emph{squared} log-error rather than of $\cosh$: the true optimum solves
+  $\E[\sinh(\log s-\beta_\star)]=0$ and sits toward the longer tail of $\log s$.
+  Because the risk in $\log\hat s$ is \emph{itself} exactly a $\cosh$
+  (Proposition~\ref{prop:selfsim}), the substitution costs exactly $\cosh\Delta$
+  with $\Delta$ the odd-cumulant sum \eqref{eq:oddcum} --- negligible for
+  moderate skew, comparable to the floor for strong skew, and cheap to measure
+  rather than assume (Remark~\ref{rem:measuredelta}). A per-state shift should
+  shrink toward the global one with weight $\tau^2/(\tau^2+\kappa(\nu))$, which is
+  never worse than either extreme.
+  \item \textbf{A different loss picks a different summary.} The same
+  population question for the \emph{advantage divisor} $\hat\sigma$ has a
+  different answer, because the tilt $\pi e^{\beta Q/\hat\sigma}$ is an
+  exponential family and its KL cost is the Bregman divergence of the $Q$
+  cumulant generating function: exactly $\tfrac{\beta^2}{2}(\sigma_Q/\hat\sigma-1)^2$
+  for Gaussian $Q$ (Proposition~\ref{prop:advkl}). Only the \emph{within}-state
+  spread of $Q$ enters, the across-state spread being pure gauge; the cost is
+  asymmetric, so one must err high; and the population minimizer is the
+  \emph{contraharmonic} mean $\E[\sigma_Q^2]/\E[\sigma_Q]$ --- two accumulators in
+  linear space, debiased by $c_4$ (Corollary~\ref{cor:advaccum}), with floor
+  $\tfrac{\beta^2}{2}\mathrm{CV}^2/(1+\mathrm{CV}^2)$. Same method, opposite space:
+  Remark~\ref{rem:twoscalars}.
+  \item \textbf{Nothing depends on $\mu$}, because a translation is known and
+  invertible and because mean and covariance propagate in decoupled recursions.
+  DDIM transports the mean exactly; for Gaussian data its only error is the loss
+  of spread.
+\end{enumerate}
+
+\begin{thebibliography}{9}
+\bibitem{guo2005mutual}
+D.~Guo, S.~Shamai, and S.~Verd\'u.
+\newblock Mutual information and minimum mean-square error in Gaussian channels.
+\newblock \emph{IEEE Trans.\ Inform.\ Theory}, 51(4):1261--1282, 2005.
+
+\bibitem{nichol2021improved}
+A.~Nichol and P.~Dhariwal.
+\newblock Improved denoising diffusion probabilistic models.
+\newblock \emph{ICML}, 2021. \texttt{arXiv:2102.09672}.
+
+\bibitem{chen2023importance}
+T.~Chen.
+\newblock On the importance of noise scheduling for diffusion models.
+\newblock 2023. \texttt{arXiv:2301.10972}.
+
+\bibitem{karras2022elucidating}
+T.~Karras, M.~Aittala, T.~Aila, and S.~Laine.
+\newblock Elucidating the design space of diffusion-based generative models.
+\newblock \emph{NeurIPS}, 2022. \texttt{arXiv:2206.00364}.
+
+\bibitem{kingma2021vdm}
+D.~P.~Kingma, T.~Salimans, B.~Poole, and J.~Ho.
+\newblock Variational diffusion models.
+\newblock \emph{NeurIPS}, 2021. \texttt{arXiv:2107.00630}.
+
+\bibitem{song2021ddim}
+J.~Song, C.~Meng, and S.~Ermon.
+\newblock Denoising diffusion implicit models.
+\newblock \emph{ICLR}, 2021. \texttt{arXiv:2010.02502}.
+
+\bibitem{chi2023diffusion}
+C.~Chi, S.~Feng, Y.~Du, Z.~Xu, E.~Cousineau, B.~Burchfiel, and S.~Song.
+\newblock Diffusion policy: visuomotor policy learning via action diffusion.
+\newblock \emph{RSS}, 2023. \texttt{arXiv:2303.04137}.
+
+\bibitem{ren2024dppo}
+A.~Z.~Ren, J.~Lidard, L.~L.~Ankile, A.~Simeonov, P.~Agrawal, A.~Majumdar,
+B.~Burchfiel, H.~Dai, and M.~Simchowitz.
+\newblock Diffusion policy policy optimization.
+\newblock 2024. \texttt{arXiv:2409.00588}.
+\end{thebibliography}
+
+\end{document}

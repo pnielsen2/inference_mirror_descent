@@ -6,7 +6,8 @@ import optax
 import haiku as hk
 
 from relax.algorithm import distillation, noise_schedule, normalizers
-from relax.algorithm.mala_sampler import build_mala_sampler
+from relax.algorithm.base_policy_sampler import TRANSITIONS, build_base_policy_sampler
+from relax.algorithm.mala_sampler import GI_STEP_SIZE_MAX, build_mala_sampler
 from relax.algorithm.mgmd_types import (
     Diffv2OptStates,
     HParams,
@@ -16,7 +17,13 @@ from relax.algorithm.mgmd_types import (
 from relax.algorithm.value_head import ValueHead
 from relax.network.actor_critic import ActorCritic, ActorCriticParams
 from relax.utils.experience import Experience
-from relax.utils.diffusion import NoiseLevel, cosine_log_snr_knots, log_snr_at
+from relax.utils.diffusion import (
+    NoiseLevel,
+    continuous_vlb_loss,
+    cosine_log_snr_knots,
+    log_snr_at,
+    sample_vlb_log_snr,
+)
 from relax.utils.jax_utils import (
     delayed_param_update,
     delayed_target_update,
@@ -68,10 +75,12 @@ class MGMD:
         self.estimate_s_hat = bool(cfg.estimate_s_hat)
         self.adaptive_schedule = bool(model.adaptive_schedule)
         self.lr_anneal = bool(cfg.lr_anneal)
-        # Training-time-only target-network usage; rollout sampling is unaffected.
-        self.use_target_policy_training = bool(cfg.use_target_policy_training)
-        self.use_target_q_sampling_training = bool(cfg.use_target_q_sampling_training)
-        self.policy_loss_key = "losses/Policy_epsilon_MSE"
+        # Target nets as THE policy/critic: every tilted sample (training TD
+        # next-action, rollout, eval) is drawn from them. See _tilt_params.
+        self.use_target_networks = bool(cfg.use_target_networks)
+        self.vlb_importance = cfg.policy_noise_sampling == "vlb_importance"
+        self.policy_loss_key = ("losses/Policy_VLB_bits" if self.vlb_importance
+                                else "losses/Policy_epsilon_MSE")
 
         # --- Optimizers: unscaled Adam; per-seed state.lr_{q,policy} is applied at update time. ---
         self.optim = optax.scale_by_adam()
@@ -107,10 +116,25 @@ class MGMD:
             batch_independent_guidance=self.cfg.batch_independent_guidance,
             denoising_predictor=self.cfg.denoising_predictor,
             guidance_gradient_space=self.cfg.guidance_gradient_space,
+            mcmc_proposal_type=self.cfg.mcmc_proposal_type,
+            ddpm_mean_final_steps=self.cfg.ddpm_mean_final_steps,
+            predictor_final_steps=self.cfg.predictor_final_steps,
             num_denoised_actions=self.num_denoised_actions,
             latent_action=getattr(self.cfg, "latent_action", False),
         )
-        sampler = build_mala_sampler(**self._sampler_kw)
+        # The rollout may read the chain out with a sharper predictor than the
+        # training branch uses. They are different jobs: the executed action wants
+        # the tilt realised as exactly as possible, while the TD next-action wants
+        # the chain's residual noise kept, since that noise is this sampler's only
+        # target-policy smoothing (TD3's trick) and removing it lets the backup
+        # chase argmax_a Q. Sharing one predictor forces one value on both.
+        self._rollout_sampler_kw = dict(self._sampler_kw)
+        if self.cfg.rollout_denoising_predictor is not None:
+            self._rollout_sampler_kw["denoising_predictor"] = self.cfg.rollout_denoising_predictor
+        if self.cfg.rollout_predictor_final_steps is not None:
+            self._rollout_sampler_kw["predictor_final_steps"] = self.cfg.rollout_predictor_final_steps
+        self.decoupled_rollout_predictor = self._rollout_sampler_kw != self._sampler_kw
+        sampler = build_mala_sampler(**self._rollout_sampler_kw)
         # Both sampling paths (rollout + TD next-action) use --q_agg_sample aggregation.
         # The TD-backup target itself remains hardcoded to 'min' (clipped double-Q).
         agg_critic = lambda qm: _aggregate_q(qm, self.cfg.q_agg_sample)
@@ -123,21 +147,7 @@ class MGMD:
             self._schedule_update = noise_schedule.build_updater(timesteps=self._timesteps)
         self._jit_vmap_update = jax.jit(jax.vmap(updater))
         self._jit_vmap_get_action = jax.jit(jax.vmap(stateless_get_action))
-        self._jit_vmap_eval_action = {}  # N -> compiled best-of-N eval sampler
-
-    @property
-    def _snr(self):
-        """Per-seed SNR grid ``[N, T]`` for the wandb log2-SNR x-axis.
-
-        A property rather than an ``__init__`` cache because the layout is a
-        function of per-seed hp: ``s_hat`` may be overridden per vmap slot by
-        ``--hp_pack_inline`` *after* construction, and both it and the adaptive
-        knots move during training (so for ``adaptive`` this axis is where the
-        levels sit now, not a fixed layout).
-        """
-        sched = jax.vmap(self.model.schedule_for)(self.state.hp, self.state.log_snr_levels)
-        return np.asarray(sched.alphas_cumprod, np.float64) / np.maximum(
-            np.asarray(sched.one_minus_alphas_cumprod, np.float64), 1e-8)
+        self._jit_vmap_eval_action = {}  # (sampler_kind, N) -> compiled best-of-N eval sampler
 
     def update_vmap(self, key: jax.Array, data: Experience, critic_weight: Optional[jax.Array] = None, env_step: Optional[float] = None):
         """Vmapped training update.
@@ -167,15 +177,19 @@ class MGMD:
         """Rollout-equivalent Q(obs, action) and V(obs) for the stepping action.
 
         Reproduces the ``(q_per_env, v_per_env)`` that ``get_action_vmap`` would
-        have returned in the non-fused path: online-Q aggregated with
+        have returned in the non-fused path: the tilting critic aggregated with
         ``--q_agg_sample`` and (when the on-policy-EMA V network exists) V(obs).
+        Goes through ``_tilt_params`` for the same reason the samplers do, so the
+        logged rollout Q keeps naming the same network as the non-fused path
+        under --use_target_networks.
         obs/action: ``[num_runs, envs_per_run, dim]``.
         """
         if getattr(self, "_jit_vmap_eval_q", None) is None:
             def _eval_q(state, o, a):
                 return _aggregate_q([self.model.q(qp, o, a) for qp in state.params.q], self.cfg.q_agg_sample)
             self._jit_vmap_eval_q = jax.jit(jax.vmap(_eval_q))
-        q_per_env = np.asarray(self._jit_vmap_eval_q(self.state, jnp.asarray(obs), jnp.asarray(action)))
+        q_state = self.state._replace(params=self._tilt_params(self.state.params))
+        q_per_env = np.asarray(self._jit_vmap_eval_q(q_state, jnp.asarray(obs), jnp.asarray(action)))
         if not self.on_policy_ema:
             return q_per_env, None
         v_per_env = np.asarray(self.value_head.apply_vmap(self.state.value_params, jnp.asarray(obs)))
@@ -216,7 +230,7 @@ class MGMD:
             q_params = state.params.q          # tuple of N Q params
             target_q_params = state.params.target_q  # tuple of N target Q params
             policy_params = state.params.policy
-            target_policy_params = state.params.target_policy  # None unless --use_target_policy_training
+            target_policy_params = state.params.target_policy  # None unless --use_target_networks
             q_opt_states = state.opt_state.q   # tuple of N opt states
             policy_opt_state = state.opt_state.policy
             step = state.step
@@ -244,19 +258,32 @@ class MGMD:
             reward *= state.hp.reward_scale
 
             # Denoise K tilted next-actions per state (K = num_denoised_actions).
-            # This training-time sampling may read the target policy and/or the
-            # target critic; rollout sampling (get_action_vmap) always uses the
-            # online pair, and the TD backup below always uses target_q.
-            sample_params = state.params
-            if self.use_target_policy_training:
-                sample_params = sample_params._replace(policy=target_policy_params)
-            if self.use_target_q_sampling_training:
-                sample_params = sample_params._replace(q=target_q_params)
-            sample_state = state._replace(params=sample_params)
+            # Under --use_target_networks this reads the target pair, exactly as
+            # rollout and eval sampling do (_tilt_params is shared by all three).
+            # The TD backup below uses target_q either way.
+            sample_state = state._replace(params=self._tilt_params(state.params))
+            # --rollout_alpha under fused denoising: the trailing R rows are the
+            # ones the trainer steps the env with, so they alone are tilted at
+            # rollout_alpha * alpha. A per-row alpha reaches the MH target (and
+            # the predictor) through state.hp.alpha, exactly as the scalar does.
+            R = self.cfg.rollout_tilt_rows
+            if R:
+                sample_state = sample_state._replace(hp=sample_state.hp._replace(
+                    alpha=state.hp.alpha * jnp.ones((obs.shape[0],), jnp.float32)
+                                               .at[-R:].set(self.cfg.rollout_alpha)))
+                # Those rows' sample is off-distribution for the update, so it is
+                # kept out of learning entirely: no TD loss (regardless of the
+                # episode-boundary weight the fused trainer passes) and, below, no
+                # policy target and no guidance statistics.
+                critic_weight = critic_weight.at[-R:].set(jnp.float32(0.0))
             mala_result = sampler(next_eval_key, sample_state, next_obs, agg_sample_fn)
             tilted_actions = mala_result.action           # [K, batch, act_dim]
             K = self.num_denoised_actions
             next_obs_k = jnp.broadcast_to(next_obs, (K, *next_obs.shape))
+            # Rows drawn at the update's own tilt: everything the policy and the
+            # guidance normalizers learn from. Identical to the full batch when
+            # no row is rollout-tilted (R = 0).
+            train_next_obs_k, train_actions = next_obs_k[:, :obs.shape[0] - R], tilted_actions[:, :obs.shape[0] - R]
 
             # Clipped double Q-learning: min_i(target_Q_i) per action, then the
             # TD backup averages that clipped double-Q over the K next-actions.
@@ -285,6 +312,14 @@ class MGMD:
             q_loss = jnp.mean(q_losses)
             value_loss_log = value_loss
 
+            # Polyak the target critic before the guidance normalizer below, so
+            # that under --use_target_networks the normalizer measures the very
+            # params the next tilt will sample from. Nothing between here and the
+            # old call site read target_q_params (the TD backup's
+            # per_q_target_values was already computed above), so moving it does
+            # not change the flag-off path.
+            target_q_params = tuple(delayed_target_update(q_params[i], target_q_params[i], state.hp.q_polyak_tau, step, state.hp.delay_target_q_update) for i in range(num_q))
+
             # V-free q_loss normalization: track EMA(Q TD loss) in the
             # advantage_second_moment_ema slot (the sampler divides beta by
             # sqrt of it). Host-side EMA is skipped since on_policy_ema is False.
@@ -294,22 +329,25 @@ class MGMD:
                 new_adv_m2_ema = (jnp.float32(1.0) - tau) * new_adv_m2_ema + tau * q_loss
 
             # EMA advantage normalization (ported from diffusion_policy_online_rl):
-            # track a slow EMA of the batch mean/std of the online (post-critic-
-            # update), --q_agg_sample-aggregated Q at the sampled next-actions. The
-            # sampler divides the guidance Q by q_running_std; q_running_mean is
-            # tracked for logging (it cancels in the guidance gradient).
+            # track a slow EMA of the batch mean/std of the freshly-updated,
+            # --q_agg_sample-aggregated Q at the sampled next-actions. The sampler
+            # divides the guidance Q by q_running_std; q_running_mean is tracked
+            # for logging (it cancels in the guidance gradient). Read from
+            # whichever critic does the tilting, so the scale never comes from a
+            # different network than the guidance it normalizes: the online
+            # ensemble normally, the just-Polyaked target one under
+            # --use_target_networks.
             new_q_running_mean = state.q_running_mean
             new_q_running_std = state.q_running_std
             if self.ema_advantage_normalization:
+                norm_q_params = target_q_params if self.use_target_networks else q_params
                 q_norm_samples = _aggregate_q(
-                    [self.model.q(qp, next_obs_k, tilted_actions) for qp in q_params],
+                    [self.model.q(qp, train_next_obs_k, train_actions) for qp in norm_q_params],
                     self.cfg.q_agg_sample,
-                )  # [K, batch] online Q at the tilted next-actions
+                )  # [K, batch] tilting Q at the tilted next-actions
                 rate = state.hp.adv_norm_ema_rate
                 new_q_running_mean = state.q_running_mean + rate * (jnp.mean(q_norm_samples) - state.q_running_mean)
                 new_q_running_std = state.q_running_std + rate * (jnp.std(q_norm_samples) - state.q_running_std)
-
-            target_q_params = tuple(delayed_target_update(q_params[i], target_q_params[i], state.hp.q_polyak_tau, step, state.hp.delay_target_q_update) for i in range(num_q))
 
             # Diffusion policy regresses toward all K tilted actions; flatten the
             # K axis into the batch so score-matching sees K*batch targets, and
@@ -319,17 +357,23 @@ class MGMD:
             assert obs.shape[0] == self.cfg.batch_size, "MGMDConfig.batch_size must be the trainer's minibatch size; it sizes the distillation buffer"
             distill_buffer = distillation.push(
                 state.distill_buffer,
-                jnp.concatenate((next_obs_k, tilted_actions), -1).reshape(K * obs.shape[0], -1),
+                jnp.concatenate((train_next_obs_k, train_actions), -1).reshape(K * (obs.shape[0] - R), -1),
                 step)
 
             def policy_loss_fn(policy_params, rows, time_key, noise_key) -> jax.Array:
-                # Standard diffusion score-matching loss (eps-MSE) against the
-                # tilted target actions in ``rows``, one [batch, obs_dim+act_dim]
-                # slice of the distillation buffer. Uses optax.squared_error
-                # (== (x-y)**2), NOT optax.l2_loss (== 0.5*(x-y)**2).
+                # Diffusion score matching against the tilted target actions in
+                # ``rows``, one [batch, obs_dim+act_dim] slice of the distillation
+                # buffer. Legacy schedules retain their exact eps-MSE reduction;
+                # VLB mode estimates the finite log-SNR integral in nats.
+                if self.cfg.policy_noise_samples_per_target > 1:
+                    rows = jnp.repeat(rows, self.cfg.policy_noise_samples_per_target, axis=0)
                 policy_obs, policy_targets = rows[:, :obs.shape[-1]], rows[:, obs.shape[-1]:]
                 n = policy_targets.shape[0]
-                if self.adaptive_schedule:
+                if self.vlb_importance:
+                    level, inverse_density = sample_vlb_log_snr(
+                        time_key, n, self.cfg.log_snr_min, self.cfg.log_snr_max,
+                        self.cfg.policy_noise_batch_sampling)
+                elif self.adaptive_schedule:
                     # Train the continuous schedule the knots interpolate rather
                     # than the grid indices, which move: uniform in the schedule's
                     # own time coordinate u, with lambda read off between knots.
@@ -341,6 +385,8 @@ class MGMD:
                 noise = jax.random.normal(noise_key, policy_targets.shape)
                 tilted_action_noisy = self.model.q_sample(level, policy_targets, noise)
                 noise_pred = self.model.eps_pred(policy_params, level, policy_obs, tilted_action_noisy)
+                if self.vlb_importance:
+                    return continuous_vlb_loss(noise_pred - noise, inverse_density)
                 return optax.squared_error(noise_pred, noise).mean()
 
             def _do(_):
@@ -352,7 +398,7 @@ class MGMD:
                 # current targets": at buffer size 1 a pass IS one step on the
                 # fresh block, which is exactly what the former used to repeat.
                 for policy_step_idx, rows in enumerate(distillation.epoch_batches(
-                    distill_buffer, key, batch_size=self.cfg.batch_size,
+                    distill_buffer, key, batch_size=self.cfg.batch_size - R,
                     epochs=self.cfg.policy_update_steps * self.cfg.distillation_steps,
                 )):
                     # Preserve the exact old random stream for a single step;
@@ -381,7 +427,7 @@ class MGMD:
                 lambda _: (state.policy_loss, policy_params, policy_opt_state), None)
 
             # Target policy tracks the just-updated online policy (mirrors target-Q).
-            if self.use_target_policy_training:
+            if self.use_target_networks:
                 target_policy_params = delayed_target_update(
                     policy_params, target_policy_params, state.hp.policy_polyak_tau,
                     step, state.hp.delay_target_policy_update)
@@ -400,8 +446,10 @@ class MGMD:
             )
 
             # --- Losses ---
+            policy_loss_log = (total_loss / jnp.log(jnp.float32(2.0))
+                               if self.vlb_importance else total_loss)
             info = {
-                self.policy_loss_key: total_loss,
+                self.policy_loss_key: policy_loss_log,
                 "losses/Q_loss": q_loss,
             }
             if self.lr_anneal:
@@ -413,10 +461,29 @@ class MGMD:
             if self.on_policy_ema and state.value_params is not None:
                 info["losses/V_MSE"] = value_loss_log
 
-            # --- MALA per-level arrays (logged as wandb.Table line plots) ---
-            info["MALA/acceptance_rate"] = mala_result.per_level_acc
-            info["MALA/clip_frac"] = mala_result.per_level_clip
-            info["MALA/eta_scale"] = jnp.exp(mala_result.log_eta_scales)
+            # --- Compact MALA summaries; full per-level state remains in snapshots. ---
+            mala_acc = mala_result.per_level_acc
+            mala_clip = mala_result.per_level_clip
+            schedule = self.model.schedule_for(state.hp, state.log_snr_levels)
+            mala_step = jnp.clip(
+                jnp.exp(mala_result.log_eta_scales) * jnp.maximum(schedule.betas, jnp.float32(1e-8)),
+                jnp.float32(1e-8), jnp.asarray(state.hp.mala_step_size_max, dtype=jnp.float32),
+            )
+            info.update({
+                "MALA/acceptance_rate_mean": jnp.mean(mala_acc),
+                "MALA/acceptance_rate_min": jnp.min(mala_acc),
+                "MALA/acceptance_rate_cleanest": mala_acc[0],
+                "MALA/acceptance_rate_noisiest": mala_acc[-1],
+                "MALA/clip_frac_mean": jnp.mean(mala_clip),
+                "MALA/clip_frac_max": jnp.max(mala_clip),
+                "MALA/clip_frac_cleanest": mala_clip[0],
+                "MALA/clip_frac_noisiest": mala_clip[-1],
+                "MALA/step_size_mean": jnp.mean(mala_step),
+                "MALA/step_size_min": jnp.min(mala_step),
+                "MALA/step_size_max": jnp.max(mala_step),
+                "MALA/step_size_cleanest": mala_step[0],
+                "MALA/step_size_noisiest": mala_step[-1],
+            })
 
             # --- Q section ---
             if self.on_policy_ema:
@@ -443,8 +510,8 @@ class MGMD:
             # Reuses the target-Q already computed for the TD backup, so ~free.
             if self.num_denoised_actions >= 2:
                 state, norm_info = normalizers.update(
-                    state, _aggregate_q(per_q_target_values, self.cfg.q_agg_sample),
-                    tilted_actions, step=step, K=self.num_denoised_actions,
+                    state, _aggregate_q(per_q_target_values, self.cfg.q_agg_sample)[:, :obs.shape[0] - R],
+                    train_actions, step=step, K=self.num_denoised_actions,
                     use_for_advantage=self.ema_within_advantage_normalization,
                     use_for_s_hat=self.estimate_s_hat,
                 )
@@ -525,14 +592,43 @@ class MGMD:
         q_for_v = jnp.mean(_aggregate_q(per_q_target_values, self.cfg.q_agg_sample), axis=0)
         return self.value_head.update_step(state, q_for_v, next_obs, state.hp.lr_q, self.optim)
 
+    def _tilt_params(self, params: ActorCriticParams) -> ActorCriticParams:
+        """The (policy, critic) pair every tilted sample is drawn from.
+
+        Under --use_target_networks the target pair IS the policy and critic, so
+        the substitution is the same wherever a chain is run: the training-time
+        TD next-action, the rollout action, and the evaluation episodes. Both
+        samplers read the networks off ``state.params.policy`` / ``.q`` and
+        nothing else, so swapping those two fields is the whole mechanism, and
+        the swap preserves every leaf shape (targets are exact copies), so no
+        jit/vmap signature changes.
+
+        Returns ``params`` unchanged when the flag is off, which is why the
+        default path stays bit-identical.
+        """
+        if not self.use_target_networks:
+            return params
+        return params._replace(policy=params.target_policy, q=params.target_q)
+
     def get_action_vmap(self, key: jax.Array, obs: np.ndarray):
         """Vmapped counterpart of get_action.
 
         obs: numpy array of shape [N, num_envs, obs_dim].
         Returns (action [N, num_envs, act_dim], q_per_env [N, num_envs],
         v_per_env [N, num_envs]).
+
+        --rollout_alpha scales the retained-policy exponent for this chain only,
+        expressed as an hp override on the state handed to the sampler: alpha
+        reaches the MH target through ``state.hp.alpha`` alone, so nothing in
+        the sampler needs to know. The step-size adaptation is written back
+        either way -- the scales are sampler self-tuning toward
+        --mala_target_acceptance_rate, not a learning signal, so both chains
+        share them and both refine them.
         """
-        result = self._jit_vmap_get_action(key, self.state, obs)
+        state = self.state._replace(params=self._tilt_params(self.state.params))
+        if self.cfg.rollout_alpha != 1.0:
+            state = state._replace(hp=state.hp._replace(alpha=state.hp.alpha * self.cfg.rollout_alpha))
+        result = self._jit_vmap_get_action(key, state, obs)
         # log_eta_scales: shape [N, timesteps] — matches stacked state layout.
         self.state = self.state._replace(log_eta_scales=result.log_eta_scales)
         # Sampler returns K iid actions per state ([N, K, num_envs, ...]); index 0
@@ -547,27 +643,54 @@ class MGMD:
         v_per_env = np.asarray(v)  # [N, num_envs]
         return action_np, q_per_env, v_per_env
 
-    def get_eval_action_vmap(self, key: jax.Array, obs: np.ndarray, num_actions: int) -> np.ndarray:
+    def get_eval_action_vmap(self, key: jax.Array, obs: np.ndarray, num_actions: int,
+                             return_q: bool = False, sampler_kind: str = "mala") -> np.ndarray:
         """Best-of-N action for separate evaluation: [N_runs, envs, act_dim].
 
-        Denoises ``num_actions`` iid candidates per state from the same chain
-        rollout uses (``self._sampler_kw`` at a different K) and executes the
+        Denoises ``num_actions`` iid candidates per state and executes the
         highest --q_agg_sample-aggregated-Q one. Unlike ``get_action_vmap`` this
         writes nothing back to ``self.state``, so the MALA step-size adaptation
         the training rollout is tuning is left alone and evaluation cannot
-        perturb the run. Compiled once per ``num_actions``.
+        perturb the run. Compiled once per ``(sampler_kind, num_actions)``.
+
+        ``sampler_kind="mala"`` (default, what training evaluation uses) draws
+        the candidates from the same chain rollout uses -- ``self._sampler_kw``
+        at a different K -- so evaluation can never drift onto a different
+        density. The other kinds are the unguided base-policy transitions of
+        :mod:`relax.algorithm.base_policy_sampler` (``"ddim"``, ``"ddpm_mean"``),
+        i.e. the base policy sampled the conventional way; only the candidate
+        sampler changes, the ranking and read-out are shared. Those are
+        analysis-only paths (offline snapshot studies), never used in training.
         """
-        if num_actions not in self._jit_vmap_eval_action:
-            sampler = build_mala_sampler(**{**self._sampler_kw, "num_denoised_actions": int(num_actions)})
+        cache_key = (sampler_kind, int(num_actions))
+        if cache_key not in self._jit_vmap_eval_action:
+            if sampler_kind == "mala":
+                sampler = build_mala_sampler(**{**self._sampler_kw, "num_denoised_actions": int(num_actions)})
+            elif sampler_kind in TRANSITIONS:
+                sampler = build_base_policy_sampler(
+                    model=self.model, timesteps=self._timesteps,
+                    transition=sampler_kind,
+                    num_denoised_actions=int(num_actions),
+                    latent_action=self._sampler_kw["latent_action"],
+                )
+            else:
+                raise ValueError(f"Unknown sampler_kind: {sampler_kind!r}; "
+                                 f"expected 'mala' or one of {TRANSITIONS}")
             agg_critic = lambda qm: _aggregate_q(qm, self.cfg.q_agg_sample)
 
             def eval_action(key, state, obs):
                 result = sampler(key, state, obs, agg_critic)  # action [N, envs, act], q [N, envs]
                 best = jnp.argmax(result.q, axis=0)            # [envs]
-                return jnp.take_along_axis(result.action, best[None, :, None], axis=0)[0]
+                action = jnp.take_along_axis(result.action, best[None, :, None], axis=0)[0]
+                q = jnp.take_along_axis(result.q, best[None, :], axis=0)[0]
+                return action, q
 
-            self._jit_vmap_eval_action[num_actions] = jax.jit(jax.vmap(eval_action))
-        return np.asarray(self._jit_vmap_eval_action[num_actions](key, self.state, obs))
+            self._jit_vmap_eval_action[cache_key] = jax.jit(jax.vmap(eval_action))
+        eval_state = self.state._replace(params=self._tilt_params(self.state.params))
+        action, q = self._jit_vmap_eval_action[cache_key](key, eval_state, obs)
+        if return_q:
+            return np.asarray(action), np.asarray(q)
+        return np.asarray(action)
 
     def _setup_value_network(self, params):
         """Construct the V(s) network used by KL-budget / on-policy-EMA mode.
@@ -594,9 +717,9 @@ class MGMD:
         different init seeds and stack the results along a leading seed axis.
         """
         cfg = self.cfg
-        # The target policy exists only under --use_target_policy_training, and
-        # starts as an exact copy of the online policy (mirrors target-Q init).
-        if self.use_target_policy_training and params.target_policy is None:
+        # The target policy exists only under --use_target_networks, and starts
+        # as an exact copy of the online policy (mirrors target-Q init).
+        if self.use_target_networks and params.target_policy is None:
             params = params._replace(target_policy=params.policy)
         # In-graph kl_budget sentinel: when --kl_budget is disabled (None),
         # store 1.0 so the value can still be a jnp.float32 in the vmappable
@@ -618,7 +741,8 @@ class MGMD:
                 self._timesteps, cfg.noise_schedule_log_snr_min, cfg.noise_schedule_log_snr_max))
                 if self.adaptive_schedule else None),
             distill_buffer=jnp.zeros(
-                (cfg.batch_size * self.num_denoised_actions * cfg.distillation_buffer_size,
+                ((cfg.batch_size - cfg.rollout_tilt_rows) * self.num_denoised_actions
+                 * cfg.distillation_buffer_size,
                  self._obs_dim + self.model.act_dim), jnp.float32),
             value_params=value_params_init,
             advantage_second_moment_ema=jnp.float32(cfg.initial_advantage_second_moment_ema),
@@ -648,13 +772,14 @@ class MGMD:
                 reward_scale=jnp.float32(cfg.reward_scale),
                 x0_hat_clip_radius=jnp.float32(cfg.x0_hat_clip_radius),
                 mala_adapt_rate=jnp.float32(cfg.mala_adapt_rate),
+                mala_target_acceptance_rate=jnp.float32(cfg.mala_target_acceptance_rate),
+                mala_step_size_max=jnp.float32(self._resolved_mala_step_size_max()),
                 q_td_huber_width=jnp.float32(cfg.q_td_huber_width),
                 alpha=jnp.float32(cfg.alpha),
                 T=jnp.float32(cfg.T),
                 eta=jnp.float32(cfg.eta),
                 s_hat=jnp.float32(cfg.s_hat),
                 noise_schedule_gamma=jnp.float32(cfg.noise_schedule_gamma),
-                noise_schedule_warmup=jnp.float32(cfg.noise_schedule_warmup),
             ),
         )
 
@@ -682,10 +807,34 @@ class MGMD:
         ]
         return stack_trees(states)
 
+    def _resolved_mala_step_size_max(self) -> float:
+        """The MALA step-size cap h_max, in x_t units.
+
+        ``--mala_step_size_max`` wins when given; otherwise the cap is dimension
+        aware, ``coef * act_dim ** (-1/3)``, because the level-t target is unit
+        scale so h is the dimensionless MALA step and its ESJD optimum falls off
+        as ``act_dim ** (-1/3)``. A cap fixed in absolute terms therefore binds
+        hard on small action spaces and not at all on large ones.
+
+        The gaussian_invariant proposal caps out at ``GI_STEP_SIZE_MAX``, where
+        its variance would vanish; the sampler applies the same bound to any
+        per-slot hp_pack override, this keeps the reported value honest.
+        """
+        if self.cfg.mala_step_size_max is not None:
+            h_max = float(self.cfg.mala_step_size_max)
+        else:
+            h_max = float(self.cfg.mala_step_size_max_coef) * float(self.model.act_dim) ** (-1.0 / 3.0)
+        if self.cfg.mcmc_proposal_type == "gaussian_invariant":
+            h_max = min(h_max, GI_STEP_SIZE_MAX)
+        if not h_max > 0.0:
+            raise ValueError(f"MALA step-size cap must be positive, got {h_max}")
+        return h_max
+
     def get_effective_hparams(self) -> dict:
         return {
             "lr_policy_effective": float(self.cfg.lr_policy),
             "lr_q_effective": float(self.cfg.lr_q),
+            "mala_step_size_max_effective": self._resolved_mala_step_size_max(),
         }
 
 

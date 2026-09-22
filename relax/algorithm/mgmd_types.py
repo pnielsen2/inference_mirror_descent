@@ -48,8 +48,8 @@ class MalaSampleResult(NamedTuple):
     log_eta_scales: jax.Array
     per_level_acc: jax.Array
     per_level_clip: jax.Array
-    # [T]: score-optimal cost of the interval between knots j and j+1, harvested
-    # from the MH drifts. Present only under ``schedule_cost``. The last entry
+    # [T]: one-step MALA difficulty between knots j and j+1, harvested from the
+    # MH drifts. Present only under ``schedule_cost``. The last entry
     # scores the N(0, I) initialization rather than an interval; the schedule
     # update drops it.
     schedule_cost: Optional[jax.Array] = None
@@ -97,11 +97,14 @@ class HParams(NamedTuple):
     # equal-cost layout each update. Lives here rather than on the frozen config
     # so it is a per-seed (vmap-packable) ablation axis like lr_q. The levels
     # themselves are a [T] array, so they sit on the state, not here.
-    noise_schedule_gamma: jax.Array = 1e-3
-    # Updates to wait before the knots start moving. The cost is only meaningful
-    # once the denoiser is Tweedie-consistent; before that d x0hat/dx scales like
-    # 1/sqrt(abar) instead of sqrt(abar) and the cost explodes at the noisy end.
+    noise_schedule_gamma: jax.Array = 1e-6
+    # Retained only so diagnostic snapshots pickled with the old tuple still load.
     noise_schedule_warmup: jax.Array = 1e5
+    # Appended at the end (not next to mala_adapt_rate) because NamedTuple
+    # unpickling is positional: trailing fields with defaults keep diagnostic
+    # snapshots written before this field loadable.
+    mala_target_acceptance_rate: jax.Array = 0.574  # MALA Robbins-Monro acceptance target
+    mala_step_size_max: jax.Array = 0.5  # upper clip on the MALA step size h
 
 
 class Diffv2TrainState(NamedTuple):
@@ -157,19 +160,37 @@ class MGMDConfig:
     delay_target_q_update: int = 2
     delay_policy_update: int = 2
     delay_target_policy_update: int = 2
-    use_target_policy_training: bool = False
-    use_target_q_sampling_training: bool = False
+    use_target_networks: bool = False
     reward_scale: float = 0.2
     q_agg_sample: str = "min"
     beta: float = 0.0
     x0_hat_clip_radius: float = 1.0
     mala_adapt_rate: float = 0.05
+    mala_target_acceptance_rate: float = 0.574
+    # None => h_max = mala_step_size_max_coef * act_dim ** (-1/3), resolved in
+    # MGMD where act_dim is known.
+    mala_step_size_max: Optional[float] = None
+    mala_step_size_max_coef: float = 2.7
+    mcmc_proposal_type: str = "euler_maruyama"
     denoising_predictor: str = "DDPM_mean"
+    ddpm_mean_final_steps: int = 1
+    predictor_final_steps: int = 0
+    # None = use the training-branch predictor for the rollout too.
+    rollout_denoising_predictor: Optional[str] = None
+    rollout_predictor_final_steps: Optional[int] = None
     q_td_huber_width: float = float("inf")
     batch_independent_guidance: bool = False
     guidance_strength_multiplier: float = 1.0
     guidance_strength_schedule: str = "constant"
     alpha: float = 1.0
+    # Scale applied to alpha for the executed action only; 1.0 = no decoupling.
+    rollout_alpha: float = 1.0
+    # Number of TRAILING minibatch rows whose tilted next-action is drawn at the
+    # rollout tilt instead of the update's. Nonzero only for --fused_denoising
+    # with --rollout_alpha != 1, where those rows are the ones the trainer steps
+    # the env with; they are then excluded from the Q TD loss and from the policy
+    # targets, since their sample is off-distribution for the update.
+    rollout_tilt_rows: int = 0
     T: float = 0.0
     eta: float = 0.0
     s_hat: float = 1.0
@@ -210,8 +231,12 @@ class MGMDConfig:
     orthogonal_init: bool = False
     latent_action: bool = False
     guidance_snr_anneal: str = "none"
-    noise_schedule_gamma: float = 1e-3
-    noise_schedule_warmup: float = 1e5
+    policy_noise_sampling: str = "schedule"
+    policy_noise_batch_sampling: str = "iid"
+    policy_noise_samples_per_target: int = 1
+    log_snr_min: float = -8.0
+    log_snr_max: float = 15.0
+    noise_schedule_gamma: float = 1e-6
     noise_schedule_log_snr_max: float = 15.0
     noise_schedule_log_snr_min: float = -15.0
 
@@ -238,8 +263,7 @@ class MGMDConfig:
             delay_target_q_update=args.delay_target_q_update,
             delay_policy_update=args.delay_policy_update,
             delay_target_policy_update=args.delay_target_policy_update,
-            use_target_policy_training=args.use_target_policy_training,
-            use_target_q_sampling_training=args.use_target_q_sampling_training,
+            use_target_networks=args.use_target_networks,
             critic_update_steps=args.critic_update_steps,
             policy_update_steps=args.policy_update_steps,
             reward_scale=args.reward_scale,
@@ -247,12 +271,23 @@ class MGMDConfig:
             beta=args.beta,
             x0_hat_clip_radius=args.x0_hat_clip_radius,
             mala_adapt_rate=args.mala_adapt_rate,
+            mala_target_acceptance_rate=args.mala_target_acceptance_rate,
+            mala_step_size_max=args.mala_step_size_max,
+            mala_step_size_max_coef=args.mala_step_size_max_coef,
+            mcmc_proposal_type=args.mcmc_proposal_type,
             denoising_predictor=args.denoising_predictor,
+            ddpm_mean_final_steps=args.ddpm_mean_final_steps,
+            predictor_final_steps=args.predictor_final_steps,
+            rollout_denoising_predictor=args.rollout_denoising_predictor,
+            rollout_predictor_final_steps=args.rollout_predictor_final_steps,
             q_td_huber_width=args.q_td_huber_width,
             batch_independent_guidance=args.batch_independent_guidance,
             guidance_strength_multiplier=float(guidance_strength_multiplier),
             guidance_strength_schedule=guidance_strength_schedule,
             alpha=args.alpha,
+            rollout_alpha=args.rollout_alpha,
+            rollout_tilt_rows=(args.num_vec_envs
+                               if args.fused_denoising and args.rollout_alpha != 1.0 else 0),
             T=args.T,
             eta=args.eta,
             s_hat=args.s_hat,
@@ -282,8 +317,12 @@ class MGMDConfig:
             orthogonal_init=args.orthogonal_init,
             latent_action=args.latent_action,
             guidance_snr_anneal=args.guidance_snr_anneal,
+            policy_noise_sampling=args.policy_noise_sampling,
+            policy_noise_batch_sampling=args.policy_noise_batch_sampling,
+            policy_noise_samples_per_target=args.policy_noise_samples_per_target,
+            log_snr_min=args.log_snr_min,
+            log_snr_max=args.log_snr_max,
             noise_schedule_gamma=args.noise_schedule_gamma,
-            noise_schedule_warmup=args.noise_schedule_warmup,
             noise_schedule_log_snr_max=args.noise_schedule_log_snr_max,
             noise_schedule_log_snr_min=args.noise_schedule_log_snr_min,
         )

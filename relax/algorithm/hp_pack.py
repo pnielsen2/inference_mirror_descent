@@ -45,13 +45,13 @@ ALLOWED_KEYS = {
     "guidance_strength_multiplier", "shape_ema_tau", "beta", "kl_budget",
     "initial_advantage_second_moment_ema", "initial_dist_shift_shape_ema",
     "reward_scale", "x0_hat_clip_radius", "mala_adapt_rate",
+    "mala_target_acceptance_rate", "mala_step_size_max",
     "q_td_huber_width", "alpha", "T", "eta", "s_hat",
-    "noise_schedule_gamma", "noise_schedule_warmup",
-    "seed",
+    "noise_schedule_gamma", "seed",
 }
 
 
-def apply(state, hp_pack: dict, N_seeds: int):
+def apply(state, hp_pack: dict, N_seeds: int, cmd_specified=None):
     """Return ``state`` with per-seed hp_pack overrides applied.
 
     ``hp_pack`` keys are argparse attribute names; values are length-N lists.
@@ -59,6 +59,12 @@ def apply(state, hp_pack: dict, N_seeds: int):
     skipped here. When ``kl_budget`` is overridden, ``beta`` is
     automatically rederived as ``sqrt(2 * kl_budget / M)`` using the current
     stored advantage-second-moment estimate ``M`` so the two stay consistent.
+
+    ``cmd_specified`` is the set of alpha/beta/T/eta names the CLI pinned,
+    captured before ``resolve_kl_budget`` fills in all four. It is required to
+    re-derive the CMD parameterization per slot: the state carries all four
+    resolved values, so without it there is no way to tell which two were the
+    free ones (see the ``cmd_pack_keys`` branch below).
     """
     # Fields on the top-level ``Diffv2TrainState``; all other override targets
     # live inside ``state.hp``.
@@ -92,6 +98,19 @@ def apply(state, hp_pack: dict, N_seeds: int):
             beta=jnp.sqrt(jnp.maximum(jnp.float32(0.0), jnp.float32(2.0) * kl_budget_v / m2_v))
         )
     if cmd_pack_keys:
+        # The CMD parameterization has exactly two free parameters and the state
+        # stores all four already resolved, so re-deriving a slot means feeding
+        # resolve_cmd_params ONLY the pair the CLI pinned (with the packed
+        # values substituted in) and leaving the other two unspecified. Passing
+        # all four is over-specified and rejected outright.
+        free = (set(cmd_specified) | cmd_pack_keys) if cmd_specified else set(cmd_pack_keys)
+        if len(free) != 2:
+            raise ValueError(
+                f"--hp_pack over {sorted(cmd_pack_keys)} needs exactly two free CMD "
+                f"parameters to resolve against, got {sorted(free)}. A pack may only "
+                f"override the two of alpha/beta/T/eta that were given on the command "
+                f"line (here: {sorted(cmd_specified) if cmd_specified else 'unknown'})."
+            )
         values = {
             "alpha": jnp.asarray(state.hp.alpha, dtype=jnp.float32),
             "beta": jnp.asarray(state.beta, dtype=jnp.float32),
@@ -109,15 +128,12 @@ def apply(state, hp_pack: dict, N_seeds: int):
         resolved_T = []
         resolved_eta = []
         for s in range(N_seeds):
-            alpha_s = float(values["alpha"][s])
-            beta_s = float(values["beta"][s])
-            T_s = float(values["T"][s])
-            eta_s = float(values["eta"][s])
-            alpha_s = None if jnp.isnan(alpha_s) else alpha_s
-            beta_s = None if jnp.isnan(beta_s) else beta_s
-            T_s = None if jnp.isnan(T_s) else T_s
-            eta_s = None if jnp.isnan(eta_s) else eta_s
-            a_res, b_res, T_res, e_res = resolve_cmd_params(alpha_s, beta_s, T_s, eta_s)
+            free_s = {}
+            for name in ("alpha", "beta", "T", "eta"):
+                v = float(values[name][s])
+                free_s[name] = None if (name not in free or jnp.isnan(v)) else v
+            a_res, b_res, T_res, e_res = resolve_cmd_params(
+                free_s["alpha"], free_s["beta"], free_s["T"], free_s["eta"])
             resolved_alpha.append(a_res)
             resolved_beta.append(b_res)
             resolved_T.append(T_res)

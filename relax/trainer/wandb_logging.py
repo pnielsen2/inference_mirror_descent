@@ -1,17 +1,10 @@
-"""Multi-run wandb logging plumbing for VmapOffPolicyTrainer.
-
-Owns one wandb.Run per vmap run, plus the host-side per-run pending-scalar
-buffers and the update-step array accumulator. The trainer itself is
-RL-focused; it just calls ``logger.add_scalar_per_run(...)`` /
-``logger.flush_all()`` etc.
-"""
+"""Scalar-only multi-run wandb logging for VmapOffPolicyTrainer."""
 import os
 import random
 import time
 from pathlib import Path
 from typing import List, Optional
 
-import numpy as np
 import wandb
 
 from relax.utils.fs import WANDB_ENTITY, WANDB_PROJECT
@@ -97,10 +90,6 @@ class WandbMultiSeedLogger:
         self._runs: List = []
         self._pending: List[dict] = [{} for _ in range(self.num_runs)]
         self._pending_step: List[Optional[int]] = [None] * self.num_runs
-        self._array_accum: dict = {}
-        # Set by trainer once the algorithm is constructed; controls the
-        # x-axis used for per-level array tables (log2 SNR if available).
-        self.snr = None
 
     def init_runs(self):
         os.environ.setdefault("WANDB__SERVICE_WAIT", "120")
@@ -155,23 +144,6 @@ class WandbMultiSeedLogger:
             )
             self._runs.append(run)
 
-    def set_snr(self, snr):
-        """Provide diffusion SNR per timestep for log2-SNR-keyed array tables.
-
-        Accepts ``[T]`` or ``[num_runs, T]`` and normalizes to the latter. It is
-        per-run because ``--s_hat`` is a per-seed hp, so slots in one vmap pack
-        can sit on different log-SNR grids; using slot 0's axis for all of them
-        would silently mislabel every other slot's per-level curves.
-        """
-        if snr is None:
-            self.snr = None
-            return
-        snr = np.atleast_2d(np.asarray(snr))
-        self.snr = np.broadcast_to(snr, (self.num_runs, snr.shape[-1]))
-
-    # ------------------------------------------------------------------
-    # Scalar logging
-    # ------------------------------------------------------------------
     def add_scalar_per_run(self, run: int, tag: str, value: float,
                            step: Optional[int] = None):
         if step is not None:
@@ -181,65 +153,6 @@ class WandbMultiSeedLogger:
             self._pending_step[run] = int(step)
         self._pending[run][tag] = float(value)
 
-    def _buffer_per_run(self, run: int, data: dict, step: int):
-        if self._pending_step[run] is not None and step != self._pending_step[run]:
-            self.flush_run(run)
-        self._pending[run].update(data)
-        self._pending_step[run] = int(step)
-
-    def add_arrays_vmap(self, array_info: dict, sample_steps_per_run: List[int]):
-        """Log per-seed array metrics as wandb.Table with one row per level.
-
-        ``array_info`` maps tag -> np.ndarray of shape [num_runs, levels]. When
-        ``self.snr`` is provided and matches ``levels``, the table x-axis is
-        ``log2_snr``; otherwise it is integer ``level``.
-        """
-        if not array_info:
-            return
-
-        snr = self.snr
-        if snr is not None:
-            log2_snr = np.log2(np.maximum(snr, 1e-12))
-
-        for s in range(self.num_runs):
-            step = int(sample_steps_per_run[s])
-            run_arrays = {tag: np.asarray(value)[s] for tag, value in array_info.items()}
-
-            for tag, value in run_arrays.items():
-                arr = np.asarray(value)
-                if snr is not None and len(arr) == snr.shape[-1]:
-                    table = wandb.Table(
-                        columns=["log2_snr", "value"],
-                        data=[[float(log2_snr[s][i]), float(arr[i])] for i in range(len(arr))],
-                    )
-                else:
-                    table = wandb.Table(
-                        columns=["level", "value"],
-                        data=[[int(i), float(arr[i])] for i in range(len(arr))],
-                    )
-                self._buffer_per_run(s, {tag: table}, step)
-
-    # ------------------------------------------------------------------
-    # Update-step array accumulator
-    # ------------------------------------------------------------------
-    def accumulate_arrays(self, array_info: dict):
-        for tag, vals in array_info.items():
-            self._array_accum.setdefault(tag, []).append(np.asarray(vals))
-
-    def flush_accumulated_arrays(self, sample_steps_per_run: List[int]):
-        """Average accumulated per-update arrays and log them. No-op if empty."""
-        if not self._array_accum:
-            return
-        averaged = {
-            tag: sum(v_list) / len(v_list)
-            for tag, v_list in self._array_accum.items()
-        }
-        self._array_accum.clear()
-        self.add_arrays_vmap(averaged, sample_steps_per_run)
-
-    # ------------------------------------------------------------------
-    # Flushing
-    # ------------------------------------------------------------------
     def flush_run(self, s: int):
         if self._pending[s]:
             self._runs[s].log(self._pending[s], step=self._pending_step[s])

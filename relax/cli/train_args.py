@@ -64,15 +64,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ----- diffusion schedule ----------------------------------------------
     parser.add_argument("--diffusion_steps", type=int, default=20)
-    parser.add_argument("--beta_schedule_type", type=str, default='linear', help="Noise schedule type. 'linear': linear beta schedule. 'cosine': cosine schedule (Nichol & Dhariwal). 'constant_kl': constant mutual-information-loss per step, spacing noise levels uniformly in log(1+SNR). 'adaptive': no family at all -- the T log-SNR levels are free knots, pinned at --noise_schedule_log_snr_{max,min} and initialised to cosine's shape cut to that range, and each batch moves them a fraction --noise_schedule_gamma toward the layout that spends equal cost per step. Cost is the score-optimal one of Williams et al., 'Score-Optimal Diffusion Schedules' (NeurIPS 2024): sigma^2 times the Fisher divergence between adjacent levels, read straight off the MALA drifts, so it is free (see relax/algorithm/noise_schedule.py). The energy net then conditions on lambda rather than on the level index, and distillation draws its noise levels continuously (uniform in the knots' own time coordinate, lambda interpolated between them) so the policy stays in distribution as the schedule moves. Requires --denoising_predictor Identity (or Identity_then_DDPM_mean, whose only non-identity step is below every scored interval) and --guidance_gradient_space xt; incompatible with --s_hat / --estimate_s_hat, since the knots already say where the ladder sits.")
+    parser.add_argument("--noise_schedule_type", "--beta_schedule_type", dest="beta_schedule_type", type=str, default='linear', help="Noise schedule type. 'linear': linear beta schedule. 'cosine': cosine schedule (Nichol & Dhariwal). 'constant_kl': levels uniform in log(1+SNR). 'adaptive': free log-SNR knots initialized from cosine and moved slowly to equalize one-step MALA difficulty; requires Identity transport between levels and --guidance_gradient_space xt. 'log_snr': fixed [--log_snr_min, --log_snr_max] interval with spacing selected by --inference_spacing.")
     parser.add_argument("--snr_max", type=float, default=124.0, help="Maximum SNR (at the cleanest noise level), i.e. alpha_bar_0 = snr_max/(1+snr_max). ONLY USED BY 'constant_kl', which is defined by it. 'cosine' and 'linear' are used natively, so their clean endpoint tracks --diffusion_steps (cosine SNR_0 = 124/401/1155 at T=20/40/80); 124.0 is exactly native cosine at T=20.")
+    parser.add_argument("--log_snr_min", type=float, default=-8.0, help="Noisiest endpoint for --noise_schedule_type log_snr and continuous VLB policy training.")
+    parser.add_argument("--log_snr_max", type=float, default=15.0, help="Cleanest endpoint for --noise_schedule_type log_snr and continuous VLB policy training.")
+    parser.add_argument("--inference_spacing", type=str, default="uniform", choices=["uniform", "karras"], help="Placement of discrete inference levels within the fixed log-SNR interval.")
+    parser.add_argument("--karras_rho", type=float, default=7.0, help="Karras sigma-space spacing exponent; used only with --inference_spacing karras.")
+    parser.add_argument("--policy_noise_sampling", type=str, default="schedule", choices=["schedule", "vlb_importance"], help="Policy-loss noise sampling: the inference schedule's levels, or the continuous finite-interval VLB importance proposal.")
+    parser.add_argument("--policy_noise_batch_sampling", type=str, default="iid", choices=["iid", "stratified"], help="IID or randomized-stratified y draws for --policy_noise_sampling vlb_importance.")
+    parser.add_argument("--policy_noise_samples_per_target", type=int, default=1, help="Independent (noise level, epsilon) corruptions per tilted target, averaged into one policy loss and one optimizer step. The final policy-loss batch has this times --batch_size rows; changing it is a hard (non-vmap-packable) sweep axis. Default 1.")
     parser.add_argument("--noise_cond_theta", type=int, default=1000, help="Frequency base of the policy net's sinusoidal noise-level embedding, which fixes the input RANGE it resolves: the dim/2 frequencies run from 1 down to theta^-(7/8) rad per unit (dim=16), so the top channel always gives ~1 rad per unit and the bottom sweeps range*theta^-(7/8) radians end to end. Channels sweeping far under a radian are near-constants, i.e. wasted. Default 1000 is shaped for a log-SNR range of [-50, 50] (6 of 8 channels informative, 1 monotone). 10000 is the inherited DDPM/Transformer value, built for a range ~20x wider, under which 5 of 8 are flat over that range -- pass it to reproduce pre-existing runs exactly. This applies to EVERY --beta_schedule_type, so hold it fixed (or ablate it explicitly) when comparing schedules. It does not change how far apart ADJACENT levels sit in embedding space; only rescaling the conditioning input itself would.")
-    parser.add_argument("--noise_schedule_log_snr_max", type=float, default=15.0, help="Log-SNR of the CLEANEST knot under --beta_schedule_type adaptive, pinned there for the whole run (the equal-cost update returns both endpoints unchanged, so this is a standing constraint and not just an initial value). Sets how clean the returned sample can get: sigma = sqrt(sigmoid(-lambda)), so the default 15 resolves action detail down to 5.5e-4, ~50x finer than native cosine at T=80 (0.029). Do not raise it much: the cost weight is sigma^2, which vanishes here, so the equal-cost rule assigns the clean tail almost no cost and knots migrate away from it, while the MALA step size there scales with 1-abar and gets too small to move -- at 20 the resulting beta rounds to 1 in float32. Every configuration in the paper's released code sits between 10 and 16. Ignored by every other schedule family.")
+    parser.add_argument("--noise_schedule_log_snr_max", type=float, default=15.0, help="Pinned clean endpoint for --beta_schedule_type adaptive. The default resolves residual action noise to about 5.5e-4. Ignored by fixed schedule families.")
     parser.add_argument("--noise_schedule_log_snr_min", type=float, default=-15.0, help="Log-SNR of the NOISIEST knot under --beta_schedule_type adaptive, pinned there for the whole run. The chain is initialised from N(0, I) and this knot is treated as BEING that reference, so it must be noisy enough for the two to agree: at the default -15, abar = 3e-7. Raising it introduces an unmodelled initialisation mismatch (the one term the cost deliberately drops); lowering it only wastes knots in a region the cost rule will evacuate anyway. The paper's image runs sit at -20 to -23. Ignored by every other schedule family.")
-    parser.add_argument("--noise_schedule_gamma", type=float, default=1e-3, help="Fraction of the way the adaptive knots move toward the equal-cost layout each update: levels <- gamma*optimal + (1-gamma)*levels (Algorithm 2 of Williams et al.). Acts as an EMA over the per-batch cost estimates, so 1/gamma is its time constant in UPDATES. Calibrated against the paper's released code rather than its stated gamma: there, gamma is applied per schedule *resample*, which only fires once every level has been visited n_l_min times (n_l_min=24 with T=1000 levels at batch 384 for their CIFAR run, i.e. roughly every 63 batches), so their 0.01 is ~1.6e-4 per batch. Our MALA sampler sweeps every level on every update with batch_size samples per level, so a per-update gamma here is ~60x more schedule motion per batch than their image runs at the same number. Default 1e-3 sits near their per-batch rate while still adapting within a few thousand steps. Their 1D runs, which do resample nearly every batch, used 0.01-0.1.")
-    parser.add_argument("--noise_schedule_warmup", type=float, default=1e5, help="Updates to run on the INITIAL (cosine-truncated) ladder before --beta_schedule_type adaptive starts moving its knots. Not optional in spirit: the score-optimal cost differences the two adjacent levels' scores, and for an untrained denoiser d x0hat/dx scales like 1/sqrt(abar) rather than the correct sqrt(abar) -- a factor 1.6e7 at lambda=-15 -- so the cost grows monotonically toward the noisy end and the equal-cost rule collapses every interior knot onto --noise_schedule_log_snr_min. That collapse then starves distillation of every level except the noisiest, so the denoiser never becomes consistent and never recovers. Williams et al. burn in the score for 160k iterations on a fixed cosine schedule before adapting for 50k (Appendix C.3), i.e. 76 percent of training. Default 1e5 is 10 percent of a 1e6-step run and ~100x the collapse timescale (1/gamma). Watch Schedule/x0hat_clip_{noisiest,cleanest}: adapting is safe once the noisiest is at or below the cleanest. The cost is still logged during warmup, so you can see it settle. Per-seed vmappable, so --ablate on it is free.")
+    parser.add_argument("--noise_schedule_gamma", type=float, default=1e-6, help="Fraction of the distance adaptive log-SNR knots move toward the equal-difficulty layout after each update. The small default makes adaptation continuous and very slow, with no warmup phase.")
     parser.add_argument("--guidance_snr_anneal", type=str, default="none", choices=["none", "sqrt_abar", "abar"], help="Damp the Q-guidance strength at low SNR in the MALA TARGET (and, to keep the proposal consistent, in the guided predictor): beta_eff(t) = beta * f(alpha_bar_t). The guided term is Q at the Tweedie estimate x0_hat = (x - omac grad E)/sqrt(abar), so its gradient carries 1/sqrt(abar); an exact score cancels that (the true posterior mean moves with x only as (sqrt(abar)/omac) Cov[x_0|x], which vanishes as the posterior widens to the prior), but any score error is amplified by it -- 1808x at lambda = -15. Left undamped this makes the noisy end of the tilted path astronomically expensive and collapses an adaptive schedule onto lambda_min. 'abar' restores the exact asymptotics: 1 at the clean end, where the Tweedie approximation is good and the sampling target must be left untouched, and decaying like sqrt(abar) at the noisy end so rho_lambda -> N(0, I). (For a Gaussian prior of action scale s the exact form is sigmoid(lambda + 2 log s); abar is the s = 1 case.) 'sqrt_abar' only holds the guidance gradient constant in lambda rather than decaying. 'none' (default) is the historical behaviour. NOTE this changes the density MALA samples for EVERY --beta_schedule_type, so runs with it on are not comparable to runs without it.")
-    parser.add_argument("--s_hat", type=float, default=1.0, help="Assumed standard deviation of the clean actions. Shifts whatever --beta_schedule_type is chosen by lambda -> lambda - 2 log(s_hat) in log-SNR, i.e. abar -> abar/(abar + s_hat^2 (1-abar)); equivalent to standardizing the actions by s_hat before diffusing. Schedules are tuned for unit variance, so the default 1.0 is the (no-op) status quo; s_hat<1 stops the schedule wasting steps on the noise-dominated end when the policy is narrower than that. Cost of a wrong value is cosh(log(s/s_hat)), so it is flat: a 2x error costs 1.25x. Not applicable to --beta_schedule_type adaptive, which places its own levels (the knots already fix where the ladder sits) and rejects the combination.")
+    parser.add_argument("--s_hat", type=float, default=1.0, help="Assumed standard deviation of the clean actions. Shifts whatever --beta_schedule_type is chosen by lambda -> lambda - 2 log(s_hat) in log-SNR, i.e. abar -> abar/(abar + s_hat^2 (1-abar)); equivalent to standardizing the actions by s_hat before diffusing. Schedules are tuned for unit variance, so the default 1.0 is the (no-op) status quo; s_hat<1 stops the schedule wasting steps on the noise-dominated end when the policy is narrower than that. Cost of a wrong value is cosh(log(s/s_hat)), so it is flat: a 2x error costs 1.25x. Not applicable to adaptive or log_snr schedules, whose knots/endpoints already fix where the ladder sits; both reject the combination.")
 
     # ----- optimization -----------------------------------------------------
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -90,12 +96,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--distillation_steps", type=int, default=1, help="Number of reshuffled passes over the distillation buffer per policy update. Each pass cuts the buffer into --batch_size minibatches and takes one score-matching optimizer step per minibatch, so an update takes --distillation_steps * --num_denoised_actions * --distillation_buffer_size steps (times --policy_update_steps). Note the minibatch is --batch_size regardless, so --num_denoised_actions K >= 2 now takes K steps of that size per pass rather than one step on all K*batch targets. Default 1.")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor for the Q critic. Default 0.99.")
     parser.add_argument("--q_polyak_tau", type=float, default=0.005, help="Polyak averaging coefficient for the target-Q soft update. Default 0.005.")
-    parser.add_argument("--policy_polyak_tau", type=float, default=0.005, help="Polyak averaging coefficient for the target-policy soft update (only used with --use_target_policy_training). Default 0.005.")
-    parser.add_argument("--delay_target_q_update", type=int, default=2, help="Polyak-update the target Q every this many update steps. Default 2.")
+    parser.add_argument("--policy_polyak_tau", type=float, default=0.005, help="Polyak averaging coefficient for the target-policy soft update (only used with --use_target_networks, which is the only mode that allocates a target policy). Matches --q_polyak_tau by default so both targets track their online net at the same rate. Under --use_target_networks this sets the staleness of the ACTING policy, not just a TD target, so it is behaviour-critical: the effective EMA horizon is --delay_target_policy_update / this, i.e. 400 update steps at the defaults. Default 0.005.")
+    parser.add_argument("--delay_target_q_update", type=int, default=2, help="Polyak-update the target Q every this many update steps. This multiplies the effective EMA horizon, which is this / --q_polyak_tau update steps (400 at the defaults); set it to 1 to Polyak-update every step, which also halves that horizon unless --q_polyak_tau is halved with it. The online Q ensemble is ungated and always steps every update. Default 2.")
     parser.add_argument("--delay_policy_update", type=int, default=2, help="Take a diffusion-policy optimizer step every this many update steps. Default 2.")
-    parser.add_argument("--delay_target_policy_update", type=int, default=2, help="Polyak-update the target policy every this many update steps (only used with --use_target_policy_training). Default 2.")
-    parser.add_argument("--use_target_policy_training", action="store_true", default=False, help="Materialize a Polyak-averaged target policy (rate --policy_polyak_tau, period --delay_target_policy_update) and use it INSTEAD of the online policy to denoise the tilted next-actions during TRAINING. Rollout action sampling is unaffected and always uses the online policy. Without this flag no target policy is allocated at all. Incompatible with --fused_denoising, which reuses the training-branch denoised action to step the env.")
-    parser.add_argument("--use_target_q_sampling_training", action="store_true", default=False, help="Use the target Q ensemble instead of the online one for the guidance signal when denoising the tilted next-actions during TRAINING. Does not change the TD backup, which already evaluates the target Q at the sampled actions, nor rollout sampling, which keeps using the online Q.")
+    parser.add_argument("--delay_target_policy_update", type=int, default=2, help="Polyak-update the target policy every this many update steps (only used with --use_target_networks). Same horizon arithmetic as --delay_target_q_update. Default 2.")
+    parser.add_argument("--use_target_networks", action="store_true", default=False, help="Treat the Polyak-averaged target networks as THE policy and critic, leaving the online pair as pure optimization state. Materializes a target policy (rate --policy_polyak_tau, period --delay_target_policy_update; without this flag none is allocated at all) and uses the target policy AND target Q ensemble for every tilted sample the run draws: the training-time TD next-action, the rollout action that steps the env, and the separate evaluation episodes. The online pair is still what the losses train, and the TD backup already evaluated the target Q at the sampled next-actions regardless of this flag, so the only Q consumer that changes is the guidance signal inside the sampler. The guidance normalizer (--ema_advantage_normalization) follows the tilting critic automatically either way, so it never tracks a different network than the guidance it scales. Changes which params are allocated, so it is a hard (non-vmap-packable) sweep axis in launch.py.")
     parser.add_argument("--reward_scale", type=float, default=1, help="Scale factor applied to rewards before Q/value learning. Default 0.2 matches original MGMD. Set to 1.0 for clarity when using inference-time guidance (adjust --beta accordingly).")
 
     # ----- Q learning -------------------------------------------------------
@@ -104,6 +109,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ----- guidance + KL budget --------------------------------------------
     parser.add_argument("--alpha", type=float, default=None, help="Composite mirror descent retained-policy exponent α in π_new ∝ π_old^α·exp(β·Q). Exactly two of --alpha, --beta, --T, --eta must be specified.")
+    parser.add_argument("--rollout_alpha", type=float, default=1.0, help="Scale on the retained-policy exponent alpha for the EXECUTED action only: the rollout chain samples pi_theta^(rollout_alpha*alpha)*exp(beta*Q) while the training branch keeps alpha. Default 1.0 is exactly the current behaviour. A scale rather than an absolute alpha because alpha is derived from whichever two of --alpha/--beta/--T/--eta are given (and can be resolved per seed by --hp_pack), so 1.0 is neutral for every parameterization and 'not 1' is exactly 'the rollout tilt differs from the update's'; under the usual --T 0, alpha is 1 and this IS the rollout alpha. Below 1 flattens the prior's share of the tilt (greedier, more Q-driven exploration), above 1 pulls the executed action back toward the policy. When it is not 1 the executed action is off-distribution for the mirror descent update, so it is kept out of learning. Under --fused_denoising, where the executed action IS one of the minibatch's tilted next-actions, only the trailing --num_vec_envs rows are tilted this way and those rows are dropped from the Q TD loss and from the policy targets (so the critic and the distillation block see --batch_size minus --num_vec_envs rows); the flag is still rejected with the beta adaptation of --kl_budget / --advantage_normalization, which is driven by the executed action's advantage and would feed the rollout tilt back into the update. The rollout chain does still adapt the shared MALA step sizes, which are sampler self-tuning toward --mala_target_acceptance_rate rather than a learning signal, so both tilts contribute and the executed chain is not left running on scales tuned for a tilt it does not use. The executed action still enters the replay buffer as the behaviour action, which is what off-policy Q learning is defined on. Separate --eval_every episodes are unaffected and keep measuring the untilted-alpha policy.")
     parser.add_argument("--beta", type=float, default=None, help="Composite mirror descent Q coefficient β in π_new ∝ π_old^α·exp(β·Q). Exactly two of --alpha, --beta, --T, --eta must be specified.")
     parser.add_argument("--T", type=float, default=None, help="Composite mirror descent entropy temperature T. Exactly two of --alpha, --beta, --T, --eta must be specified.")
     parser.add_argument("--eta", type=float, default=None, help="Composite mirror descent step size η. Exactly two of --alpha, --beta, --T, --eta must be specified.")
@@ -136,13 +142,29 @@ def build_parser() -> argparse.ArgumentParser:
     # ----- MALA -------------------------------------------------------------
     parser.add_argument("--mala_steps", type=int, default=0, help="Number of MALA correction steps per diffusion step.")
     parser.add_argument("--mala_adapt_rate", type=float, default=0.05, help="Robbins-Monro adaptation rate for MALA log_eta_scale updates.")
-    parser.add_argument("--denoising_predictor", type=str, default="DDPM_mean", choices=["Identity", "Identity_then_DDPM_mean", "DDPM_mean", "DDIM", "DDIM_unguided"], help="Predictor transition after each MALA correction level. Identity skips denoising; DDPM_mean uses the guided DDPM posterior mean; DDIM uses the guided deterministic DDIM update; DDIM_unguided uses the deterministic DDIM update with the *unguided* eps reused from the last MALA gradient (no extra network evals, no x0 clip, ignores --guidance_strength_multiplier; requires --mala_steps >= 1). Identity_then_DDPM_mean is Identity for every transition BETWEEN noise levels and DDPM_mean for the last one (level 0 -> clean), where the posterior mean is exactly the guided Tweedie estimate: the chain -- MALA targets, acceptance rates, schedule cost -- is bit-identical to Identity's, and only the action read off the cleanest level changes, from that level's (still noisy) sample to its clean prediction. Costs one extra guided predictor pass per sampler call, not T.")
+    parser.add_argument("--mala_step_size_max", type=float, default=None, help="Absolute upper clip on the MALA step size h, overriding the --mala_step_size_max_coef default. h lives in x_t units, where the level-t target has unit scale, so it is already the dimensionless MALA step. The cap also sets the per-level ceiling log(h_max / beta_t) on the adaptation state, so a level whose cap binds cannot integrate its scale up past what the cap can express and then need many updates to walk back. Per-seed vmappable, so --ablate mala_step_size_max packs its values into one job. The historical hardcoded value was 0.5.")
+    parser.add_argument("--mala_step_size_max_coef", type=float, default=2.7, help="Dimension-aware default for the step-size cap: h_max = coef * act_dim^(-1/3), i.e. 2.14 / 1.87 / 1.49 / 1.35 / 1.06 at act_dim 2 / 3 / 6 / 8 / 17. The ESJD-optimal step for a standard-normal target is 1.362 * act_dim^(-1/3), so the default coef 2.7 puts the cap at ~2x the stationary optimum: enough headroom that the Robbins-Monro rule, not the clip, sets h for any --mala_target_acceptance_rate down to ~0.25, and that the transient regime (one MALA step per level, where the optimal step is larger than the stationary one) is not truncated either. Ignored when --mala_step_size_max is given.")
+    parser.add_argument("--mala_target_acceptance_rate", type=float, default=0.574, help="Target acceptance rate the Robbins-Monro rule drives log_eta_scale toward: c <- c + --mala_adapt_rate * (accept_rate - target). Default 0.574 is Roberts & Rosenthal's asymptotic ESJD-optimal rate for a chain at stationarity. Per-seed vmappable, so --ablate mala_target_acceptance_rate packs its values into one job.")
+    parser.add_argument("--mcmc_proposal_type", type=str, default="euler_maruyama", choices=["euler_maruyama", "gaussian_invariant"], help="Covariance of the MALA proposal N(x - h*grad_U, sigma^2). euler_maruyama (default) is the Langevin discretization, sigma^2 = 2h. gaussian_invariant is sigma^2 = h(2-h): same mean, same score, same MH correction, same number of network passes -- only the variance differs. On a Gaussian target that variance makes the proposal the exact OU/AR(1) transition matching contraction 1-h, so the target is left exactly invariant: MH accepts with probability 1 for every h in (0,2), and h=1 draws an independent exact sample. euler_maruyama instead proposes twice the target covariance and pays for it in rejections. The correction is O(h^2), so the two coincide as h -> 0. Worth trying here because the intermediate diffusion levels are deliberately close to Gaussian and only --mala_steps transitions run per level, which makes finite-step contraction matter more than the small-step diffusion limit euler_maruyama is faithful to. Positive variance requires h < 2, so under gaussian_invariant the step-size cap (see --mala_step_size_max) is pulled to 1.9 -- which binds only at act_dim 2, where the dimension-aware default is 2.14. Note the 0.574 of --mala_target_acceptance_rate is a euler_maruyama asymptotic and is NOT the right target for gaussian_invariant, whose Gaussian limit is acceptance 1, so ablate the two together.")
+    parser.add_argument("--denoising_predictor", type=str, default="DDPM_mean", choices=["Identity", "Identity_then_DDPM_mean", "Identity_then_DDPM_mean_final_k", "DDPM_mean", "DDIM", "DDIM_unguided"], help="Predictor transition after each MALA correction level. Identity skips denoising; DDPM_mean uses the guided DDPM posterior mean; DDIM uses the guided deterministic DDIM update; DDIM_unguided uses the deterministic DDIM update with the *unguided* eps reused from the last MALA gradient (no extra network evals, no x0 clip, ignores --guidance_strength_multiplier; requires --mala_steps >= 1). Identity_then_DDPM_mean is Identity for every transition BETWEEN noise levels and DDPM_mean for the last one (level 0 -> clean), where the posterior mean is exactly the guided Tweedie estimate: the chain -- MALA targets, acceptance rates, schedule cost -- is bit-identical to Identity's, and only the action read off the cleanest level changes, from that level's (still noisy) sample to its clean prediction. Identity_then_DDPM_mean_final_k applies DDPM_mean to the final --ddpm_mean_final_steps transitions and Identity before them.")
+    parser.add_argument("--ddpm_mean_final_steps", type=int, default=1, help="Number of final transitions using DDPM_mean under --denoising_predictor Identity_then_DDPM_mean_final_k. Equivalent to --denoising_predictor DDPM_mean --predictor_final_steps K; kept as its own predictor name for existing runs and analysis scripts.")
+    parser.add_argument("--rollout_denoising_predictor", type=str, default=None, choices=["Identity", "Identity_then_DDPM_mean", "DDPM_mean", "DDIM", "DDIM_unguided"], help="Predictor used ONLY for the action that is executed in the environment (and for the separate --eval_every episodes), leaving --denoising_predictor in charge of the TD next-action and the distillation targets. Default None uses --denoising_predictor for both. These two read-outs want opposite things: the executed action wants the tilt realised exactly, while the training branch wants to KEEP the chain's residual level-0 noise, which is this sampler's only target-policy smoothing -- denoise it and the backup drifts toward argmax_a Q and the critic overestimates. Costs one extra denoising chain per env step at batch --num_vec_envs (negligible next to the batch-size chain the update already runs). Incompatible with --fused_denoising, which by construction reuses the training branch's action to step the env.")
+    parser.add_argument("--rollout_predictor_final_steps", type=int, default=None, help="--predictor_final_steps for the rollout-only predictor selected by --rollout_denoising_predictor. Default None reuses --predictor_final_steps.")
+    parser.add_argument("--predictor_final_steps", type=int, default=0, help="Apply --denoising_predictor only to the last K transitions of the reverse diffusion (the K cleanest levels, t < K) and the Identity predictor -- which leaves the sample where the MALA chain put it -- to every noisier transition. 0 (default) disables the restriction, so the predictor runs at every level exactly as before; K >= --diffusion_steps is the same thing. K=1 means only the final level-0 -> clean read-out is denoised, which for DDPM_mean is the guided Tweedie estimate (see --denoising_predictor Identity_then_DDPM_mean). Guidance still enters every level through the MALA target, so this changes only the transport between levels: smaller K keeps more of the chain's equilibrium sampling and pays fewer guided predictor passes (cost is ~K/T of the full predictor's). Ignored when --denoising_predictor is Identity (nothing to restrict) or Identity_then_DDPM_mean_final_k (which carries its own --ddpm_mean_final_steps).")
 
     return parser
 
 
 def validate_args(args, parser: argparse.ArgumentParser) -> None:
     """Post-parse validation. Calls ``parser.error`` on bad combinations."""
+    def _s_hat_sources():
+        sources = [f"--s_hat {args.s_hat}"] if args.s_hat != 1.0 else []
+        if args.estimate_s_hat:
+            sources.append("--estimate_s_hat")
+        if args.hp_pack_inline is not None and "s_hat" in json.loads(args.hp_pack_inline):
+            sources.append("--hp_pack_inline s_hat")
+        return sources
+
     if isinstance(args.guidance_strength_multiplier, str) and args.guidance_strength_multiplier != "increasing":
         parser.error("--guidance_strength_multiplier only supports the string value 'increasing'")
 
@@ -263,24 +285,62 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
         parser.error("--critic_update_steps must be > 0.")
     if args.policy_update_steps <= 0:
         parser.error("--policy_update_steps must be > 0.")
+    if args.policy_noise_samples_per_target <= 0:
+        parser.error("--policy_noise_samples_per_target must be > 0.")
     if args.distillation_buffer_size <= 0 or args.distillation_steps <= 0:
         parser.error("--distillation_buffer_size and --distillation_steps must be > 0.")
     for _delay_flag in ("delay_target_q_update", "delay_policy_update", "delay_target_policy_update"):
         if getattr(args, _delay_flag) <= 0:
             parser.error(f"--{_delay_flag} must be > 0.")
 
-    # Fused denoising steps the env with the action denoised in the training
-    # branch, which under a target policy would make rollouts target-policy
-    # actions -- the one thing --use_target_policy_training must not change.
-    if args.use_target_policy_training and args.fused_denoising:
-        parser.error("--use_target_policy_training is incompatible with --fused_denoising.")
     if args.mala_steps <= 0:
         parser.error("--mala_steps must be > 0; the non-MALA sampling branches have been removed.")
+    if args.ddpm_mean_final_steps <= 0 or args.ddpm_mean_final_steps > args.diffusion_steps:
+        parser.error(
+            f"--ddpm_mean_final_steps must be in [1, {args.diffusion_steps}] "
+            f"(got {args.ddpm_mean_final_steps})."
+        )
+    if args.predictor_final_steps < 0 or args.predictor_final_steps > args.diffusion_steps:
+        parser.error(
+            f"--predictor_final_steps must be in [0, {args.diffusion_steps}] "
+            f"(got {args.predictor_final_steps}); 0 disables the restriction."
+        )
+    _rollout_override = (args.rollout_denoising_predictor is not None
+                         or args.rollout_predictor_final_steps is not None)
+    if _rollout_override and args.fused_denoising:
+        parser.error(
+            "--rollout_denoising_predictor / --rollout_predictor_final_steps "
+            "decouple the executed action from the training branch's next-action, but "
+            "--fused_denoising reuses that same action to step the env. Drop --fused_denoising "
+            "to decouple them."
+        )
+    # The V-based beta adaptation estimates the tilt's KL from the advantages of the
+    # actions actually executed, which --rollout_alpha draws from a different tilt.
+    if args.rollout_alpha != 1.0 and (args.advantage_normalization or args.kl_budget is not None
+                                      or args.kl_budget_per_dim is not None):
+        parser.error(
+            "--rollout_alpha is incompatible with --advantage_normalization / --kl_budget / "
+            "--kl_budget_per_dim, whose beta adaptation is driven by the executed action's "
+            "advantage and so would feed the rollout tilt back into the update."
+        )
+    if args.rollout_predictor_final_steps is not None and not (
+        0 <= args.rollout_predictor_final_steps <= args.diffusion_steps
+    ):
+        parser.error(
+            f"--rollout_predictor_final_steps must be in [0, {args.diffusion_steps}] "
+            f"(got {args.rollout_predictor_final_steps})."
+        )
+    if args.predictor_final_steps and args.denoising_predictor in (
+        "Identity", "Identity_then_DDPM_mean", "Identity_then_DDPM_mean_final_k"
+    ):
+        parser.error(
+            f"--predictor_final_steps has nothing to restrict under --denoising_predictor "
+            f"{args.denoising_predictor}: use a full predictor (e.g. DDPM_mean, DDIM, "
+            "DDIM_unguided) with it, or --denoising_predictor Identity_then_DDPM_mean_final_k "
+            "with --ddpm_mean_final_steps."
+        )
 
     if args.beta_schedule_type == "adaptive":
-        if args.noise_schedule_warmup < 0:
-            parser.error("--noise_schedule_warmup is a number of updates and must be >= 0 "
-                         f"(got {args.noise_schedule_warmup}).")
         if not (0.0 < args.noise_schedule_gamma <= 1.0):
             parser.error("--noise_schedule_gamma blends the new layout into the old, so it "
                          f"must be in (0, 1] (got {args.noise_schedule_gamma}).")
@@ -293,12 +353,23 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
         # the sampler produces when the predictor moves nothing BETWEEN levels.
         # Identity_then_DDPM_mean qualifies: its one non-identity step is the
         # final read-out to the clean action, below every scored interval.
-        if args.denoising_predictor not in ("Identity", "Identity_then_DDPM_mean"):
+        # Restricting any predictor to the single final transition qualifies for the same
+        # reason: that step is the read-out below every scored interval.
+        _identity_between_levels = (
+            args.denoising_predictor in ("Identity", "Identity_then_DDPM_mean")
+            or args.predictor_final_steps == 1
+            or (args.denoising_predictor == "Identity_then_DDPM_mean_final_k"
+                and args.ddpm_mean_final_steps == 1)
+        )
+        if not _identity_between_levels:
             parser.error(
-                "--beta_schedule_type adaptive is the identity-predictor case of the "
-                "score-optimal cost (it scores adjacent levels at the same sample), so it "
-                "requires --denoising_predictor Identity or Identity_then_DDPM_mean "
-                f"(got {args.denoising_predictor})."
+                "--beta_schedule_type adaptive scores Identity transport between adjacent "
+                "levels at the same inherited sample, so the "
+                "predictor must move nothing BETWEEN levels: use --denoising_predictor "
+                "Identity / Identity_then_DDPM_mean, or restrict the predictor to the final "
+                "transition with --predictor_final_steps 1 "
+                f"(got --denoising_predictor {args.denoising_predictor} with "
+                f"--predictor_final_steps {args.predictor_final_steps})."
             )
         # The cost is a divergence between the exact level-wise scores; the
         # Jacobian-free drift is an approximation to them.
@@ -310,14 +381,39 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
             )
         # The knots already fix each level's log-SNR, so an s_hat shift on top
         # would move the same degree of freedom twice, from two objectives.
-        _s_hat_sources = [f"--s_hat {args.s_hat}"] if args.s_hat != 1.0 else []
-        if args.estimate_s_hat:
-            _s_hat_sources.append("--estimate_s_hat")
-        if args.hp_pack_inline is not None and "s_hat" in json.loads(args.hp_pack_inline):
-            _s_hat_sources.append("--hp_pack_inline s_hat")
-        if _s_hat_sources:
+        s_hat_sources = _s_hat_sources()
+        if s_hat_sources:
             parser.error(
-                f"--beta_schedule_type adaptive is incompatible with {', '.join(_s_hat_sources)}: "
+                f"--beta_schedule_type adaptive is incompatible with {', '.join(s_hat_sources)}: "
                 "its knots already fix where each level sits, so the log-SNR translation "
                 "s_hat would apply on top would double-count."
             )
+
+    if args.beta_schedule_type not in ("linear", "cosine", "constant_kl", "adaptive", "log_snr"):
+        parser.error(f"Unknown --noise_schedule_type {args.beta_schedule_type!r}.")
+    if args.beta_schedule_type == "log_snr":
+        if args.diffusion_steps < 2:
+            parser.error("--noise_schedule_type log_snr requires --diffusion_steps >= 2.")
+        if args.log_snr_max <= args.log_snr_min:
+            parser.error(
+                f"--log_snr_max must exceed --log_snr_min "
+                f"(got {args.log_snr_max} <= {args.log_snr_min})."
+            )
+        if args.inference_spacing == "karras" and args.karras_rho <= 0:
+            parser.error(f"--karras_rho must be > 0 (got {args.karras_rho}).")
+        s_hat_sources = _s_hat_sources()
+        if s_hat_sources:
+            parser.error(
+                f"--noise_schedule_type log_snr is incompatible with {', '.join(s_hat_sources)}: "
+                "its configured endpoints must remain exact."
+            )
+    elif args.inference_spacing != "uniform":
+        parser.error("--inference_spacing is only configurable with --noise_schedule_type log_snr.")
+
+    if args.policy_noise_sampling == "vlb_importance":
+        if args.beta_schedule_type != "log_snr":
+            parser.error("--policy_noise_sampling vlb_importance requires --noise_schedule_type log_snr.")
+        if args.policy_parameterization != "f":
+            parser.error("--policy_noise_sampling vlb_importance requires --policy_parameterization f.")
+    elif args.policy_noise_batch_sampling != "iid":
+        parser.error("--policy_noise_batch_sampling is only configurable with --policy_noise_sampling vlb_importance.")

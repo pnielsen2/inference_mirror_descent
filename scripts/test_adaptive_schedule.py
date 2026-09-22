@@ -3,9 +3,9 @@
 
     JAX_PLATFORMS=cpu python scripts/test_adaptive_schedule.py
 
-The schedule is the score-optimal one of Williams, Campbell, Doucet and Syed,
-NeurIPS 2024: free log-SNR knots, pinned at both ends, moved each batch toward
-the layout that spends equal cost per step. Checks:
+The schedule uses the equal-path-length construction of Williams, Campbell,
+Doucet and Syed, NeurIPS 2024, with a one-step MALA difficulty metric: free
+log-SNR knots are pinned at both ends and moved slowly toward equal cost. Checks:
 
   1. The knots start at cosine's shape cut to [log_snr_min, log_snr_max], with
      the ends exactly on the bounds, and take no s_hat anywhere.
@@ -16,11 +16,11 @@ the layout that spends equal cost per step. Checks:
   3. NoiseLevel.at(grid) == NoiseLevel.from_log_snr(lambda) on-grid; the
      continuous schedule interpolates the knots and hits them on the u grid; and
      the fixed families still condition on the level index.
-  4. The recorded per-interval cost is what it claims: the squared score gap
-     between adjacent levels at the SHARED sample, weighted by that level's MALA
-     step size squared (v = h, not the paper's sigma), recomputed from scratch
-     against the levels the sampler visited, including the N(0,I) end whose score
-     is -x. Asking for it does not perturb the trajectory.
+  4. The recorded per-interval cost is what it claims: the mean squared score
+     gap between adjacent levels at the SHARED sample, normalized by that level's
+     one-step MALA proposal scale h, recomputed from scratch against the levels the
+     sampler visited, including the N(0,I) end whose score is -x. Asking for it
+     does not perturb the trajectory.
   5. The update is Algorithm 1: endpoints stay pinned, the ladder stays
      decreasing, an already-equal-cost ladder is a fixed point, cost concentrated
      in one region pulls knots into it, and gamma scales the move linearly.
@@ -39,10 +39,12 @@ from relax.algorithm import noise_schedule
 from relax.algorithm.mala_sampler import build_mala_sampler, build_target_energy
 from relax.algorithm.mgmd import MGMD, _aggregate_q
 from relax.algorithm.mgmd_types import MGMDConfig
+from relax.cli.train_args import build_parser
 from relax.cli.train_setup import _mish
 from relax.network.actor_critic import ActorCritic
 from relax.utils.diffusion import (
-    NoiseLevel, build_beta_schedule, cosine_log_snr_knots, log_snr_at,
+    NoiseLevel, build_beta_schedule, build_log_snr_schedule, continuous_vlb_loss,
+    cosine_log_snr_knots, log_snr_at, sample_vlb_log_snr,
     schedule_from_log_snr, shift_schedule,
 )
 from relax.utils.experience import Experience
@@ -57,12 +59,21 @@ ENERGY_KW = dict(ema_normalization=False, batch_advantage_normalization=False,
 AGG = lambda qs: _aggregate_q(qs, "mean")
 
 
-def make(schedule_type, **cfg_kw):
+def make(schedule_type, policy_parameterization="E", inference_spacing="uniform",
+         expected_policy_batch=None, **cfg_kw):
     model = ActorCritic.create(
         OBS, ACT, [16, 16], [16, 16], _mish, num_timesteps=T,
         beta_schedule_type=schedule_type, mala_steps=1, num_q_networks=2,
         x_recon_clip_radius=float("inf"), snr_max=124.0,
-        policy_parameterization="E", policy_final_layer="ff")
+        policy_parameterization=policy_parameterization, policy_final_layer="ff",
+        inference_spacing=inference_spacing)
+    if expected_policy_batch is not None:
+        eps_pred = model.eps_pred
+        def checked_eps_pred(params, level, obs, act):
+            if act.ndim == 2:
+                assert act.shape[0] == expected_policy_batch
+            return eps_pred(params, level, obs, act)
+        model = dataclasses.replace(model, eps_pred=checked_eps_pred)
     params_list = [model.init_params(jax.random.PRNGKey(s)) for s in range(SEEDS)]
     cfg = MGMDConfig(
         alpha=1.0, beta=1.0, T=0.0, eta=1.0, num_denoised_actions=K, batch_size=B,
@@ -77,6 +88,10 @@ def make(schedule_type, **cfg_kw):
 
 def main():
     import inspect
+
+    args = build_parser().parse_args([])
+    assert args.noise_schedule_gamma == 1e-6
+    assert not hasattr(args, "noise_schedule_warmup")
 
     print("--- 1. knots: cosine truncated to the bounds, ends pinned, no s_hat ---")
     # Read off the built state, so this tests the initialization the flags
@@ -136,7 +151,41 @@ def main():
     assert np.allclose(np.asarray(cos.t_cond), np.arange(T)), "fixed family: index"
     print("  ok")
 
-    print("--- 4. the recorded cost is h^2 * squared score gap at the shared x ---")
+    print("--- 3b. fixed log-SNR inference spacing and continuous VLB proposal ---")
+    log_min, log_max = -8.0, 15.0
+    karras_rho = 7.0
+    for spacing in ("uniform", "karras"):
+        fixed = build_log_snr_schedule(T, log_min, log_max, spacing, karras_rho=karras_rho)
+        fixed_lam = np.asarray(fixed.t_cond, np.float64)
+        assert fixed_lam[0] == log_max and fixed_lam[-1] == log_min
+        assert fixed_lam[::-1][0] == log_min and fixed_lam[::-1][-1] == log_max
+        assert np.all(np.diff(fixed_lam) < 0)
+        assert all(np.isfinite(np.asarray(v)).all() for v in fixed)
+        coordinate = (fixed_lam if spacing == "uniform"
+                      else np.exp(-fixed_lam / 2) ** (1 / karras_rho))
+        assert np.allclose(np.diff(coordinate), np.diff(coordinate)[0], rtol=2e-5, atol=2e-7)
+        fixed_model = make("log_snr", inference_spacing=spacing).model
+        handed_out = fixed_model.schedule_for(None)
+        assert np.allclose(np.asarray(handed_out.t_cond), fixed_lam, rtol=1e-6)
+    assert np.isclose(float(continuous_vlb_loss(jnp.ones((2, 3)), jnp.asarray([2.0, 4.0]))), 4.5)
+    for sampling, n in (("iid", 65536), ("stratified", 4096)):
+        sampled, inverse_q = sample_vlb_log_snr(
+            jax.random.PRNGKey(11), n, log_min, log_max, sampling)
+        sampled_lam = np.asarray(sampled.cond, np.float64)
+        sampled_y = np.arcsinh(np.exp(sampled_lam / 2))
+        y_min, y_max = np.arcsinh(np.exp(log_min / 2)), np.arcsinh(np.exp(log_max / 2))
+        u = (sampled_y - y_min) / (y_max - y_min)
+        assert np.all((u >= 0) & (u < 1))
+        assert abs(u.mean() - 0.5) < 5e-3
+        if sampling == "stratified":
+            assert np.array_equal(np.sort(np.floor(u * n).astype(int)), np.arange(n))
+        z = 2 * (y_max - y_min)
+        assert np.allclose(np.asarray(inverse_q), z / np.tanh(sampled_y), rtol=3e-5)
+        estimate = np.mean(np.asarray(inverse_q) * np.asarray(sampled.sqrt_abar))
+        assert np.isclose(estimate, z, rtol=3e-5)
+    print("  uniform/Karras endpoints exact; IID/stratified proposal and VLB reduction match")
+
+    print("--- 4. the recorded cost is h * mean squared score gap at the shared x ---")
     rng = np.random.default_rng(0)
     obs = jnp.asarray(rng.standard_normal((B, OBS)), jnp.float32)
     energy_total, _, _ = build_target_energy(
@@ -171,10 +220,8 @@ def main():
             # The score it arrives with: level j+1's, or the prior's (-x) at the top.
             prev = x if j + 1 == T else gradU(x, lam_j[j + 1])
             gap = gradU(x, lam_j[j]) - prev
-            # v(t') = this level's MALA step size (log_eta_scale = 0 at init),
-            # not the paper's sigma(t') -- see noise_schedule.
             h = float(np.clip(max(float(sc.betas[j]), 1e-8), 1e-8, 0.5))
-            ref = h * h * float(jnp.mean(jnp.sum(gap * gap, -1)))
+            ref = h * float(jnp.mean(jnp.mean(gap * gap, axis=-1)))
             assert np.isclose(cost[j], ref, rtol=2e-4), (steps, j, cost[j], ref)
         assert np.allclose(np.asarray(sample(m, schedule_cost=False).action),
                            np.asarray(r.action), rtol=2e-4, atol=2e-5), "scoring moved the chain"
@@ -227,6 +274,8 @@ def main():
     # ... and gamma is a plain convex combination of old and new.
     for g in (0.1, 0.5):
         assert np.allclose(at_gamma(g, lop), (1 - g) * lam + g * at_gamma(1.0, lop), atol=1e-4), g
+    slow = at_gamma(1e-6, lop)
+    assert np.any(slow != lam) and np.max(np.abs(slow - lam)) < 2e-5, slow - lam
     print(f"  ends pinned at ({moved[0]:.1f}, {moved[-1]:.1f}); equal cost is a fixed point; "
           f"lopsided cost moves the mean {lam.mean():.2f} -> {at_gamma(1.0, lop).mean():.2f}")
 
@@ -246,7 +295,15 @@ def main():
         # FALL toward the noisy end. Rising means d x0hat/dx still carries
         # 1/sqrt(abar) and the cost is not yet worth descending.
         "Schedule/x0hat_clip_cleanest", "Schedule/x0hat_clip_noisiest"}, sorted(scalar_info)
-    assert not any(k.startswith("Schedule") for k in array_info), sorted(array_info)
+    assert not array_info, sorted(array_info)
+    assert {k for k in scalar_info if k.startswith("MALA/")} == {
+        "MALA/acceptance_rate_mean", "MALA/acceptance_rate_min",
+        "MALA/acceptance_rate_cleanest", "MALA/acceptance_rate_noisiest",
+        "MALA/clip_frac_mean", "MALA/clip_frac_max",
+        "MALA/clip_frac_cleanest", "MALA/clip_frac_noisiest",
+        "MALA/step_size_mean", "MALA/step_size_min", "MALA/step_size_max",
+        "MALA/step_size_cleanest", "MALA/step_size_noisiest",
+    }
     for k, v in scalar_info.items():
         if k.startswith("Schedule"):
             assert np.isfinite(np.asarray(v)).all(), k
@@ -259,6 +316,17 @@ def main():
     assert not any(k.startswith("Schedule") for k in {**cos_scalar, **cos_array})
     assert cos_alg.state.log_snr_levels is None, "fixed families carry no knots"
     print("  cosine run logs no Schedule/* keys and carries no knots")
+    vlb_alg = make(
+        "log_snr", policy_parameterization="f", expected_policy_batch=3 * B,
+        policy_noise_sampling="vlb_importance", policy_noise_batch_sampling="iid",
+        policy_noise_samples_per_target=3)
+    vlb_scalar, _, _ = vlb_alg.update_vmap(keys, data, env_step=0.0)
+    assert np.all(np.asarray(vlb_alg.state.opt_state.policy.count) == K)
+    assert "losses/Policy_VLB_bits" in vlb_scalar
+    assert "losses/Policy_epsilon_MSE" not in vlb_scalar
+    expected_bits = np.asarray(vlb_alg.state.policy_loss) / np.log(2.0)
+    assert np.allclose(vlb_scalar["losses/Policy_VLB_bits"], expected_bits, rtol=1e-5)
+    print("  three corruptions per target preserve one Adam step per ordinary distillation minibatch")
 
     print("--- 7. adaptive adds no per-sample work to the sampler ---")
     def sampler_flops(alg_, batch):
