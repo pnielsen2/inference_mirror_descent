@@ -96,6 +96,7 @@ if __name__ == "__main__":
         eval_every=args.eval_every,
         eval_n_episodes=args.eval_n_episodes,
         eval_best_of_n_actions=args.eval_best_of_n_actions,
+        eval_sampler_kind=None if args.eval_sampler == "policy" else args.eval_sampler,
         eval_seed=args.eval_seed,
     )
     trainer.setup(Experience.create_example(obs_dim, act_dim, trainer.batch_size))

@@ -64,8 +64,8 @@ def build(sweeps, out: Path = OUT) -> pd.DataFrame:
         if c in df:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     # Composite-MD effective coefficients: pi_new ~ pi_old^alpha exp(beta Q).
-    df["alpha_eff"] = 1.0 / (1.0 + df.eta * df["T"])
-    df["beta_eff"] = df.eta / (1.0 + df.eta * df["T"])
+    df["alpha_eff"] = df["alpha"] if "alpha" in df else 1.0 / (1.0 + df.eta * df["T"])
+    df["beta_eff"] = df["beta"] if "beta" in df else df.eta / (1.0 + df.eta * df["T"])
     df["frac_done"] = df.step / df.total_step
 
     # guidance_strength_multiplier mixes floats with the literal "increasing",

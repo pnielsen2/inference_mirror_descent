@@ -24,6 +24,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from cleanrl_utils.buffers import ReplayBuffer
 from relax.dmc import register_dmc_envs
+from relax.humanoidbench import register_humanoidbench_envs
 
 
 @dataclass
@@ -56,6 +57,10 @@ class Args:
     """how to aggregate the twin critics when scoring eval candidates: 'min' (SAC's own pessimistic value, as used in its actor loss) or 'mean'"""
     eval_csv_output: str = None
     """path to write the eval CSV (env_step, train_step, eval_best_of_n_actions, episode_index, episode_return, episode_length)"""
+    eval_mean_action: bool = False
+    """also evaluate the deterministic squashed mean of the Gaussian policy"""
+    eval_mean_csv_output: str = None
+    """path to write Gaussian-mean eval episodes (env_step, train_step, episode_index, episode_return, episode_length)"""
 
     # Algorithm specific arguments
     env_id: str = "Hopper-v4"
@@ -86,6 +91,10 @@ class Args:
     """Entropy regularization coefficient."""
     autotune: bool = True
     """automatic tuning of the entropy coefficient"""
+    critic_hidden_layers: int = 2
+    """number of hidden layers in each twin critic. 2 is SAC's published architecture; 3 matches the critic used by the diffusion-policy baselines"""
+    critic_hidden_dim: int = 256
+    """width of each critic hidden layer"""
 
 
 def make_env(env_id, seed, idx, capture_video, run_name):
@@ -104,21 +113,24 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 
 # ALGO LOGIC: initialize agent here:
 class SoftQNetwork(nn.Module):
-    def __init__(self, env):
+    def __init__(self, env, hidden_layers: int = 2, hidden_dim: int = 256):
         super().__init__()
-        self.fc1 = nn.Linear(
-            np.array(env.single_observation_space.shape).prod() + np.prod(env.single_action_space.shape),
-            256,
+        if hidden_layers < 1:
+            raise ValueError(f"critic_hidden_layers must be >= 1, got {hidden_layers}")
+        in_dim = int(
+            np.array(env.single_observation_space.shape).prod() + np.prod(env.single_action_space.shape)
         )
-        self.fc2 = nn.Linear(256, 256)
-        self.fc3 = nn.Linear(256, 1)
+        dims = [in_dim] + [hidden_dim] * hidden_layers
+        self.hidden = nn.ModuleList(
+            [nn.Linear(dims[i], dims[i + 1]) for i in range(hidden_layers)]
+        )
+        self.out = nn.Linear(hidden_dim, 1)
 
     def forward(self, x, a):
         x = torch.cat([x, a], 1)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = self.fc3(x)
-        return x
+        for layer in self.hidden:
+            x = F.relu(layer(x))
+        return self.out(x)
 
 
 LOG_STD_MAX = 2
@@ -239,6 +251,28 @@ def run_eval_episodes(actor, qf1, qf2, eval_envs, device, n_episodes, n_values, 
     return out
 
 
+def run_mean_eval_episodes(actor, eval_env, device, n_episodes, episode_seeds=None):
+    returns, lengths = [], []
+    for ep_idx in range(n_episodes):
+        seed = None if episode_seeds is None else int(episode_seeds[ep_idx])
+        obs, _ = eval_env.reset(seed=seed)
+        ep_return = 0.0
+        ep_length = 0
+        while True:
+            with torch.no_grad():
+                obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device).reshape(1, -1)
+                mean, _ = actor(obs_tensor)
+                action = torch.tanh(mean) * actor.action_scale + actor.action_bias
+            obs, reward, terminated, truncated, _ = eval_env.step(action.squeeze(0).cpu().numpy())
+            ep_return += float(reward)
+            ep_length += 1
+            if bool(terminated) or bool(truncated):
+                break
+        returns.append(ep_return)
+        lengths.append(ep_length)
+    return returns, lengths
+
+
 if __name__ == "__main__":
 
     args = tyro.cli(Args)
@@ -247,6 +281,8 @@ if __name__ == "__main__":
     eval_n_values = sorted({int(n) for n in args.eval_best_of_n})
     if any(n < 1 for n in eval_n_values):
         raise ValueError(f"--eval-best-of-n values must be >= 1, got {args.eval_best_of_n}")
+    if args.eval_mean_csv_output and not args.eval_mean_action:
+        raise ValueError("--eval-mean-csv-output requires --eval-mean-action")
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
@@ -275,10 +311,10 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # env setup
-    # Teaches gymnasium the dmc/ ids and puts the FlattenObservation for
-    # dm_control's Dict observations behind them. SyncVectorEnv builds its envs
-    # in THIS process, so this one call also covers the eval envs made below.
+    # Register optional benchmark namespaces before SyncVectorEnv constructs
+    # training and evaluation envs in this process.
     register_dmc_envs(args.env_id)
+    register_humanoidbench_envs(args.env_id)
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
     )
@@ -287,10 +323,11 @@ if __name__ == "__main__":
     max_action = float(envs.single_action_space.high[0])
 
     actor = Actor(envs).to(device)
-    qf1 = SoftQNetwork(envs).to(device)
-    qf2 = SoftQNetwork(envs).to(device)
-    qf1_target = SoftQNetwork(envs).to(device)
-    qf2_target = SoftQNetwork(envs).to(device)
+    make_critic = lambda: SoftQNetwork(envs, args.critic_hidden_layers, args.critic_hidden_dim).to(device)
+    qf1 = make_critic()
+    qf2 = make_critic()
+    qf1_target = make_critic()
+    qf2_target = make_critic()
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
     q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
@@ -331,12 +368,16 @@ if __name__ == "__main__":
     # would have drawn: combined with the torch RNG snapshot below, the training
     # curve is identical to the same run with --eval-every 0.
     eval_envs = []
+    eval_mean_env = None
     eval_csv_file = None
     eval_csv_writer = None
+    eval_mean_csv_file = None
+    eval_mean_csv_writer = None
     if args.eval_every:
         # One env per N so the N sweep can be stepped in lockstep from a common
         # start state; each is reset with an explicit per-episode seed below.
         eval_envs = [gym.make(args.env_id) for _ in eval_n_values]
+        eval_mean_env = gym.make(args.env_id) if args.eval_mean_action else None
         if args.eval_csv_output:
             eval_csv_path = Path(args.eval_csv_output)
             eval_csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -345,6 +386,14 @@ if __name__ == "__main__":
             eval_csv_writer.writerow([
                 "env_step", "train_step", "eval_best_of_n_actions",
                 "episode_index", "episode_return", "episode_length",
+            ])
+        if args.eval_mean_csv_output:
+            eval_mean_csv_path = Path(args.eval_mean_csv_output)
+            eval_mean_csv_path.parent.mkdir(parents=True, exist_ok=True)
+            eval_mean_csv_file = open(eval_mean_csv_path, "w", newline="")
+            eval_mean_csv_writer = csv.writer(eval_mean_csv_file)
+            eval_mean_csv_writer.writerow([
+                "env_step", "train_step", "episode_index", "episode_return", "episode_length",
             ])
 
     # TRY NOT TO MODIFY: start the game
@@ -485,6 +534,7 @@ if __name__ == "__main__":
             # Snapshot/restore so the eval action samples do not advance the
             # training stream (torch.distributions has no per-call generator).
             torch_rng_state = torch.get_rng_state()
+            cuda_rng_states = torch.cuda.get_rng_state_all() if device.type == "cuda" else None
             # Same start states and same actor-noise stream for every N at this
             # checkpoint, so the N curves differ only through the argmax.
             eval_seed = args.seed + 100_000 + global_step
@@ -496,7 +546,16 @@ if __name__ == "__main__":
                 args.eval_episodes, eval_n_values, args.eval_q_agg,
                 episode_seeds=episode_seeds,
             )
+            mean_eval_results = (
+                run_mean_eval_episodes(
+                    actor, eval_mean_env, device, args.eval_episodes,
+                    episode_seeds=episode_seeds,
+                )
+                if eval_mean_env is not None else None
+            )
             torch.set_rng_state(torch_rng_state)
+            if cuda_rng_states is not None:
+                torch.cuda.set_rng_state_all(cuda_rng_states)
             for n_candidates in eval_n_values:
                 eval_returns, eval_lengths = eval_results[n_candidates]
                 mean_return = float(np.mean(eval_returns))
@@ -517,13 +576,35 @@ if __name__ == "__main__":
                             ep_idx, ep_ret, ep_len,
                         ])
                     eval_csv_file.flush()
-            print(f"eval env_step={global_step} all_N took={time.time() - eval_start:.0f}s", flush=True)
+            if mean_eval_results is not None:
+                eval_returns, eval_lengths = mean_eval_results
+                mean_return = float(np.mean(eval_returns))
+                print(
+                    f"eval env_step={global_step} gaussian_mean episodes={args.eval_episodes} "
+                    f"return_mean={mean_return:.1f} return_std={float(np.std(eval_returns)):.1f} "
+                    f"length_mean={float(np.mean(eval_lengths)):.0f}",
+                    flush=True,
+                )
+                writer.add_scalar("eval/mean/episode_return_mean", mean_return, global_step)
+                writer.add_scalar("eval/mean/episode_return_std", float(np.std(eval_returns)), global_step)
+                writer.add_scalar("eval/mean/episode_length_mean", float(np.mean(eval_lengths)), global_step)
+                if eval_mean_csv_writer:
+                    for ep_idx, (ep_ret, ep_len) in enumerate(zip(eval_returns, eval_lengths)):
+                        eval_mean_csv_writer.writerow([
+                            global_step, total_episode_steps, ep_idx, ep_ret, ep_len,
+                        ])
+                    eval_mean_csv_file.flush()
+            print(f"eval env_step={global_step} all_modes took={time.time() - eval_start:.0f}s", flush=True)
 
     envs.close()
     for eval_env in eval_envs:
         eval_env.close()
+    if eval_mean_env is not None:
+        eval_mean_env.close()
     writer.close()
     if csv_file:
         csv_file.close()
     if eval_csv_file:
         eval_csv_file.close()
+    if eval_mean_csv_file:
+        eval_mean_csv_file.close()

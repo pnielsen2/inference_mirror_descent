@@ -104,6 +104,7 @@ class VmapOffPolicyTrainer:
         eval_every: int = 0,
         eval_n_episodes: int = 10,
         eval_best_of_n_actions: int = 1,
+        eval_sampler_kind: Optional[str] = None,
         eval_seed: int = 0,
     ):
         self.env = env
@@ -215,6 +216,7 @@ class VmapOffPolicyTrainer:
             every=eval_every,
             n_episodes=eval_n_episodes,
             best_of_n=eval_best_of_n_actions,
+            sampler_kind=eval_sampler_kind,
             seed=eval_seed,
         )
 

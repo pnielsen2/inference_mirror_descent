@@ -1,0 +1,245 @@
+\documentclass[10pt]{article}
+
+\usepackage[letterpaper,margin=0.58in]{geometry}
+\usepackage{amsmath,amssymb,booktabs,microtype}
+\usepackage[colorlinks=true,allcolors=blue]{hyperref}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\operatorname{Var}}
+\newcommand{\Cov}{\operatorname{Cov}}
+\newcommand{\ESS}{\operatorname{ESS}}
+\newcommand{\R}{\mathrm{R}}
+\newcommand{\sel}{\mathrm{sel}}
+\newcommand{\dir}{\mathrm{dir}}
+\newcommand{\IS}{\mathrm{IS}}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{1pt}
+\setlength{\abovedisplayskip}{2pt}
+\setlength{\belowdisplayskip}{2pt}
+\setlength{\abovedisplayshortskip}{2pt}
+\setlength{\belowdisplayshortskip}{2pt}
+\makeatletter
+\renewcommand\section{\@startsection{section}{1}{\z@}{5pt plus 1pt minus 1pt}{2pt plus 1pt}{\normalfont\large\bfseries}}
+\makeatother
+
+\title{Boltzmann Sampling versus Exponential Reweighting}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-3em}
+
+\begin{abstract}
+A direct Boltzmann sample is one noisy, equally weighted training target.
+Self-normalized reweighting uses every proposal, but its effective sample size
+can collapse exponentially with critic scale.  For fixed proposals, the
+weighted estimator is the conditional mean of one Boltzmann-selected target and
+therefore has lower variance.  Direct sampling instead avoids importance
+weights and their finite-sample bias.
+\end{abstract}
+\vspace{-0.7em}
+\small
+
+\section{Target distribution and quantity of interest}
+Fix one state $s$ throughout and suppress it from the notation:
+$\pi(a):=\pi(a\mid s)$, $Q(a):=Q(s,a)$, and
+$\pi_\theta(a):=\pi_\theta(a\mid s)$.  Let $a$ denote a random action and
+$\eta\geq0$ the inverse temperature (or mirror-descent step size).  Write
+$\E_\rho$, $\Var_\rho$, and $\Cov_\rho$ for moments under $a\sim\rho$; without
+subscripts they cover all displayed random draws.  Define
+\begin{equation}
+  w_\eta(a)=\exp\!\bigl(\eta Q(a)\bigr),\qquad
+  Z_\eta=\E_\pi[w_\eta(a)],\qquad
+  \pi_\eta(a)=\frac{\pi(a)w_\eta(a)}{Z_\eta}.
+  \label{eq:tilt}
+\end{equation}
+Here $w_\eta$ is the unnormalized importance weight, $Z_\eta$ its normalizer,
+and $\pi_\eta$ the Boltzmann-improved policy.  Let $h(a)$ be a scalar loss or
+gradient coordinate, e.g.\ $-\log\pi_\theta(a)$.  The target is
+\begin{equation}
+  \mu_h=\E_{\pi_\eta}[h(a)].
+  \label{eq:estimand}
+\end{equation}
+For optimization this applies componentwise to the gradient vector, whose
+covariance controls update noise; sampled actions, $Q$ values, and weights are
+held fixed when differentiating.
+
+For an integer $K\geq1$ and independent and identically distributed (i.i.d.)
+draws $a_1,\ldots,a_K\sim\pi_\eta$,
+\begin{equation}
+  \widehat\mu_{\dir}=\frac1K\sum_{i=1}^K h(a_i),
+  \qquad \sigma_\eta^2=\Var_{\pi_\eta}(h(a)),
+  \qquad
+  \Var(\widehat\mu_{\dir})=\frac{\sigma_\eta^2}{K}.
+  \label{eq:direct}
+\end{equation}
+At $K=1$ the target is noisy, but an exact sampler has neither unequal
+importance weights nor finite-$K$ ratio-of-means bias.
+
+\section{Reweighting and selection from the same proposals}
+Suppose instead that $a_{1:K}:=(a_1,\ldots,a_K)$ are i.i.d. draws from $\pi$ and
+set
+\begin{equation}
+  \bar w_i=\frac{w_\eta(a_i)}{\sum_{j=1}^K w_\eta(a_j)},
+  \qquad
+  \widehat\mu_{\R}=\sum_{i=1}^K\bar w_i h(a_i).
+  \label{eq:snis}
+\end{equation}
+This is self-normalized importance sampling (SNIS).  Its summands are dependent
+because they share the random denominator, so in general
+$\Var(\widehat\mu_{\R})\neq K\Var(\bar w_1h(a_1))$.  As $K\to\infty$,
+under standard moment regularity, define the importance-sampling asymptotic
+variance and obtain
+\begin{align}
+  \sigma_{\IS}^2&=
+  \E_\pi\!\left[\left(\frac{w_\eta(a)}{Z_\eta}\right)^2
+  (h(a)-\mu_h)^2\right],\\[-2pt]
+  \sqrt K(\widehat\mu_{\R}-\mu_h)&\ \xrightarrow{d}\
+  \mathcal N(0,\sigma_{\IS}^2),
+  \label{eq:snis-clt}\\[-2pt]
+  \E[\widehat\mu_{\R}]-\mu_h
+  &=-\frac1K\E_\pi\!\left[\left(\frac{w_\eta(a)}{Z_\eta}\right)^2
+  (h(a)-\mu_h)\right]+O(K^{-2}).
+  \label{eq:snis-bias}
+\end{align}
+Consequently $\Var(\widehat\mu_{\R})=\sigma_{\IS}^2/K+O(K^{-2})$, and SNIS
+has a first-order $K^{-1}$ bias.  The exact variance also depends on whether
+large $Q(a)$ coincides with large $(h(a)-\mu_h)^2$; $\Var_\pi(Q(a))$ alone is
+only a weight-degeneracy proxy.
+
+With $\bar w_{1:K}:=(\bar w_1,\ldots,\bar w_K)$, let
+$\operatorname{Categorical}(\bar w_{1:K})$ select index $i$ with probability
+$\bar w_i$.  Draw one index conditionally on the proposals,
+\begin{equation}
+  i^\star\mid a_{1:K}\sim\operatorname{Categorical}(\bar w_{1:K}),
+  \qquad \widehat\mu_{\sel}=h(a_{i^\star}).
+  \label{eq:selection}
+\end{equation}
+This is finite-candidate Boltzmann selection, also called
+sampling--importance--resampling.  Conditioning on the proposals yields the
+exact identities
+\begin{align}
+  \E[\widehat\mu_{\sel}\mid a_{1:K}]&=\widehat\mu_{\R},\label{eq:rb-mean}\\
+  \Var(\widehat\mu_{\sel}\mid a_{1:K})
+  &=\sum_{i=1}^K\bar w_i\bigl(h(a_i)-\widehat\mu_{\R}\bigr)^2,\label{eq:rb-cond}\\
+  \Var(\widehat\mu_{\sel})
+  &=\Var(\widehat\mu_{\R})+
+  \E\!\left[\sum_{i=1}^K\bar w_i
+  \bigl(h(a_i)-\widehat\mu_{\R}\bigr)^2\right].
+  \label{eq:rb}
+\end{align}
+The first identity makes $\widehat\mu_{\R}$ the conditional expectation of
+$\widehat\mu_{\sel}$---its Rao--Blackwellization---so it cannot be noisier for
+the same candidate set and per-candidate losses.  Both estimators have the same
+finite-$K$ mean and therefore the same bias in \eqref{eq:snis-bias}.  However,
+as $K\to\infty$,
+\begin{equation}
+  \Var(\widehat\mu_{\R})\to0,
+  \qquad
+  \Var(\widehat\mu_{\sel})\to\sigma_\eta^2.
+  \label{eq:limits}
+\end{equation}
+More candidates make the selected action's distribution closer to $\pi_\eta$
+but do not average away the noise of the one selected target.  If an integer
+$R\geq1$ counts conditionally independent resampled indices, their average has
+variance $\Var(\widehat\mu_{\R})+
+R^{-1}\E[\Var(\widehat\mu_{\sel}\mid a_{1:K})]$; using all weighted losses is
+the $R\to\infty$ limit.
+
+\section{Effective sample size and critic scale}
+For positive $x$ under policy $\rho$, its \emph{coefficient of variation} is
+$\operatorname{CV}_\rho(x):=\sqrt{\Var_\rho(x)}/\E_\rho[x]$, the standard
+deviation relative to the mean.  Set $w_i:=w_\eta(a_i)$.  The realized effective
+sample size (ESS) and its large-$K$ limit are
+\begin{equation}
+  \ESS_K:=\frac{(\sum_i w_i)^2}{\sum_i w_i^2},
+  \qquad
+  \frac{\ESS_K}{K}\xrightarrow[]{p}
+  \frac{Z_\eta^2}{\E_\pi[w_\eta(a)^2]}
+  =\frac{1}{1+\operatorname{CV}_\pi^2(w_\eta(a))}.
+  \label{eq:ess}
+\end{equation}
+Below, $\approx$ means that $\ESS_K/K$ is replaced by this large-$K$ limit.
+Let $\psi_Q(t):=\log\E_\pi[e^{tQ(a)}]$ be the cumulant-generating function of
+$Q(a)$ under $\pi$.  Then
+\begin{equation}
+  1+\operatorname{CV}_\pi^2(w_\eta(a))
+  =\exp\!\bigl(\psi_Q(2\eta)-2\psi_Q(\eta)\bigr),
+  \quad
+  \ESS_K\approx K\exp\!\bigl[-\psi_Q(2\eta)+2\psi_Q(\eta)\bigr].
+  \label{eq:ess-cgf}
+\end{equation}
+Define $\sigma_Q:=\sqrt{\Var_\pi(Q(a))}$ and
+$\kappa_3:=\E_\pi[(Q(a)-\E_\pi Q(a))^3]$, the third cumulant.  For small $\eta$,
+the exponent is $\eta^2\sigma_Q^2+\eta^3\kappa_3$ plus terms of fourth and
+higher order in $\eta$.  If $Q(a)$ is Gaussian under $\pi$, the population ESS
+fraction is exactly $e^{-\eta^2\sigma_Q^2}$, hence
+\begin{equation}
+  \ESS_K\approx K\exp\!\bigl(-\eta^2\sigma_Q^2\bigr).
+  \label{eq:gaussian-ess}
+\end{equation}
+Thus the dimensionless severity is $\tau:=\eta\sigma_Q$.  To obtain a desired
+effective count $M$, one needs roughly $K\approx M e^{\tau^2}$ proposals; the
+realized value cannot fall below $1$.  Additive shifts of $Q$ cancel.  Noise in
+a learned critic estimate $\widehat Q$ instead increases the spread of
+$\eta\widehat Q$ and can collapse ESS like true action variation.
+
+\section{Diffusion-training noise at the fixed state}
+Let the vector $g(a,\xi)$ be one stochastic gradient, where $\xi$ contains the
+random diffusion time and Gaussian noise.  The operators $\E_\xi$ and
+$\Cov_\xi$ average only over $\xi$ at fixed $a$, and ${}^\top$ denotes
+transpose.  Define
+\begin{align}
+  m(a)&=\E_\xi[g(a,\xi)], &
+  \mu_g&=\E_{\pi_\eta}[m(a)],\\
+  \Sigma_\eta&=\Cov_{\pi_\eta}(m(a))
+  +\E_{\pi_\eta}[\Cov_\xi(g\mid a)],\\
+  \Sigma_{\IS}&=\E_\pi\!\left[\left(\frac{w_\eta(a)}{Z_\eta}\right)^2
+  \left\{(m(a)-\mu_g)(m(a)-\mu_g)^\top+\Cov_\xi(g\mid a)\right\}\right].
+\end{align}
+For direct sampling take $a_i\sim\pi_\eta$; for reweighting or selection take
+$a_i\sim\pi$ and use \eqref{eq:snis}.  With independent $\xi_i$, define
+\begin{equation}
+  \widehat g_{\dir,K}=\frac1K\sum_{i=1}^K g(a_i,\xi_i),\qquad
+  \widehat g_{\R}=\sum_{i=1}^K\bar w_i g(a_i,\xi_i),\qquad
+  \widehat g_{\sel}=g(a_{i^\star},\xi_{i^\star}).
+\end{equation}
+Their covariance scaling is
+\begin{align}
+  \Cov(\widehat g_{\dir,1})&=\Sigma_\eta,
+  &\Cov(\widehat g_{\dir,K})&=\frac{\Sigma_\eta}{K},\\
+  \Cov(\widehat g_{\R})&=\frac{\Sigma_{\IS}}{K}+O(K^{-2}),
+  &\Cov(\widehat g_{\sel})&\longrightarrow\Sigma_\eta.
+  \label{eq:fixed-state-cov}
+\end{align}
+
+\textbf{Noise-scaling summary.}
+\begin{itemize}
+\setlength{\itemsep}{1pt}
+\setlength{\topsep}{2pt}
+\setlength{\parsep}{0pt}
+\setlength{\parskip}{0pt}
+\item \textbf{Direct tilted sampling (MGMD).}
+Averaging $K$ independent tilted actions reduces action and diffusion noise as
+$K^{-1}$.  The usual one-action MGMD update has $K=1$ and covariance
+$\Sigma_\eta$.  Increasing $\eta\sigma_Q$ changes $\Sigma_\eta$ but introduces
+no importance-weight ESS factor; an incompletely mixed Metropolis-adjusted
+Langevin algorithm (MALA) chain instead adds sampler bias.
+\item \textbf{Self-normalized reweighting.}
+The covariance scales as $K^{-1}\Sigma_{\IS}$ and the bias as $K^{-1}$.  The
+effective candidate count is
+$\ESS_K\approx K/(1+\operatorname{CV}_\pi^2(w_\eta(a)))$.  For Gaussian $Q$ and
+weak association between weights and squared gradient residuals, the weight
+inflation scales as $e^{\eta^2\sigma_Q^2}$, so covariance decays like
+$e^{\eta^2\sigma_Q^2}/K$ up to the unweighted gradient scale.  Critic noise
+increases the same factor through CV.
+\item \textbf{One-action Boltzmann selection.}
+Its covariance approaches $\Sigma_\eta$, so it remains order one in $K$.
+Increasing $K$ reduces the finite-candidate bias as $K^{-1}$ but does not average
+the selected target.  Averaging $R$ categorical resamples reduces the added
+selection variance as $R^{-1}$, down to the reweighting floor.
+\end{itemize}
+
+\end{document}

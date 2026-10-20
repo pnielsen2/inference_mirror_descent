@@ -6,6 +6,7 @@ model → run trainer) without paging past per-seed init loops or
 KL-budget plumbing.
 """
 import json
+import math
 from typing import List, Tuple
 
 import jax, jax.numpy as jnp
@@ -25,24 +26,29 @@ def resolve_cmd_params(alpha, beta, T, eta):
     if len(provided) != 2:
         raise ValueError(f"Exactly two of alpha, beta, T, and eta must be specified, got {provided}.")
 
+    def eta_from_alpha_beta(a, b):
+        return math.inf if a == 0.0 else b / a
+
     if alpha is not None and beta is not None:
         if beta == 0.0:
             raise ValueError("Cannot derive T and eta from --alpha and --beta when beta is 0.")
         T = (1.0 - alpha) / beta
-        eta = beta / alpha
+        eta = eta_from_alpha_beta(alpha, beta)
     elif alpha is not None and T is not None:
         if T == 0.0:
             raise ValueError("Cannot derive beta and eta from --alpha and --T when T is 0.")
         beta = (1.0 - alpha) / T
-        eta = beta / alpha
+        eta = eta_from_alpha_beta(alpha, beta)
     elif alpha is not None and eta is not None:
+        if alpha == 0.0:
+            raise ValueError("Cannot derive beta and T from --alpha 0 and finite --eta; specify --beta instead.")
         if eta == 0.0:
             raise ValueError("Cannot derive T from --alpha and --eta when eta is 0.")
         T = (1.0 / alpha - 1.0) / eta
         beta = eta * alpha
     elif beta is not None and T is not None:
         alpha = 1.0 - beta * T
-        eta = beta / alpha
+        eta = eta_from_alpha_beta(alpha, beta)
     elif beta is not None and eta is not None:
         if beta == 0.0 or eta == 0.0:
             raise ValueError("Cannot derive a unique CMD update from --beta and --eta when either is 0.")
@@ -58,8 +64,8 @@ def resolve_cmd_params(alpha, beta, T, eta):
         alpha = 1.0 / denom
         beta = eta / denom
 
-    if alpha <= 0.0:
-        raise ValueError(f"Resolved alpha must be > 0, got {alpha}.")
+    if alpha < 0.0:
+        raise ValueError(f"Resolved alpha must be >= 0, got {alpha}.")
     if beta < 0.0:
         raise ValueError(f"Resolved beta must be >= 0, got {beta}.")
     if eta < 0.0:

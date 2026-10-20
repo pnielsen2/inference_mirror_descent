@@ -4,7 +4,7 @@ One full pass of the sampler:
 
 * Sample x_T ~ N(0, I), then for t = T-1 .. 0:
     1. ``mala_steps`` MALA correction steps targeting
-       ``E_total(t, x) = alpha * E_θ(s, x, t) - beta * Q_agg(s, x_0_hat)``,
+       ``E_total(t, x) = alpha_t * E_θ(s, x, t) - beta * Q_agg(s, x_0_hat)``,
        built by :func:`build_target_energy` (module level, so that the one
        definition of the chain's target is also available off-grid).
     2. The selected denoising predictor step -- the one out of the cleanest
@@ -25,6 +25,15 @@ from relax.network.actor_critic import ActorCritic
 from relax.utils.diffusion import NoiseLevel, tweedie_x0
 
 MCMC_PROPOSAL_TYPES = ("euler_maruyama", "gaussian_invariant")
+
+# How the step size h_t = c_t (1 - alpha_t) gets its coefficient. Both modes use
+# the same parameterization -- (1 - alpha_t) is ``schedule.betas[t]`` -- and
+# differ only in how many coefficients there are and how often each moves:
+# "per_level" carries one c_t per noise level, each driven by that level's own
+# acceptance rate inside the MALA loop; "shared" carries a single c for the whole
+# schedule, updated once per sampler pass from the acceptance averaged over every
+# level. See ``--mala_step_size_mode``.
+MALA_STEP_SIZE_MODES = ("per_level", "shared")
 
 # Largest step the gaussian_invariant proposal may take: its variance h(2-h)
 # vanishes at h = 2, so the cap has to stay strictly inside that window.
@@ -74,12 +83,27 @@ def alpha_broadcast(alpha):
     vector -- the trailing rows the trainer steps the env with are tilted
     differently from the rows the update learns on -- so it needs an explicit
     axis to line up with the ``[K, batch]`` energies and the
-    ``[K, batch, act_dim]`` gradients / eps predictions. ``ndim`` is static, so
+    ``[K, batch, act_dim]`` target gradients. ``ndim`` is static, so
     a scalar alpha takes the identity branch and stays bit-identical.
     """
     if jnp.ndim(alpha) == 0:
         return alpha, alpha
     return alpha[None, :], alpha[None, :, None]
+
+
+def retained_policy_exponent(alpha, level: NoiseLevel, schedule):
+    """Interpolate from configured alpha at the clean end to one at pure noise."""
+    clean_var = schedule.one_minus_alphas_cumprod[0]
+    noisy_var = schedule.one_minus_alphas_cumprod[-1]
+    span = noisy_var - clean_var
+    noise_var = level.sqrt_omac * level.sqrt_omac
+    u = jnp.clip((noise_var - clean_var) / jnp.maximum(span, jnp.float32(1e-8)),
+                 jnp.float32(0.0), jnp.float32(1.0))
+    u = jnp.where(level.sqrt_omac == schedule.sqrt_one_minus_alphas_cumprod[0],
+                  jnp.float32(0.0), u)
+    u = jnp.where(level.sqrt_omac == schedule.sqrt_one_minus_alphas_cumprod[-1],
+                  jnp.float32(1.0), u)
+    return alpha + (jnp.float32(1.0) - alpha) * u
 
 
 def build_target_energy(
@@ -93,7 +117,7 @@ def build_target_energy(
     ema_advantage_normalization: bool,
     guidance_snr_anneal: str = "none",
 ):
-    """The MALA/MH target ``U_level(x) = alpha E_theta - beta_eff Q(clip(x0_hat))``.
+    """The MALA/MH target ``U_level(x) = alpha_level E_theta - beta_eff Q(clip(x0_hat))``.
 
     Module-level, and parameterized by a :class:`NoiseLevel` rather than by a
     schedule index, so that the *one* definition of what the chain is sampling
@@ -138,7 +162,7 @@ def build_target_energy(
         std = jnp.maximum(jax.lax.stop_gradient(state.q_running_std), jnp.float32(1e-6))
         return (q - mean) / std
 
-    alpha_e, _ = alpha_broadcast(state.hp.alpha)
+    schedule = model.schedule_for(state.hp, state.log_snr_levels)
 
     def agg_q_at_action(action):
         return maybe_ema_normalize(maybe_batch_normalize(aggregate_q_fn([model.q(qp, obs, action) for qp in q_params_tuple])))
@@ -156,18 +180,25 @@ def build_target_energy(
         x0_hat = tweedie_x0(level, x, noise_pred)
         clip_frac = jnp.mean((jnp.abs(x0_hat) > x0_hat_clip_radius).astype(jnp.float32))
         beta_eff = beta_current * guidance_snr_anneal_factor(level, guidance_snr_anneal)
+        alpha_e, _ = alpha_broadcast(retained_policy_exponent(
+            state.hp.alpha, level, schedule))
         return alpha_e * E_vals - beta_eff * q_aggregated_at_clipped_x0_hat(x0_hat), (clip_frac, e_grad)
 
     return energy_total, agg_q_at_action, beta_current
 
 
-def ddim_from_eps(schedule, t_idx, x_in: jax.Array, eps_pred: jax.Array) -> jax.Array:
+def ddim_from_eps(schedule, t_idx, x_in: jax.Array, eps_pred: jax.Array,
+                  x_recon_clip_radius=None) -> jax.Array:
     """One deterministic DDIM transition ``t_idx -> t_idx - 1`` at ``eps_pred``.
 
     Module level so the unguided base-policy chain in
-    :mod:`relax.algorithm.ddim_sampler` shares the *one* implementation of the
+    :mod:`relax.algorithm.base_policy_sampler` shares the *one* implementation of the
     transition with the guided predictors below, which differ from it only in
     which eps they feed it.
+
+    With a clip radius, recompute epsilon from the clipped x0. The resulting
+    coefficient on x_in is sigma_prev/sigma_t <= 1, preventing an inaccurate
+    high-noise prediction from sending the subsequent network inputs to infinity.
     """
     sqrt_ab_t = schedule.sqrt_alphas_cumprod[t_idx]
     sqrt_one_minus_ab_t = schedule.sqrt_one_minus_alphas_cumprod[t_idx]
@@ -176,6 +207,11 @@ def ddim_from_eps(schedule, t_idx, x_in: jax.Array, eps_pred: jax.Array) -> jax.
     # relative precision in float32 once abar_prev -> 1, which is exactly
     # where small s_hat puts the clean end.
     sqrt_one_minus_ab_prev = jnp.sqrt(schedule.one_minus_alphas_cumprod_prev[t_idx])
+    if x_recon_clip_radius is not None:
+        x0 = jnp.clip((x_in - sqrt_one_minus_ab_t * eps_pred) / sqrt_ab_t,
+                     -x_recon_clip_radius, x_recon_clip_radius)
+        ratio = sqrt_one_minus_ab_prev / sqrt_one_minus_ab_t
+        return ratio * x_in + (sqrt_ab_prev - ratio * sqrt_ab_t) * x0
     return (
         (sqrt_ab_prev / sqrt_ab_t) * x_in
         + (sqrt_one_minus_ab_prev - (sqrt_ab_prev / sqrt_ab_t) * sqrt_one_minus_ab_t) * eps_pred
@@ -209,6 +245,7 @@ def build_mala_sampler(
     denoising_predictor: str,
     guidance_gradient_space: str,
     mcmc_proposal_type: str = "euler_maruyama",
+    mala_step_size_mode: str = "per_level",
     ddpm_mean_final_steps: int = 1,
     predictor_final_steps: int = 0,
     num_denoised_actions: int = 1,
@@ -239,11 +276,23 @@ def build_mala_sampler(
     ``mcmc_proposal_type`` picks the MALA proposal covariance; see
     ``--mcmc_proposal_type``. It is static, so the branch it selects is resolved
     at build time and the euler_maruyama graph is unchanged.
+
+    ``mala_step_size_mode`` picks how many step-size coefficients the chain
+    adapts, ``"per_level"`` (one per noise level, the default and previous
+    behaviour) or ``"shared"`` (a single one for the whole schedule); see
+    ``--mala_step_size_mode``. Static for the same reason.
     """
     if mcmc_proposal_type not in MCMC_PROPOSAL_TYPES:
         raise ValueError(f"Unknown mcmc_proposal_type: {mcmc_proposal_type!r}; "
                          f"expected one of {MCMC_PROPOSAL_TYPES}")
+    if mala_step_size_mode not in MALA_STEP_SIZE_MODES:
+        raise ValueError(f"Unknown mala_step_size_mode: {mala_step_size_mode!r}; "
+                         f"expected one of {MALA_STEP_SIZE_MODES}")
     gaussian_invariant = mcmc_proposal_type == "gaussian_invariant"
+    shared_step_size_scale = mala_step_size_mode == "shared"
+    # Static, so "per_level" keeps its previous graph exactly: the in-loop
+    # Robbins-Monro update below is emitted only in that mode.
+    adapt_per_level = not shared_step_size_scale
 
     def stateless_get_action_mala_full(
         key: jax.Array,
@@ -261,9 +310,15 @@ def build_mala_sampler(
         mala_step_size_max = state.hp.mala_step_size_max
         guidance_multiplier = state.hp.guidance_mult
         guidance_mult_increasing = state.hp.guidance_mult_increasing
-        # alpha_e multiplies [K, batch] energies, alpha_g the [K, batch, act_dim]
-        # gradients and eps predictions; they differ only for a per-row alpha.
-        alpha_e, alpha_g = alpha_broadcast(state.hp.alpha)
+        if shared_step_size_scale:
+            # One coefficient for the whole schedule. The state keeps its [T]
+            # layout -- snapshots, hp packing and the per-level step-size logging
+            # are all unchanged -- and simply holds T copies of that one number,
+            # so collapsing to the mean here is the identity in steady state and
+            # converts a state adapted per level (geometric mean of its c_t)
+            # rather than silently reading one arbitrary level's scale.
+            log_eta_scales_in = jnp.full_like(log_eta_scales_in,
+                                              jnp.mean(log_eta_scales_in))
 
         # Denoise K actions per state: broadcast a leading [K] axis onto obs so
         # every downstream Q / energy / eps call yields [K, batch, ...]. The K
@@ -279,6 +334,7 @@ def build_mala_sampler(
         # T x mala_steps network passes.
         schedule = model.schedule_for(state.hp, state.log_snr_levels)
         level = lambda t_idx: NoiseLevel.at(schedule, t_idx)
+        alpha_at_level = lambda lvl: retained_policy_exponent(state.hp.alpha, lvl, schedule)
         x_recon_clip_radius = model.x_recon_clip_radius
         increasing_scheduler = schedule.alphas_cumprod / schedule.alphas_cumprod_prev
         increasing_scheduler = increasing_scheduler / jnp.maximum(increasing_scheduler[0], jnp.float32(1e-8))
@@ -314,8 +370,8 @@ def build_mala_sampler(
             return agg_q_at_action(x0_clipped)
 
         def guidance_value_from_x(x_in, t_idx):
-            # Tweedie-clean prediction with alpha-scaled base
-            # score; guidance component is NOT scaled.
+            # Tweedie-clean prediction always uses the untempered base-policy
+            # score; the retained-policy exponent belongs only to the MH target.
             lvl = level(t_idx)
             eps_pred = model.eps_pred(policy_params, lvl, obs, x_in)
             x0_hat = tweedie_x0(lvl, x_in, eps_pred)
@@ -366,6 +422,7 @@ def build_mala_sampler(
                     lambda action: jnp.sum(agg_q_at_action(action))
                 )(jax.lax.stop_gradient(x0_clipped))
             beta_eff = beta_current * guidance_snr_anneal_factor(lvl, guidance_snr_anneal)
+            alpha_e, alpha_g = alpha_broadcast(alpha_at_level(lvl))
             energy = alpha_e * E_vals - beta_eff * q
             grad_energy = alpha_g * e_grad - beta_eff * grad_q
             clip_frac = jnp.mean((jnp.abs(x0_hat) > x0_hat_clip_radius).astype(jnp.float32))
@@ -374,9 +431,9 @@ def build_mala_sampler(
         # ---- Denoising predictor step (chosen at build time) -----------------
         def guided_eps_pred(t_idx, x_in):
             lvl = level(t_idx)
-            noise_pred_scaled = alpha_g * model.eps_pred(policy_params, lvl, obs, x_in)
+            noise_pred = model.eps_pred(policy_params, lvl, obs, x_in)
             grad_q = compute_guidance_gradient(x_in, t_idx)
-            return noise_pred_scaled - beta_current * lvl.sqrt_omac * grad_q
+            return noise_pred - beta_current * lvl.sqrt_omac * grad_q
 
         def ddpm_mean_step(t_idx, x_in, _e_grad):
             return ddpm_mean_from_eps(schedule, level(t_idx), t_idx, x_in,
@@ -386,13 +443,10 @@ def build_mala_sampler(
             return ddim_from_eps(schedule, t_idx, x_in, guided_eps_pred(t_idx, x_in))
 
         def ddim_unguided_step(t_idx, x_in, e_grad):
-            # ε̂ = α σ_t ∇_x E_θ at the MALA-accepted state: the last MALA step
+            # ε̂ = σ_t ∇_x E_θ at the MALA-accepted state: the last MALA step
             # already computed this gradient, so the transport is free. No
             # guidance and no x0 clip -- all tilting stays inside the MH loop.
-            # The α factor matches the base component of the chain's target
-            # exp(−αE + βQ), whose level-t factor is p_t^α with score α∇log p_t;
-            # ``guided_eps_pred`` applies the same α to its base term.
-            eps = alpha_g * schedule.sqrt_one_minus_alphas_cumprod[t_idx] * e_grad
+            eps = schedule.sqrt_one_minus_alphas_cumprod[t_idx] * e_grad
             return ddim_from_eps(schedule, t_idx, x_in, eps)
 
         # ---- The MH energy: value and drift. Both variants return
@@ -472,16 +526,22 @@ def build_mala_sampler(
 
         # ---- MALA step-size scale floor (shared across all levels) --------
         log_eta_min = jnp.log(jnp.float32(1e-8) / jnp.maximum(jnp.max(schedule.betas), jnp.float32(1e-8)))
+        eta_upper = jnp.asarray(mala_step_size_max, dtype=jnp.float32)
+        if gaussian_invariant:
+            # The proposal variance h(2-h) vanishes at h = 2, so the cap has to
+            # hold whatever a per-seed hp_pack asks for. Enforced here as well as
+            # where the cap is resolved for logging.
+            eta_upper = jnp.minimum(eta_upper, jnp.float32(GI_STEP_SIZE_MAX))
+        # Ceiling for the shared coefficient: the cap binds level by level, so c
+        # still has feedback until even the smallest (1 - alpha_t) is clipped.
+        # Past that point acceptance cannot respond to c at all, which is exactly
+        # where the per-level ceiling below stops its own scale from winding up.
+        log_eta_max_shared = jnp.log(
+            eta_upper / jnp.maximum(jnp.min(schedule.betas), jnp.float32(1e-8)))
 
         # ---- Per-diffusion-level MALA correction + denoising predictor ----
         def run_mala_chain_at_level(t_idx, x_t, rng, log_eta_scales, drift_in):
             eta_base_t = jnp.maximum(schedule.betas[t_idx], jnp.float32(1e-8))
-            eta_upper = jnp.asarray(mala_step_size_max, dtype=jnp.float32)
-            if gaussian_invariant:
-                # The proposal variance h(2-h) vanishes at h = 2, so the cap has
-                # to hold whatever a per-seed hp_pack asks for. Enforced here as
-                # well as where the cap is resolved for logging.
-                eta_upper = jnp.minimum(eta_upper, jnp.float32(GI_STEP_SIZE_MAX))
             # Ceiling on the adaptation state, per level rather than schedule-wide:
             # scale * beta_t is what the clip below caps at eta_upper, so a level
             # whose cap binds cannot integrate its scale up past that point and
@@ -538,9 +598,10 @@ def build_mala_sampler(
                 x_next = jnp.where(accept[..., None], x_prop, x_current)
 
                 acc_rate = jnp.mean(accept.astype(jnp.float32).reshape(-1))
-                target = jnp.asarray(mala_target_acceptance_rate, dtype=jnp.float32)  # default 0.574: optimal MALA acceptance rate in high dimensions (Roberts et al. 1997)
-                log_eta_scale = log_eta_scale + mala_adapt_rate * (acc_rate - target)
-                log_eta_scale = jnp.clip(log_eta_scale, log_eta_min, log_eta_max)
+                if adapt_per_level:
+                    target = jnp.asarray(mala_target_acceptance_rate, dtype=jnp.float32)  # default 0.574: optimal MALA acceptance rate in high dimensions (Roberts et al. 1997)
+                    log_eta_scale = log_eta_scale + mala_adapt_rate * (acc_rate - target)
+                    log_eta_scale = jnp.clip(log_eta_scale, log_eta_min, log_eta_max)
 
                 if schedule_cost:
                     # The accepted drift is what the identity predictor hands to
@@ -620,6 +681,27 @@ def build_mala_sampler(
         if peel_final_level:
             carry = process_one_noise_level(final_denoising_step, timesteps - 1, carry)
         x_0, _, log_eta_scales_out, per_level_acc_out, per_level_clip_frac_out, x_levels_out, cost_out, _ = carry
+
+        if shared_step_size_scale and model.mala_steps >= 1:
+            # One Robbins-Monro step per sampler pass, on the single coefficient,
+            # driven by the acceptance rate averaged over every level (each entry
+            # of per_level_acc is itself already averaged over that level's
+            # mala_steps). Averaging first is the point of this mode: the shared c
+            # sees T times the acceptance samples a per-level scale does, so its
+            # update is that much less noisy -- at the cost of not being able to
+            # hit the target level by level. Still in log space, so the update is
+            # multiplicative in c and cannot drive h negative. Guarded on
+            # mala_steps >= 1 because with no MALA steps there are no acceptances
+            # to average and per_level_acc is identically zero, which would walk c
+            # down every call; the per-level rule is skipped for the same reason
+            # (its loop body never runs).
+            log_c = jnp.clip(
+                jnp.mean(log_eta_scales_out)
+                + mala_adapt_rate * (jnp.mean(per_level_acc_out)
+                                     - jnp.asarray(mala_target_acceptance_rate, dtype=jnp.float32)),
+                log_eta_min, log_eta_max_shared,
+            )
+            log_eta_scales_out = jnp.full_like(log_eta_scales_out, log_c)
 
         # In latent-action mode the endpoint is an unbounded latent; the env-side
         # Gaussian-CDF squash bounds it. Otherwise clip to the normalized box.

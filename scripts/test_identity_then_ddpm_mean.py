@@ -30,8 +30,10 @@ import jax
 import jax.numpy as jnp
 from jax.extend.core import ClosedJaxpr, Jaxpr
 
-from relax.algorithm.mala_sampler import build_mala_sampler
+import relax.algorithm.mala_sampler as mala_sampler
+from relax.algorithm.mala_sampler import build_mala_sampler, build_target_energy, retained_policy_exponent
 from relax.algorithm.mgmd_types import Diffv2TrainState, Diffv2OptStates, HParams
+from relax.cli.train_setup import resolve_cmd_params
 from relax.network.actor_critic import ActorCritic
 from relax.utils.diffusion import NoiseLevel, tweedie_x0
 
@@ -47,14 +49,14 @@ def make_model(timesteps=T, mala_steps=2):
                               mala_steps=mala_steps, x_recon_clip_radius=float("inf"))
 
 
-def make_state(model, timesteps=T, guidance_mult=1.0, beta=2.0):
+def make_state(model, timesteps=T, guidance_mult=1.0, beta=2.0, alpha=1.0):
     return Diffv2TrainState(
         params=model.init_params(jax.random.PRNGKey(0)),
         opt_state=Diffv2OptStates(q=(), policy=()),
         step=0,
         log_eta_scales=jnp.zeros((timesteps,), jnp.float32),
         beta=jnp.float32(beta),
-        hp=HParams(guidance_mult=jnp.float32(guidance_mult), alpha=jnp.float32(1.0),
+        hp=HParams(guidance_mult=jnp.float32(guidance_mult), alpha=jnp.float32(alpha),
                    x0_hat_clip_radius=jnp.float32(jnp.inf)),
     )
 
@@ -149,6 +151,50 @@ def main():
     print(f"  [control] Identity returns the level-0 sample: max|diff| = {di:.3e}")
     ok &= di == 0.0
 
+    print("--- 2aa. retained-policy alpha endpoints and x0_hat stay separate ---")
+    schedule = model.schedule_for(st.hp, st.log_snr_levels)
+    levels = [NoiseLevel.at(schedule, i) for i in range(T)]
+    for clean_alpha in (0.0, 0.3, 1.0):
+        values = jnp.stack([
+            retained_policy_exponent(jnp.float32(clean_alpha), lvl, schedule)
+            for lvl in levels
+        ])
+        assert float(values[0]) == float(jnp.float32(clean_alpha))
+        assert float(values[-1]) == 1.0
+        assert bool(jnp.all(jnp.diff(values) >= 0.0))
+    alpha0, beta64, temp, eta = resolve_cmd_params(0.0, 64.0, None, None)
+    assert alpha0 == 0.0 and beta64 == 64.0 and temp == 1.0 / 64.0 and jnp.isinf(eta)
+
+    fixed_x = jax.random.normal(jax.random.PRNGKey(13), (1, BATCH, ACT_DIM))
+    fixed_obs = jnp.broadcast_to(obs, (1, *obs.shape))
+    lvl = levels[T // 2]
+    for clean_alpha in (0.0, 1.0):
+        alpha_state = make_state(model, beta=2.0, alpha=clean_alpha)
+        target, _, _ = build_target_energy(
+            alpha_state, fixed_obs, AGG, model=model, ema_normalization=False,
+            batch_advantage_normalization=False, ema_advantage_normalization=False)
+        actual = target(lvl, fixed_x)[0]
+        base_eps = model.eps_pred(alpha_state.params.policy, lvl, fixed_obs, fixed_x)
+        base_x0_hat = tweedie_x0(lvl, fixed_x, base_eps)
+        base_q = AGG([model.q(qp, fixed_obs, base_x0_hat)
+                      for qp in alpha_state.params.q])
+        base_energy = model.energy_fn(alpha_state.params.policy, lvl, fixed_obs, fixed_x)
+        alpha_level = retained_policy_exponent(alpha_state.hp.alpha, lvl, schedule)
+        expected = alpha_level * base_energy - jnp.float32(2.0) * base_q
+        assert maxdiff(actual, expected) < 2e-6
+
+    alpha_zero_state = make_state(model, guidance_mult=0.0, beta=0.0, alpha=0.0)
+    alpha_zero_result = sample(model, alpha_zero_state, NEW, obs, collect_levels=True)
+    alpha_zero_x = alpha_zero_result.x_levels[0]
+    alpha_zero_level = NoiseLevel.at(
+        model.schedule_for(alpha_zero_state.hp, alpha_zero_state.log_snr_levels), 0)
+    alpha_zero_eps = model.eps_pred(
+        alpha_zero_state.params.policy, alpha_zero_level, obs_k, alpha_zero_x)
+    alpha_zero_expected = tweedie_x0(alpha_zero_level, alpha_zero_x, alpha_zero_eps)
+    assert maxdiff(alpha_zero_result.action, alpha_zero_expected) \
+        <= 1e-5 * max(float(jnp.max(jnp.abs(alpha_zero_expected))), 1.0)
+    print("  noisiest=1, cleanest=configured alpha; base Tweedie x0 unchanged")
+
     print("--- 2b. the final step is guided (Identity's action is not) ---")
     for p in ("Identity", NEW):
         ref = sample(model, make_state(model, guidance_mult=1.0), p, obs).action
@@ -213,6 +259,21 @@ def main():
         d = maxdiff(sample(model, st, predictor, obs, predictor_final_steps=2).per_level_acc,
                     sample(model, st, "Identity", obs).per_level_acc)
         print(f"  {predictor:<14} k=2 acceptance vs Identity: max|diff| = {d:.3e}")
+
+    print("--- 7. alpha=1 is bit-identical to the constant-alpha target ---")
+    compatibility_kw = dict(collect_levels=True, schedule_cost=True)
+    scheduled = sample(model, make_state(model, alpha=1.0), NEW, obs, **compatibility_kw)
+    original_retained_policy_exponent = mala_sampler.retained_policy_exponent
+    try:
+        mala_sampler.retained_policy_exponent = lambda alpha, level, schedule: alpha
+        legacy = sample(model, make_state(model, alpha=1.0), NEW, obs, **compatibility_kw)
+    finally:
+        mala_sampler.retained_policy_exponent = original_retained_policy_exponent
+    for name in ("action", "per_level_acc", "per_level_clip", "log_eta_scales",
+                 "x_levels", "schedule_cost"):
+        d = maxdiff(getattr(scheduled, name), getattr(legacy, name))
+        ok &= d == 0.0
+        print(f"  {name:<16} max|diff| = {d:.3e}  identical={d == 0.0}")
 
     print("\nALL PASS" if ok else "\nFAILURES PRESENT")
     return 0 if ok else 1

@@ -1,0 +1,17 @@
+\begin{table}[t]
+\centering
+\caption{Peak evaluation return. At each checkpoint the evaluation return is averaged over the 10 seeds; we report the maximum of that curve over all checkpoints, with a 80\% bootstrap confidence interval obtained by resampling seeds. Per environment we bold the best value and every value lying inside its confidence interval.}
+\label{tab:max_eval_return}
+\begin{tabular}{lcccc}
+\toprule
+Environment & MGMD (ours) & DIPO & DPMD & SAC \\
+\midrule
+Ant-v3 & \textbf{6\,660} {\scriptsize [6\,566, 6\,830]} & 5\,586 {\scriptsize [5\,283, 5\,894]} & 5\,727 {\scriptsize [5\,376, 6\,082]} & 5\,251 {\scriptsize [4\,929, 5\,605]} \\
+HalfCheetah-v3 & \textbf{13\,056} {\scriptsize [12\,881, 13\,277]} & 9\,978 {\scriptsize [9\,670, 10\,328]} & \textbf{13\,325} {\scriptsize [13\,004, 13\,712]} & 11\,127 {\scriptsize [10\,707, 11\,587]} \\
+Hopper-v3 & 3\,213 {\scriptsize [3\,047, 3\,458]} & \textbf{3\,354} {\scriptsize [3\,329, 3\,438]} & 2\,859 {\scriptsize [2\,893, 3\,187]} & \textbf{3\,341} {\scriptsize [3\,282, 3\,568]} \\
+Humanoid-v3 & \textbf{5\,330} {\scriptsize [5\,303, 5\,417]} & 5\,164 {\scriptsize [5\,162, 5\,229]} & 5\,030 {\scriptsize [4\,908, 5\,206]} & 5\,227 {\scriptsize [5\,243, 5\,444]} \\
+Swimmer-v3 & 138 {\scriptsize [129, 148]} & 56 {\scriptsize [54, 59]} & \textbf{148} {\scriptsize [147, 150]} & 58 {\scriptsize [54, 64]} \\
+Walker2d-v3 & \textbf{4\,954} {\scriptsize [4\,824, 5\,103]} & 4\,499 {\scriptsize [4\,325, 4\,728]} & \textbf{4\,935} {\scriptsize [4\,800, 5\,186]} & 4\,733 {\scriptsize [4\,583, 4\,929]} \\
+\bottomrule
+\end{tabular}
+\end{table}

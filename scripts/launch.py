@@ -67,6 +67,9 @@ VENV_BY_ENV_VERSION = {
 # ``0:`` entry would silently claim every future -v0 env too.
 DMC_ENV_PREFIX = "dmc/"
 DMC_VENV = Path.home() / ".venvs" / "general"
+HUMANOIDBENCH_ENV_PREFIX = "humanoidbench/"
+HUMANOIDBENCH_VENV = Path(os.environ.get(
+    "HUMANOIDBENCH_VENV", Path.home() / ".venvs" / "general")).expanduser()
 
 
 # An ablation on any of these flags, whose values are all parseable as floats,
@@ -111,6 +114,7 @@ FLAG_TO_HP_KEY = {f: f for f in (
     "eta",
     "s_hat",
     "noise_schedule_gamma",
+    "action_noise",
 )}
 
 
@@ -175,8 +179,8 @@ echo "Finished at: $(date)"
 #   * ~/.local fills the login-node home quota when a 24-slot pack streams
 #     directly, and wandb.ai rate-limits filestream registration when 300+
 #     concurrent runs across a sweep hit init in the same second.
-# Sync offline runs periodically for dashboard progress, but discard CLI output
-# and remove its debug log after every invocation to prevent quota growth.
+# Sync offline runs periodically for dashboard progress. Keep the last attempt's
+# output (overwritten each time) so upload failures can be diagnosed.
 _WANDB_OFFLINE_BLOCK = """
 export WANDB_MODE=offline
 export WANDB_DIR="{wandb_dir}"
@@ -185,8 +189,12 @@ echo "WANDB_MODE=$WANDB_MODE"
 echo "WANDB_DIR=$WANDB_DIR"
 
 _wandb_sync() {{
-  (cd "$WANDB_DIR" && nice -n 19 wandb sync --sync-all --include-synced >/dev/null 2>&1) || true
-  rm -f "$WANDB_DIR/wandb/debug-cli.$USER.log"
+  (cd "$WANDB_DIR" && nice -n 19 wandb sync --sync-all --include-synced >"$WANDB_DIR/sync.log" 2>&1) || {{
+    echo "wandb sync failed; see $WANDB_DIR/sync.log" >&2
+  }}
+  if [ -f "$WANDB_DIR/wandb/debug-cli.$USER.log" ]; then
+    mv -f "$WANDB_DIR/wandb/debug-cli.$USER.log" "$WANDB_DIR/sync-debug.log"
+  fi
 }}
 
 _wandb_sync_loop() {{
@@ -235,6 +243,10 @@ def parse_args():
                         help="One-at-a-time ablation: base config plus each listed value for one flag, "
                              "without taking the Cartesian product across oat axes. Can be used multiple times. "
                              "Regular --ablate axes still form their usual Cartesian product.")
+    parser.add_argument("--benchmark", type=str, default=None,
+                        help="Expand a named benchmark into a hard env ablation. Available: "
+                             "humanoidbench, mujoco-v3, dmc (aliases: hb, humanoidbench-main, mujoco). "
+                             "Cannot be combined with an explicit env ablation.")
     parser.add_argument("--max-runs-per-gpu", "--max_runs_per_gpu", type=int, default=1,
                         dest="max_runs_per_gpu",
                         help="Max runs vmap-packed on a single GPU (default: 1, no packing). "
@@ -466,6 +478,22 @@ def _classify_ablations(ablations):
             else:
                 hard_ablations.append((flag, values))
     return hard_ablations, easy_ablations
+
+
+def expand_benchmark_ablations(benchmark, ablations, oat_ablations):
+    """Return sweep axes with a named benchmark materialized as ``env`` values."""
+    regular = [list(ab) for ab in (ablations or [])]
+    oat = [list(ab) for ab in (oat_ablations or [])]
+    if benchmark is None:
+        return regular, oat
+    if any(ab and ab[0] == "env" for ab in regular + oat):
+        raise ValueError("--benchmark cannot be combined with --ablate/--oat-ablate env")
+    from relax.benchmarks import benchmark_envs
+    envs = benchmark_envs(benchmark)
+    if not envs:
+        raise ValueError(f"Benchmark {benchmark!r} contains no environments")
+    regular.append(["env", *envs])
+    return regular, oat
 
 
 def _generate_run_specs(base_cmd: str, seeds: list, ablations: list,
@@ -713,7 +741,8 @@ def venv_for_command(cmd: str) -> Path:
     version has no registered venv — we'd rather stop the sweep than
     silently ship jobs to the wrong interpreter.
 
-    ``dmc/`` ids bypass that lookup and go to ``DMC_VENV``; see its comment.
+    ``dmc/`` and ``humanoidbench/`` ids bypass that lookup and use their
+    configured venv paths.
     """
     env_match = re.search(r'--env\s+(\S+)', cmd)
     if not env_match:
@@ -721,6 +750,8 @@ def venv_for_command(cmd: str) -> Path:
     env_name = env_match.group(1)
     if env_name.startswith(DMC_ENV_PREFIX):
         venv_path, label = DMC_VENV.resolve(), "dm_control"
+    elif env_name.startswith(HUMANOIDBENCH_ENV_PREFIX):
+        venv_path, label = HUMANOIDBENCH_VENV.resolve(), "HumanoidBench"
     else:
         ver_match = re.search(r'-v(\d+)$', env_name)
         if not ver_match:
@@ -865,7 +896,7 @@ def main():
         sweep_id = next_unused_sweep_id()
     if sweep_id is not None:
         print(f"[launch.py] sweep_id = {sweep_id}  "
-              f"(wandb group 'sweep_{sweep_id}')")
+              f"(wandb filter: config.sweep_id == {sweep_id})")
 
     # Inject sweep_id into the base command so every pack's derived cmd carries
     # it. We treat it like a first-class CLI flag: replace any existing
@@ -882,8 +913,14 @@ def main():
     if args.max_runs_per_gpu < 1:
         sys.exit(f"launch.py: --max-runs-per-gpu must be >= 1, got {args.max_runs_per_gpu}")
 
-    args_ablate = args.ablate
-    args_oat_ablate = args.oat_ablate
+    try:
+        args_ablate, args_oat_ablate = expand_benchmark_ablations(
+            args.benchmark, args.ablate, args.oat_ablate)
+    except (ValueError, RuntimeError) as exc:
+        sys.exit(f"launch.py: {exc}")
+    if args.benchmark is not None:
+        env_axis = next(ab[1:] for ab in args_ablate if ab[0] == "env")
+        print(f"[launch.py] benchmark {args.benchmark!r}: {len(env_axis)} environments")
 
     # Tell the trainer which argparse attributes to include in each per-slot
     # config_tag. We pick the union of every --ablate axis (hard and easy)

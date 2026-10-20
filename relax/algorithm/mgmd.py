@@ -68,6 +68,21 @@ class MGMD:
         self.one_step_dist_shift_beta = bool(cfg.one_step_dist_shift_beta)
         # V-free guidance-normalization knobs (see relax/cli/train_args.py).
         self.num_denoised_actions = int(cfg.num_denoised_actions)
+        self.candidate_sampler = cfg.candidate_sampler
+        self.candidate_selection = ("boltzmann" if cfg.candidate_selection == "reweight"
+                                    else cfg.candidate_selection)
+        self.boltzmann_reweight = bool(cfg.boltzmann_reweight or cfg.candidate_selection == "reweight")
+        if self.candidate_sampler not in ("mala", *TRANSITIONS):
+            raise ValueError(f"Unknown candidate_sampler: {self.candidate_sampler!r}")
+        if self.candidate_selection not in ("first", "boltzmann", "best"):
+            raise ValueError(f"Unknown candidate_selection: {self.candidate_selection!r}")
+        self.uses_boltzmann = self.candidate_selection == "boltzmann" or self.boltzmann_reweight
+        if self.candidate_sampler == "mala" and self.model.energy_fn is None:
+            raise ValueError("MALA requires a scalar E/f policy parameterization")
+        self.distill_actions_per_state = (
+            self.num_denoised_actions
+            if self.candidate_selection == "first" or self.boltzmann_reweight else 1
+        )
         self.q_loss_normalization = bool(cfg.q_loss_normalization)
         self.batch_advantage_normalization = bool(cfg.batch_advantage_normalization)
         self.ema_advantage_normalization = bool(cfg.ema_advantage_normalization)
@@ -90,6 +105,7 @@ class MGMD:
         value_params_init, value_opt_state_init = self._setup_value_network(params)
 
         self._timesteps = int(self.model.num_timesteps)
+        self._action_noise_schedule = distillation.dpmd_noise_schedule(model.act_dim, cfg.total_step)
 
         # --- Initial vmap-stackable train state ---
         self.state = self._build_initial_state(params, value_params_init, value_opt_state_init)
@@ -117,6 +133,7 @@ class MGMD:
             denoising_predictor=self.cfg.denoising_predictor,
             guidance_gradient_space=self.cfg.guidance_gradient_space,
             mcmc_proposal_type=self.cfg.mcmc_proposal_type,
+            mala_step_size_mode=self.cfg.mala_step_size_mode,
             ddpm_mean_final_steps=self.cfg.ddpm_mean_final_steps,
             predictor_final_steps=self.cfg.predictor_final_steps,
             num_denoised_actions=self.num_denoised_actions,
@@ -134,13 +151,50 @@ class MGMD:
         if self.cfg.rollout_predictor_final_steps is not None:
             self._rollout_sampler_kw["predictor_final_steps"] = self.cfg.rollout_predictor_final_steps
         self.decoupled_rollout_predictor = self._rollout_sampler_kw != self._sampler_kw
-        sampler = build_mala_sampler(**self._rollout_sampler_kw)
+        # --td_next_action: draw the critic's backup action from the UNGUIDED base
+        # policy instead of the tilted chain. Only the TD target changes; the
+        # policy is still distilled on the tilted actions and the rollout still
+        # executes one, so this isolates backing up through the tilt. None keeps
+        # the previous single-sampler graph exactly.
+        self._backup_sampler = None
+        if self.cfg.td_next_action != "tilted":
+            if self.cfg.td_next_action not in TRANSITIONS:
+                raise ValueError(f"Unknown td_next_action: {self.cfg.td_next_action!r}; "
+                                 f"expected 'tilted' or one of {TRANSITIONS}")
+            self._backup_sampler = build_base_policy_sampler(
+                model=self.model, timesteps=self._timesteps,
+                transition=self.cfg.td_next_action,
+                num_denoised_actions=self.num_denoised_actions,
+                latent_action=getattr(self.cfg, "latent_action", False),
+                compute_final_q=False)
+        def build_candidate_sampler(sampler_kw, num_actions, compute_final_q, schedule_cost=False):
+            if self.candidate_sampler != "mala":
+                return build_base_policy_sampler(
+                    model=self.model, timesteps=self._timesteps, transition=self.candidate_sampler,
+                    num_denoised_actions=num_actions,
+                    latent_action=getattr(self.cfg, "latent_action", False),
+                    compute_final_q=compute_final_q,
+                )
+            return build_mala_sampler(
+                **{**sampler_kw, "num_denoised_actions": num_actions},
+                compute_final_q=compute_final_q, schedule_cost=schedule_cost,
+            )
+
+        rollout_actions = (self.num_denoised_actions
+                           if self.candidate_selection != "first"
+                           or self.candidate_sampler == "mala" else 1)
+        sampler = build_candidate_sampler(
+            self._rollout_sampler_kw, rollout_actions, compute_final_q=True)
+        sampler = self._stateless_candidate_sampler(sampler, add_noise=True)
         # Both sampling paths (rollout + TD next-action) use --q_agg_sample aggregation.
         # The TD-backup target itself remains hardcoded to 'min' (clipped double-Q).
         agg_critic = lambda qm: _aggregate_q(qm, self.cfg.q_agg_sample)
         updater = self._stateless_update(
-            build_mala_sampler(**self._sampler_kw, compute_final_q=False,
-                               schedule_cost=self.adaptive_schedule), agg_critic)
+            build_candidate_sampler(
+                self._sampler_kw, self.num_denoised_actions,
+                compute_final_q=self.uses_boltzmann or self.candidate_selection == "best",
+                schedule_cost=self.adaptive_schedule,
+            ), agg_critic)
         stateless_get_action = lambda key, state, obs: sampler(key, state, obs, agg_critic)
         self._schedule_update = None
         if self.adaptive_schedule:
@@ -155,9 +209,9 @@ class MGMD:
         ``critic_weight`` is an optional per-row weight (``[num_runs, batch]``) on
         the Q TD loss; ``None`` means all-ones (standard mean). The fused-denoising
         trainer passes zeros for the injected step-action rows so their backup
-        (bogus at an episode's first state) is excluded. Always returns the
-        index-0 tilted next-action per row so the fused path can reuse it to step
-        the env; the normal path ignores it.
+        (bogus at an episode's first state) is excluded. Returns the configured
+        selected next-action per row for fused environment steps;
+        the normal path ignores it.
         """
         if critic_weight is None:
             critic_weight = jnp.ones_like(data.reward)
@@ -214,11 +268,42 @@ class MGMD:
             return jnp.mean(per_elem_loss)
         return jnp.sum(weight * per_elem_loss) / jnp.maximum(jnp.sum(weight), jnp.float32(1.0))
 
+    def _action_noise_std(self, state):
+        # DPMD updates at step 0, then every 250 updates (=1250 env steps).
+        index = jnp.ceil(state.step * self.cfg.env_steps_per_update / distillation.DPMD_NOISE_PERIOD).astype(jnp.int32)
+        return state.hp.action_noise * self._action_noise_schedule[index]
+
+    def _noisy_candidates(self, key, state, actions):
+        return actions + self._action_noise_std(state) * jax.random.normal(jax.random.fold_in(key, 2), actions.shape)
+
+    def _select_candidate(self, key, q, state):
+        if self.candidate_selection == "best":
+            return jnp.argmax(q, axis=0)
+        return jax.random.categorical(jax.random.fold_in(key, 1),
+                                      _boltzmann_logits(q, state, self.cfg), axis=0)
+
+    def _stateless_candidate_sampler(self, sampler, groups=1, *, add_noise=False):
+        """Select using clean Q, then perturb the selected action for training."""
+        def select(key, state, obs, aggregate_q_fn):
+            result = sampler(key, state, obs, aggregate_q_fn)
+            actions = self._noisy_candidates(key, state, result.action) if add_noise else result.action
+            q = result.q
+            if self.candidate_selection != "first":
+                actions = jnp.swapaxes(actions.reshape(groups, self.num_denoised_actions, *actions.shape[1:]), 0, 1)
+                q = jnp.swapaxes(q.reshape(groups, self.num_denoised_actions, *q.shape[1:]), 0, 1)
+                selected = self._select_candidate(key, q, state)
+                actions, q = _take_candidates(actions, selected), _take_candidates(q, selected)
+            if add_noise:
+                obs_k = jnp.broadcast_to(obs, (*actions.shape[:-1], obs.shape[-1]))
+                q = aggregate_q_fn([self.model.q(qp, obs_k, actions) for qp in state.params.q])
+            return result._replace(action=actions, q=q)
+        return select
+
     def _stateless_update(self, sampler, agg_sample_fn):
         """Return the ``stateless_update(key, state, data, critic_weight)`` closure.
 
-        Captures ``sampler`` (MALA sampler) and ``agg_sample_fn`` (Q aggregation
-        used when sampling the TD next-action; distinct from the backup target
+        Captures ``sampler`` (configured candidate sampler) and ``agg_sample_fn``
+        (Q aggregation used for candidate logits; distinct from the backup target
         which is hardcoded to 'min'). Called once from ``__init__``; the result
         is wrapped with ``jax.jit(jax.vmap(...))`` and stored as
         ``_jit_vmap_update``.
@@ -264,8 +349,8 @@ class MGMD:
             sample_state = state._replace(params=self._tilt_params(state.params))
             # --rollout_alpha under fused denoising: the trailing R rows are the
             # ones the trainer steps the env with, so they alone are tilted at
-            # rollout_alpha * alpha. A per-row alpha reaches the MH target (and
-            # the predictor) through state.hp.alpha, exactly as the scalar does.
+            # rollout_alpha * alpha. A per-row alpha reaches the MH target
+            # through state.hp.alpha, exactly as the scalar does.
             R = self.cfg.rollout_tilt_rows
             if R:
                 sample_state = sample_state._replace(hp=sample_state.hp._replace(
@@ -277,18 +362,56 @@ class MGMD:
                 # policy target and no guidance statistics.
                 critic_weight = critic_weight.at[-R:].set(jnp.float32(0.0))
             mala_result = sampler(next_eval_key, sample_state, next_obs, agg_sample_fn)
-            tilted_actions = mala_result.action           # [K, batch, act_dim]
-            K = self.num_denoised_actions
+            # Perturb every candidate independently, but rank/weight its CLEAN Q.
+            # Selecting afterward is the same law as adding noise after selection,
+            # and makes weighted distillation the conditional mean of resampling.
+            candidate_actions = self._noisy_candidates(next_eval_key, sample_state, mala_result.action)
+            candidate_logits = (
+                _boltzmann_logits(mala_result.q, sample_state, self.cfg)
+                if self.uses_boltzmann else None
+            )
+            candidate_weights = (jax.nn.softmax(candidate_logits, axis=0)
+                                 if candidate_logits is not None else None)
+            if self.candidate_selection != "first":
+                selected = self._select_candidate(next_eval_key, mala_result.q, sample_state)
+                selected_actions = _take_candidates(candidate_actions, selected)[None]
+            else:
+                selected_actions = candidate_actions[:1]
+            tilted_actions = (candidate_actions if self.boltzmann_reweight
+                              or self.candidate_selection == "first" else selected_actions)
+            distill_weights = candidate_weights if self.boltzmann_reweight else None
+            K = tilted_actions.shape[0]
             next_obs_k = jnp.broadcast_to(next_obs, (K, *next_obs.shape))
             # Rows drawn at the update's own tilt: everything the policy and the
             # guidance normalizers learn from. Identical to the full batch when
             # no row is rollout-tilted (R = 0).
             train_next_obs_k, train_actions = next_obs_k[:, :obs.shape[0] - R], tilted_actions[:, :obs.shape[0] - R]
+            train_weights = (None if distill_weights is None
+                             else distill_weights[:, :obs.shape[0] - R])
+
+            # --td_next_action: the action the backup is evaluated at. Default is
+            # the tilted sample, so Q evaluates the post-mirror-descent policy;
+            # the base-policy alternative makes Q evaluate pi_theta itself. The
+            # key is folded off next_eval_key rather than taken from a wider
+            # split, so the default path's RNG stream is untouched.
+            if self._backup_sampler is None:
+                backup_actions = tilted_actions
+                backup_weights = distill_weights
+            else:
+                backup_actions = self._backup_sampler(
+                    jax.random.fold_in(next_eval_key, 1), sample_state,
+                    next_obs, agg_sample_fn).action
+                backup_weights = None
 
             # Clipped double Q-learning: min_i(target_Q_i) per action, then the
             # TD backup averages that clipped double-Q over the K next-actions.
-            per_q_target_values = [self.model.q(tqp, next_obs_k, tilted_actions) for tqp in target_q_params]  # each [K, batch]
-            q_target_min_for_backup = jnp.mean(_aggregate_q(per_q_target_values, "min"), axis=0)  # [batch]
+            backup_next_obs = jnp.broadcast_to(next_obs, (*backup_actions.shape[:-1], next_obs.shape[-1]))
+            per_q_target_values = [self.model.q(tqp, backup_next_obs, backup_actions) for tqp in target_q_params]  # each [K, batch]
+            q_target_min = _aggregate_q(per_q_target_values, "min")
+            q_target_min_for_backup = (
+                jnp.mean(q_target_min, axis=0) if backup_weights is None
+                else jnp.sum(jax.lax.stop_gradient(backup_weights) * q_target_min, axis=0)
+            )
             shared_backup = reward + (1 - done) * state.hp.gamma * q_target_min_for_backup
             q_backup_per_q = [shared_backup] * num_q
 
@@ -307,7 +430,8 @@ class MGMD:
                     opt_state=state.opt_state._replace(value=value_opt_state_updated),
                 )
                 value_params_updated, value_opt_state_updated, value_loss = \
-                    self._value_update_step(value_step_state, per_q_target_values, next_obs)
+                    self._value_update_step(value_step_state, per_q_target_values, next_obs,
+                                            backup_weights)
 
             q_loss = jnp.mean(q_losses)
             value_loss_log = value_loss
@@ -355,10 +479,12 @@ class MGMD:
             # every policy step below draws its minibatch from (at
             # --distillation_buffer_size 1 the buffer IS this block).
             assert obs.shape[0] == self.cfg.batch_size, "MGMDConfig.batch_size must be the trainer's minibatch size; it sizes the distillation buffer"
+            distill_rows = jnp.concatenate((train_next_obs_k, train_actions), -1)
+            if train_weights is not None:
+                distill_rows = jnp.concatenate((distill_rows, train_weights[..., None]), -1)
             distill_buffer = distillation.push(
                 state.distill_buffer,
-                jnp.concatenate((train_next_obs_k, train_actions), -1).reshape(K * (obs.shape[0] - R), -1),
-                step)
+                distill_rows.reshape(K * (obs.shape[0] - R), -1), step)
 
             def policy_loss_fn(policy_params, rows, time_key, noise_key) -> jax.Array:
                 # Diffusion score matching against the tilted target actions in
@@ -367,7 +493,9 @@ class MGMD:
                 # VLB mode estimates the finite log-SNR integral in nats.
                 if self.cfg.policy_noise_samples_per_target > 1:
                     rows = jnp.repeat(rows, self.cfg.policy_noise_samples_per_target, axis=0)
-                policy_obs, policy_targets = rows[:, :obs.shape[-1]], rows[:, obs.shape[-1]:]
+                policy_obs = rows[:, :obs.shape[-1]]
+                policy_targets = rows[:, obs.shape[-1]:obs.shape[-1] + action.shape[-1]]
+                policy_weights = rows[:, -1] if self.boltzmann_reweight else None
                 n = policy_targets.shape[0]
                 if self.vlb_importance:
                     level, inverse_density = sample_vlb_log_snr(
@@ -385,8 +513,16 @@ class MGMD:
                 noise = jax.random.normal(noise_key, policy_targets.shape)
                 tilted_action_noisy = self.model.q_sample(level, policy_targets, noise)
                 noise_pred = self.model.eps_pred(policy_params, level, policy_obs, tilted_action_noisy)
+                error = noise_pred - noise
+                if self.boltzmann_reweight:
+                    per_action_loss = (
+                        jnp.float32(0.5) * inverse_density * jnp.sum(error * error, axis=-1)
+                        if self.vlb_importance else jnp.mean(error * error, axis=-1)
+                    )
+                    return (self.num_denoised_actions
+                            * jnp.mean(jax.lax.stop_gradient(policy_weights) * per_action_loss))
                 if self.vlb_importance:
-                    return continuous_vlb_loss(noise_pred - noise, inverse_density)
+                    return continuous_vlb_loss(error, inverse_density)
                 return optax.squared_error(noise_pred, noise).mean()
 
             def _do(_):
@@ -397,8 +533,10 @@ class MGMD:
                 # --distillation_steps because both mean "another pass over the
                 # current targets": at buffer size 1 a pass IS one step on the
                 # fresh block, which is exactly what the former used to repeat.
+                policy_batch_size = (distill_buffer.shape[0] if self.boltzmann_reweight
+                                     else self.cfg.batch_size - R)
                 for policy_step_idx, rows in enumerate(distillation.epoch_batches(
-                    distill_buffer, key, batch_size=self.cfg.batch_size - R,
+                    distill_buffer, key, batch_size=policy_batch_size,
                     epochs=self.cfg.policy_update_steps * self.cfg.distillation_steps,
                 )):
                     # Preserve the exact old random stream for a single step;
@@ -451,39 +589,53 @@ class MGMD:
             info = {
                 self.policy_loss_key: policy_loss_log,
                 "losses/Q_loss": q_loss,
+                "Policy/action_noise_std": self._action_noise_std(sample_state),
             }
             if self.lr_anneal:
                 info["lr/anneal_factor"] = lr_factor
                 info["lr/lr_q"] = lr_q_eff
                 info["lr/lr_policy"] = lr_policy_eff
+            if candidate_weights is not None:
+                ess = jnp.float32(1.0) / jnp.sum(candidate_weights * candidate_weights, axis=0)
+                info["Boltzmann/ess_mean"] = jnp.mean(ess)
+                info["Boltzmann/ess_min"] = jnp.min(ess)
+                info["Boltzmann/pmax_mean"] = jnp.mean(jnp.max(candidate_weights, axis=0))
+                info["Boltzmann/pmax_max"] = jnp.max(candidate_weights)
+                info["Boltzmann/eta"] = jnp.mean(state.hp.eta)
 
             # V_MSE: only when V network exists
             if self.on_policy_ema and state.value_params is not None:
                 info["losses/V_MSE"] = value_loss_log
 
             # --- Compact MALA summaries; full per-level state remains in snapshots. ---
-            mala_acc = mala_result.per_level_acc
-            mala_clip = mala_result.per_level_clip
-            schedule = self.model.schedule_for(state.hp, state.log_snr_levels)
-            mala_step = jnp.clip(
-                jnp.exp(mala_result.log_eta_scales) * jnp.maximum(schedule.betas, jnp.float32(1e-8)),
-                jnp.float32(1e-8), jnp.asarray(state.hp.mala_step_size_max, dtype=jnp.float32),
-            )
-            info.update({
-                "MALA/acceptance_rate_mean": jnp.mean(mala_acc),
-                "MALA/acceptance_rate_min": jnp.min(mala_acc),
-                "MALA/acceptance_rate_cleanest": mala_acc[0],
-                "MALA/acceptance_rate_noisiest": mala_acc[-1],
-                "MALA/clip_frac_mean": jnp.mean(mala_clip),
-                "MALA/clip_frac_max": jnp.max(mala_clip),
-                "MALA/clip_frac_cleanest": mala_clip[0],
-                "MALA/clip_frac_noisiest": mala_clip[-1],
-                "MALA/step_size_mean": jnp.mean(mala_step),
-                "MALA/step_size_min": jnp.min(mala_step),
-                "MALA/step_size_max": jnp.max(mala_step),
-                "MALA/step_size_cleanest": mala_step[0],
-                "MALA/step_size_noisiest": mala_step[-1],
-            })
+            if self.candidate_sampler == "mala":
+                mala_acc = mala_result.per_level_acc
+                mala_clip = mala_result.per_level_clip
+                schedule = self.model.schedule_for(state.hp, state.log_snr_levels)
+                mala_step = jnp.clip(
+                    jnp.exp(mala_result.log_eta_scales) * jnp.maximum(schedule.betas, jnp.float32(1e-8)),
+                    jnp.float32(1e-8), jnp.asarray(state.hp.mala_step_size_max, dtype=jnp.float32),
+                )
+                info.update({
+                    "MALA/acceptance_rate_mean": jnp.mean(mala_acc),
+                    "MALA/acceptance_rate_min": jnp.min(mala_acc),
+                    "MALA/acceptance_rate_cleanest": mala_acc[0],
+                    "MALA/acceptance_rate_noisiest": mala_acc[-1],
+                    "MALA/clip_frac_mean": jnp.mean(mala_clip),
+                    "MALA/clip_frac_max": jnp.max(mala_clip),
+                    "MALA/clip_frac_cleanest": mala_clip[0],
+                    "MALA/clip_frac_noisiest": mala_clip[-1],
+                    "MALA/step_size_mean": jnp.mean(mala_step),
+                    "MALA/step_size_min": jnp.min(mala_step),
+                    "MALA/step_size_max": jnp.max(mala_step),
+                    "MALA/step_size_cleanest": mala_step[0],
+                    "MALA/step_size_noisiest": mala_step[-1],
+                    # The adapted coefficient c of h_t = c (1 - alpha_t) itself, before
+                    # the beta_t profile and the h_max clip. Under
+                    # --mala_step_size_mode shared every level holds the same c, so
+                    # this is that one number; under per_level it is the mean of the T.
+                    "MALA/step_size_scale_mean": jnp.mean(jnp.exp(mala_result.log_eta_scales)),
+                })
 
             # --- Q section ---
             if self.on_policy_ema:
@@ -509,9 +661,19 @@ class MGMD:
             # normalization; they drive training only under the two flags passed in.
             # Reuses the target-Q already computed for the TD backup, so ~free.
             if self.num_denoised_actions >= 2:
+                if self.candidate_selection != "first" and not self.boltzmann_reweight:
+                    candidate_obs = jnp.broadcast_to(
+                        next_obs, (*candidate_actions.shape[:-1], next_obs.shape[-1]))
+                    normalizer_q = _aggregate_q(
+                        [self.model.q(tqp, candidate_obs, candidate_actions)
+                         for tqp in target_q_params], self.cfg.q_agg_sample)
+                    normalizer_actions = candidate_actions[:, :obs.shape[0] - R]
+                else:
+                    normalizer_q = _aggregate_q(per_q_target_values, self.cfg.q_agg_sample)
+                    normalizer_actions = train_actions
                 state, norm_info = normalizers.update(
-                    state, _aggregate_q(per_q_target_values, self.cfg.q_agg_sample)[:, :obs.shape[0] - R],
-                    train_actions, step=step, K=self.num_denoised_actions,
+                    state, normalizer_q[:, :obs.shape[0] - R],
+                    normalizer_actions, step=step, K=self.num_denoised_actions,
                     use_for_advantage=self.ema_within_advantage_normalization,
                     use_for_s_hat=self.estimate_s_hat,
                 )
@@ -531,11 +693,10 @@ class MGMD:
                 # carries 1/sqrt(abar) and the cost is not yet worth descending.
                 info["Schedule/x0hat_clip_noisiest"] = mala_result.per_level_clip[-1]
                 info["Schedule/x0hat_clip_cleanest"] = mala_result.per_level_clip[0]
-            # Also return the index-0 (uniform-draw) tilted next-action per row so
-            # the fused-denoising trainer can reuse it to step the env. XLA already
-            # materializes tilted_actions for the policy loss, so this is ~free; the
-            # normal update_vmap path discards it.
-            return state, info, tilted_actions[0]
+            # Return the configured selected action per row so
+            # the fused-denoising trainer can reuse it to step the environment;
+            # the normal update_vmap path discards it.
+            return state, info, selected_actions[0]
 
         return stateless_update
 
@@ -573,7 +734,7 @@ class MGMD:
 
         return unstack_tree(stacked_new_qp, num_q), unstack_tree(stacked_new_q_opt_states, num_q), all_q_losses
 
-    def _value_update_step(self, state, per_q_target_values, next_obs):
+    def _value_update_step(self, state, per_q_target_values, next_obs, action_weights=None):
         """Train V(s') against on-policy Q(s', a') targets (KL-budget mode).
 
         Returns ``(value_params_updated, value_opt_state_updated, value_loss_log)``.
@@ -589,7 +750,9 @@ class MGMD:
 
         # per_q_target_values entries are [K, batch]; average over the K denoised
         # actions to get the on-policy V(s') regression target [batch].
-        q_for_v = jnp.mean(_aggregate_q(per_q_target_values, self.cfg.q_agg_sample), axis=0)
+        q_values = _aggregate_q(per_q_target_values, self.cfg.q_agg_sample)
+        q_for_v = (jnp.mean(q_values, axis=0) if action_weights is None
+                   else jnp.sum(jax.lax.stop_gradient(action_weights) * q_values, axis=0))
         return self.value_head.update_step(state, q_for_v, next_obs, state.hp.lr_q, self.optim)
 
     def _tilt_params(self, params: ActorCriticParams) -> ActorCriticParams:
@@ -644,7 +807,7 @@ class MGMD:
         return action_np, q_per_env, v_per_env
 
     def get_eval_action_vmap(self, key: jax.Array, obs: np.ndarray, num_actions: int,
-                             return_q: bool = False, sampler_kind: str = "mala") -> np.ndarray:
+                             return_q: bool = False, sampler_kind: Optional[str] = None) -> np.ndarray:
         """Best-of-N action for separate evaluation: [N_runs, envs, act_dim].
 
         Denoises ``num_actions`` iid candidates per state and executes the
@@ -653,29 +816,34 @@ class MGMD:
         the training rollout is tuning is left alone and evaluation cannot
         perturb the run. Compiled once per ``(sampler_kind, num_actions)``.
 
-        ``sampler_kind="mala"`` (default, what training evaluation uses) draws
-        the candidates from the same chain rollout uses -- ``self._sampler_kw``
-        at a different K -- so evaluation can never drift onto a different
-        density. The other kinds are the unguided base-policy transitions of
-        :mod:`relax.algorithm.base_policy_sampler` (``"ddim"``, ``"ddpm_mean"``),
-        i.e. the base policy sampled the conventional way; only the candidate
-        sampler changes, the ranking and read-out are shared. Those are
-        analysis-only paths (offline snapshot studies), never used in training.
+        ``sampler_kind=None`` (default) uses the configured candidate sampler and
+        selection rule. Under Boltzmann selection, each of the N actions ranked by
+        evaluation is independently selected from K base candidates. Explicit
+        ``"mala"`` and explicit base-sampler kinds bypass that policy rule,
+        so N always means N proposals even under Boltzmann selection.
         """
-        cache_key = (sampler_kind, int(num_actions))
+        policy_sampler = sampler_kind is None
+        sampler_kind = self.candidate_sampler if policy_sampler else sampler_kind
+        cache_key = ("policy" if policy_sampler else sampler_kind, int(num_actions))
         if cache_key not in self._jit_vmap_eval_action:
+            proposal_actions = int(num_actions)
+            if policy_sampler and self.candidate_selection == "boltzmann":
+                proposal_actions *= self.num_denoised_actions
             if sampler_kind == "mala":
-                sampler = build_mala_sampler(**{**self._sampler_kw, "num_denoised_actions": int(num_actions)})
+                sampler = build_mala_sampler(**{
+                    **self._sampler_kw, "num_denoised_actions": proposal_actions})
             elif sampler_kind in TRANSITIONS:
                 sampler = build_base_policy_sampler(
                     model=self.model, timesteps=self._timesteps,
                     transition=sampler_kind,
-                    num_denoised_actions=int(num_actions),
+                    num_denoised_actions=proposal_actions,
                     latent_action=self._sampler_kw["latent_action"],
                 )
             else:
                 raise ValueError(f"Unknown sampler_kind: {sampler_kind!r}; "
                                  f"expected 'mala' or one of {TRANSITIONS}")
+            if policy_sampler and self.candidate_selection == "boltzmann":
+                sampler = self._stateless_candidate_sampler(sampler, groups=int(num_actions))
             agg_critic = lambda qm: _aggregate_q(qm, self.cfg.q_agg_sample)
 
             def eval_action(key, state, obs):
@@ -741,9 +909,10 @@ class MGMD:
                 self._timesteps, cfg.noise_schedule_log_snr_min, cfg.noise_schedule_log_snr_max))
                 if self.adaptive_schedule else None),
             distill_buffer=jnp.zeros(
-                ((cfg.batch_size - cfg.rollout_tilt_rows) * self.num_denoised_actions
+                ((cfg.batch_size - cfg.rollout_tilt_rows) * self.distill_actions_per_state
                  * cfg.distillation_buffer_size,
-                 self._obs_dim + self.model.act_dim), jnp.float32),
+                 self._obs_dim + self.model.act_dim + int(self.boltzmann_reweight)), jnp.float32),
+            policy_loss=jnp.float32(0.0),
             value_params=value_params_init,
             advantage_second_moment_ema=jnp.float32(cfg.initial_advantage_second_moment_ema),
             advantage_third_moment_ema=jnp.float32(0.0),
@@ -780,6 +949,7 @@ class MGMD:
                 eta=jnp.float32(cfg.eta),
                 s_hat=jnp.float32(cfg.s_hat),
                 noise_schedule_gamma=jnp.float32(cfg.noise_schedule_gamma),
+                action_noise=jnp.float32(cfg.action_noise),
             ),
         )
 
@@ -831,11 +1001,46 @@ class MGMD:
         return h_max
 
     def get_effective_hparams(self) -> dict:
-        return {
+        out = {
             "lr_policy_effective": float(self.cfg.lr_policy),
             "lr_q_effective": float(self.cfg.lr_q),
-            "mala_step_size_max_effective": self._resolved_mala_step_size_max(),
         }
+        if self.candidate_sampler == "mala":
+            out["mala_step_size_max_effective"] = self._resolved_mala_step_size_max()
+        return out
+
+
+def _normalized_candidate_q(q, state, cfg):
+    """Apply the configured advantage scale to candidate Q values."""
+    out = q
+    if cfg.batch_advantage_normalization:
+        denom = jnp.sqrt(jnp.maximum(jnp.mean(jnp.var(out, axis=0, ddof=1)), jnp.float32(1e-6)))
+        out = out / jax.lax.stop_gradient(denom)
+    if cfg.ema_advantage_normalization or cfg.ema_within_advantage_normalization:
+        out = ((out - jax.lax.stop_gradient(state.q_running_mean))
+               / jnp.maximum(jax.lax.stop_gradient(state.q_running_std), jnp.float32(1e-6)))
+    if cfg.advantage_normalization or cfg.q_loss_normalization:
+        out = out / jnp.sqrt(jnp.maximum(
+            jax.lax.stop_gradient(state.advantage_second_moment_ema), jnp.float32(1e-6)))
+    return out
+
+
+def _boltzmann_logits(q, state, cfg):
+    """Per-state candidate logits eta * normalized Q."""
+    return state.hp.eta * _normalized_candidate_q(q, state, cfg)
+
+
+def _boltzmann_weights(q, state, cfg):
+    """Per-state candidate probabilities proportional to exp(eta * normalized Q)."""
+    return jax.nn.softmax(_boltzmann_logits(q, state, cfg), axis=0)
+
+
+def _take_candidates(values, selected):
+    """Gather one leading-axis candidate independently at every state position."""
+    index = selected[None]
+    while index.ndim < values.ndim:
+        index = index[..., None]
+    return jnp.take_along_axis(values, index, axis=0).squeeze(axis=0)
 
 
 # ---------------------------------------------------------------------------

@@ -10,6 +10,7 @@ from gymnasium.spaces import Box
 import numpy as np
 
 from relax.dmc import register_dmc_envs
+from relax.humanoidbench import register_humanoidbench_envs
 from relax.env.vector.base import VectorEnv
 from relax.futex import futex_server_wait, futex_server_notify
 
@@ -27,6 +28,7 @@ class ProcessVectorEnv(VectorEnv):
         self.env_per_worker = num_envs // num_workers
 
         register_dmc_envs(name)
+        register_humanoidbench_envs(name)
         dummy_env = gymnasium.make(name)
         self.single_observation_space = dummy_env.observation_space
         self.single_action_space = dummy_env.action_space
@@ -81,7 +83,9 @@ class ProcessVectorEnv(VectorEnv):
         self.reward_shm, self.reward, descr["reward"] = make_shared_memory((self.num_envs,), np.float64)
         self.terminated_shm, self.terminated, descr["terminated"] = make_shared_memory((self.num_envs,), np.bool_)
         self.truncated_shm, self.truncated, descr["truncated"] = make_shared_memory((self.num_envs,), np.bool_)
+        self.status_shm, self.status, descr["status"] = make_shared_memory((self.num_workers,), np.uint8)
         self.signal_shm, self.signal, descr["signal"] = make_shared_memory((2,), np.uint32)
+        self.status[:] = 0
         self.signal[:] = 0
         self.signal_pointer = self.signal.ctypes.data
         self.seq = 0
@@ -93,6 +97,7 @@ class ProcessVectorEnv(VectorEnv):
                     sys.executable,
                     str(WORKER_PATH),
                     "--env", name,
+                    "--worker-index", str(i),
                     "--index", ",".join(map(str, index)),
                     "--seed", ",".join(str(seeds[j]) for j in index),
                     "--descr", json.dumps(descr),
@@ -113,6 +118,12 @@ class ProcessVectorEnv(VectorEnv):
         return self.obs.copy()
 
     def step(self, action: np.ndarray):
+        action = np.asarray(action, dtype=self.action.dtype)
+        finite = np.isfinite(action).all(axis=-1)
+        if not finite.all():
+            raise FloatingPointError(
+                f"Non-finite policy actions for env indices {np.flatnonzero(~finite).tolist()}; "
+                "check the sampler and network losses. Actions were not sent to the simulator.")
         self.action[:] = action
         self._notify(0b01)
         self._wait()
@@ -122,7 +133,7 @@ class ProcessVectorEnv(VectorEnv):
         self._notify(0b10)
         for c in self.workers:
             c.wait()
-        for shm in [self.obs_shm, self.obs2_shm, self.action_shm, self.reward_shm, self.terminated_shm, self.truncated_shm, self.signal_shm]:
+        for shm in [self.obs_shm, self.obs2_shm, self.action_shm, self.reward_shm, self.terminated_shm, self.truncated_shm, self.status_shm, self.signal_shm]:
             shm.close()
             shm.unlink()
         self.workers = None
@@ -134,6 +145,11 @@ class ProcessVectorEnv(VectorEnv):
     def _wait(self):
         try:
             futex_server_wait(self.signal_pointer, self.num_workers)
+            failed = np.flatnonzero(self.status)
+            if failed.size:
+                details = ", ".join(
+                    f"{int(i)} (exit={self.workers[int(i)].poll()})" for i in failed)
+                raise RuntimeError(f"Vector environment worker failure: {details}; see worker stderr")
         except KeyboardInterrupt:
             self.close()
             print("Workers closed due to KeyboardInterrupt", file=sys.stderr)

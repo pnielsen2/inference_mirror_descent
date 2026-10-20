@@ -15,14 +15,24 @@ SCRATCH_PARENT = Path("/n/netscratch/kdbrantley_lab/Lab/pnielsen/mujoco_v5_stand
 ACCOUNT = "kempner_kdbrantley_lab"
 PARTITION = "kempner_h100"
 GPU_RESOURCE = "gpu:nvidia_h100_80gb_hbm3:1"
-ENVS = (
-    ("Humanoid-v5", "hum"),
-    ("Ant-v5", "ant"),
-    ("Walker2d-v5", "walker"),
-    ("Hopper-v5", "hopper"),
-    ("HalfCheetah-v5", "hc"),
-    ("Swimmer-v5", "swim"),
-)
+ENVS_BY_VERSION = {
+    3: (
+        ("Humanoid-v3", "hum"),
+        ("Ant-v3", "ant"),
+        ("Walker2d-v3", "walker"),
+        ("Hopper-v3", "hopper"),
+        ("HalfCheetah-v3", "hc"),
+        ("Swimmer-v3", "swim"),
+    ),
+    5: (
+        ("Humanoid-v5", "hum"),
+        ("Ant-v5", "ant"),
+        ("Walker2d-v5", "walker"),
+        ("Hopper-v5", "hopper"),
+        ("HalfCheetah-v5", "hc"),
+        ("Swimmer-v5", "swim"),
+    ),
+}
 SEEDS = tuple(range(10))
 
 
@@ -95,6 +105,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--submission-mode", choices=("array", "individual"), default="array")
     parser.add_argument("--max-concurrent", type=int, default=16)
     parser.add_argument("--total-timesteps", type=int, default=int(1e6))
+    parser.add_argument("--env-version", type=int, choices=tuple(ENVS_BY_VERSION), default=5)
+    parser.add_argument("--eval-every", type=int, default=0)
+    parser.add_argument("--eval-episodes", type=int, default=10)
+    parser.add_argument("--eval-best-of-n", type=int, nargs="+", default=[32])
+    parser.add_argument("--eval-q-agg", choices=("min", "mean"), default="min")
+    parser.add_argument("--eval-mean-action", action="store_true")
+    parser.add_argument("--sac-critic-hidden-layers", type=int, default=2,
+                        help="Hidden layers per twin critic for SAC. 2 is its published architecture; "
+                             "3 matches the critic used by the diffusion-policy baselines.")
     parser.add_argument("--mgmd-start-step", type=int, default=int(3e4))
     parser.add_argument("--mgmd-num-vec-envs", type=int, default=5)
     parser.add_argument("--mgmd-mem-fraction", default="0.04")
@@ -110,9 +129,9 @@ def shell_quote(value: str | Path) -> str:
     return shlex.quote(str(value))
 
 
-def build_tasks(algorithm: str) -> list[TaskSpec]:
+def build_tasks(algorithm: str, envs: tuple[tuple[str, str], ...]) -> list[TaskSpec]:
     tasks: list[TaskSpec] = []
-    for env_name, env_slug in ENVS:
+    for env_name, env_slug in envs:
         for index in range(0, len(SEEDS), 2):
             seed0 = SEEDS[index]
             seed1 = SEEDS[index + 1]
@@ -145,15 +164,15 @@ def cleanrl_sbatch_text(spec: AlgoSpec, tasks: list[TaskSpec], root: Path, args:
         "#!/bin/bash",
         f"#SBATCH -A {ACCOUNT}",
         f"#SBATCH -p {PARTITION}",
-        f"#SBATCH -J {spec.key}_v5_pack2",
+        f"#SBATCH -J {spec.key}_v{args.env_version}_pack2",
         f"#SBATCH -t {spec.walltime}",
         "#SBATCH -N 1",
         f"#SBATCH -c {spec.cpus}",
         f"#SBATCH --mem={spec.memory}",
         f"#SBATCH --gres={GPU_RESOURCE}",
         f"#SBATCH --array=0-{len(tasks) - 1}%{args.max_concurrent}",
-        f"#SBATCH -o {slurm_dir / (spec.key + '_v5_pack2_%A_%a.out')}",
-        f"#SBATCH -e {slurm_dir / (spec.key + '_v5_pack2_%A_%a.err')}",
+        f"#SBATCH -o {slurm_dir / (spec.key + '_v' + str(args.env_version) + '_pack2_%A_%a.out')}",
+        f"#SBATCH -e {slurm_dir / (spec.key + '_v' + str(args.env_version) + '_pack2_%A_%a.err')}",
         "set -euo pipefail",
         f"PYTHON={shell_quote(PYTHON)}",
         f"ROOT={shell_quote(root)}",
@@ -199,6 +218,35 @@ def cleanrl_sbatch_text(spec: AlgoSpec, tasks: list[TaskSpec], root: Path, args:
         'fi',
         'exit 0',
     ]
+    if args.env_version == 3:
+        omp_idx = lines.index('export OMP_NUM_THREADS=1')
+        lines[omp_idx + 1:omp_idx + 1] = [
+            'export LD_LIBRARY_PATH="$HOME/.mujoco/mujoco210/bin:/usr/lib/nvidia:/lib64:${LD_LIBRARY_PATH:-}"',
+            'export CPATH="$HOME/.local/glew/glew-2.1.0/include:${CPATH:-}"',
+        ]
+    if spec.key == "sac" and args.sac_critic_hidden_layers != 2:
+        seed_line = '      --seed "$seed" \\'
+        idx = lines.index(seed_line)
+        lines[idx + 1:idx + 1] = [f'      --critic-hidden-layers {args.sac_critic_hidden_layers} \\']
+    if spec.key == "sac" and args.eval_every:
+        csv_line = '      --csv-output "$run_root/episode_returns.csv"'
+        csv_idx = lines.index(csv_line)
+        eval_lines = [
+            f'      --eval-every {args.eval_every}',
+            f'      --eval-episodes {args.eval_episodes}',
+            f'      --eval-best-of-n {" ".join(map(str, args.eval_best_of_n))}',
+            f'      --eval-q-agg {args.eval_q_agg}',
+            '      --eval-csv-output "$run_root/eval_episode_returns.csv"',
+        ]
+        if args.eval_mean_action:
+            eval_lines.extend([
+                '      --eval-mean-action',
+                '      --eval-mean-csv-output "$run_root/eval_mean_episode_returns.csv"',
+            ])
+        lines[csv_idx] += ' \\'
+        eval_lines = [line + (' \\' if i < len(eval_lines) - 1 else '')
+                      for i, line in enumerate(eval_lines)]
+        lines[csv_idx + 1:csv_idx + 1] = eval_lines
     return "\n".join(lines) + "\n"
 
 
@@ -208,15 +256,15 @@ def mgmd_sbatch_text(spec: AlgoSpec, tasks: list[TaskSpec], root: Path, args: ar
         "#!/bin/bash",
         f"#SBATCH -A {ACCOUNT}",
         f"#SBATCH -p {PARTITION}",
-        f"#SBATCH -J {spec.key}_v5_pack2",
+        f"#SBATCH -J {spec.key}_v{args.env_version}_pack2",
         f"#SBATCH -t {spec.walltime}",
         "#SBATCH -N 1",
         f"#SBATCH -c {spec.cpus}",
         f"#SBATCH --mem={spec.memory}",
         f"#SBATCH --gres={GPU_RESOURCE}",
         f"#SBATCH --array=0-{len(tasks) - 1}%{args.max_concurrent}",
-        f"#SBATCH -o {slurm_dir / (spec.key + '_v5_pack2_%A_%a.out')}",
-        f"#SBATCH -e {slurm_dir / (spec.key + '_v5_pack2_%A_%a.err')}",
+        f"#SBATCH -o {slurm_dir / (spec.key + '_v' + str(args.env_version) + '_pack2_%A_%a.out')}",
+        f"#SBATCH -e {slurm_dir / (spec.key + '_v' + str(args.env_version) + '_pack2_%A_%a.err')}",
         "set -euo pipefail",
         f"WORKTREE={shell_quote(spec.worktree)}",
         f"PYTHON={shell_quote(PYTHON)}",
@@ -334,6 +382,35 @@ def cleanrl_task_sbatch_text(spec: AlgoSpec, task: TaskSpec, root: Path, args: a
         'fi',
         'exit 0',
     ]
+    if args.env_version == 3:
+        omp_idx = lines.index('export OMP_NUM_THREADS=1')
+        lines[omp_idx + 1:omp_idx + 1] = [
+            'export LD_LIBRARY_PATH="$HOME/.mujoco/mujoco210/bin:/usr/lib/nvidia:/lib64:${LD_LIBRARY_PATH:-}"',
+            'export CPATH="$HOME/.local/glew/glew-2.1.0/include:${CPATH:-}"',
+        ]
+    if spec.key == "sac" and args.sac_critic_hidden_layers != 2:
+        seed_line = '      --seed "$seed" \\'
+        idx = lines.index(seed_line)
+        lines[idx + 1:idx + 1] = [f'      --critic-hidden-layers {args.sac_critic_hidden_layers} \\']
+    if spec.key == "sac" and args.eval_every:
+        csv_line = '      --csv-output "$run_root/episode_returns.csv"'
+        csv_idx = lines.index(csv_line)
+        eval_lines = [
+            f'      --eval-every {args.eval_every}',
+            f'      --eval-episodes {args.eval_episodes}',
+            f'      --eval-best-of-n {" ".join(map(str, args.eval_best_of_n))}',
+            f'      --eval-q-agg {args.eval_q_agg}',
+            '      --eval-csv-output "$run_root/eval_episode_returns.csv"',
+        ]
+        if args.eval_mean_action:
+            eval_lines.extend([
+                '      --eval-mean-action',
+                '      --eval-mean-csv-output "$run_root/eval_mean_episode_returns.csv"',
+            ])
+        lines[csv_idx] += ' \\'
+        eval_lines = [line + (' \\' if i < len(eval_lines) - 1 else '')
+                      for i, line in enumerate(eval_lines)]
+        lines[csv_idx + 1:csv_idx + 1] = eval_lines
     return "\n".join(lines) + "\n"
 
 
@@ -417,12 +494,13 @@ def write_artifacts(root: Path, algorithms: list[str], args: argparse.Namespace)
         root.mkdir(parents=True)
 
     payload: dict[str, dict[str, object]] = {}
+    envs = ENVS_BY_VERSION[args.env_version]
     for algorithm in algorithms:
         spec = ALGO_SPECS[algorithm]
         algo_root = root / algorithm
         for subdir in ("sbatch", "slurm", "runs", "wandb"):
             (algo_root / subdir).mkdir(parents=True, exist_ok=True)
-        tasks = build_tasks(algorithm)
+        tasks = build_tasks(algorithm, envs)
         (algo_root / "tasks.tsv").write_text(tasks_tsv(tasks))
         payload_entry: dict[str, object] = {
             "spec": {
@@ -438,7 +516,7 @@ def write_artifacts(root: Path, algorithms: list[str], args: argparse.Namespace)
             "tasks": [asdict(task) for task in tasks],
         }
         if args.submission_mode == "array":
-            sbatch_path = algo_root / "sbatch" / f"{algorithm}_v5_pack2.sbatch"
+            sbatch_path = algo_root / "sbatch" / f"{algorithm}_v{args.env_version}_pack2.sbatch"
             if algorithm == "mgmd":
                 sbatch_path.write_text(mgmd_sbatch_text(spec, tasks, algo_root, args))
             else:
@@ -462,11 +540,18 @@ def write_artifacts(root: Path, algorithms: list[str], args: argparse.Namespace)
         "account": ACCOUNT,
         "partition": PARTITION,
         "gpu_resource": GPU_RESOURCE,
-        "envs": [{"env_name": env_name, "env_slug": env_slug} for env_name, env_slug in ENVS],
+        "envs": [{"env_name": env_name, "env_slug": env_slug} for env_name, env_slug in envs],
         "seeds": list(SEEDS),
         "submission_mode": args.submission_mode,
         "max_concurrent": args.max_concurrent,
         "total_timesteps": args.total_timesteps,
+        "env_version": args.env_version,
+        "eval_every": args.eval_every,
+        "eval_episodes": args.eval_episodes,
+        "eval_best_of_n": args.eval_best_of_n,
+        "eval_q_agg": args.eval_q_agg,
+        "eval_mean_action": args.eval_mean_action,
+        "sac_critic_hidden_layers": args.sac_critic_hidden_layers,
         "mgmd_start_step": args.mgmd_start_step,
         "mgmd_num_vec_envs": args.mgmd_num_vec_envs,
         "mgmd_mem_fraction": args.mgmd_mem_fraction,
@@ -487,7 +572,7 @@ def main() -> None:
     algorithms = list(args.algos)
     root = args.root if args.root is not None else default_root()
     payload = write_artifacts(root, algorithms, args)
-    print(f"Prepared Phase 4 launch artifacts under {root}")
+    print(f"Prepared MuJoCo v{args.env_version} launch artifacts under {root}")
     submissions = []
     for algorithm in algorithms:
         if args.submission_mode == "array":

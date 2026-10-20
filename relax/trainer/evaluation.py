@@ -56,7 +56,8 @@ class Evaluator:
 
     def __init__(self, *, algorithm, logger: WandbMultiSeedLogger, log_path: Path,
                  env_name: str, num_runs: int, to_env_action, every: int,
-                 n_episodes: int, best_of_n: int, seed: int):
+                 n_episodes: int, best_of_n: int, sampler_kind: str | None = None,
+                 seed: int):
         self.algorithm = algorithm
         self.logger = logger
         self.log_path = log_path
@@ -66,6 +67,7 @@ class Evaluator:
         self.every = int(every)
         self.n_episodes = int(n_episodes)
         self.best_of_n = int(best_of_n)
+        self.sampler_kind = sampler_kind
         self.seed = int(seed)
         self._csv_path = log_path / "eval_episode_returns.csv"
         self._keys = jax.random.split(jax.random.key(self.seed), self.num_runs)
@@ -105,7 +107,8 @@ class Evaluator:
                     break
                 obs = env.get_current_obs().reshape(self.num_runs, E, -1)
                 action = self.algorithm.get_eval_action_vmap(
-                    jax.vmap(lambda k: jax.random.fold_in(k, i))(keys), obs, self.best_of_n)
+                    jax.vmap(lambda k: jax.random.fold_in(k, i))(keys), obs,
+                    self.best_of_n, sampler_kind=self.sampler_kind)
                 _, reward, terminated, truncated, _ = env.step(
                     self.to_env_action(action.reshape(self.num_runs * E, -1)))
                 returns += reward.reshape(self.num_runs, E) * active

@@ -189,3 +189,44 @@ Two scheduling notes for retargeting a stalled array:
 `_snapshot_codebase()` captures the codebase with `git stash create`, which
 **ignores untracked files**. `git add` any new file before launching or the
 submitted jobs will run from a snapshot missing it and crash on import.
+
+## Paper (ICLR 2027) and the ablation tables
+
+`paper/iclr2027_sec4_sec6.tex` holds the method (Section 4, with both
+algorithm boxes), the ablation-setup text, the results section and the
+hyperparameter appendix for the ICLR draft, which itself lives in Overleaf.
+It is a fragment: test-compile it by `\input`-ing it into a stub document with
+`amsmath`, `booktabs` and `[ruled,vlined]{algorithm2e}`.
+
+`scripts/make_ablation_tables.py` regenerates every number in that section's
+tables. It reproduces `figures/algorithm_comparison_trailing_of_median_ci80.csv`
+exactly for the main arm, so ablation cells are directly comparable to Table 1:
+the estimator is the trailing average over the last 10 evaluation checkpoints of
+the **across-seed median**, with an 80% bootstrap CI over seeds. Re-run it once
+sweeps 246/248 reach 1M and paste the new cells.
+
+Sweeps behind the current numbers (main arm = sweep 244, `rollout_alpha=1`,
+which is the `_s{60,70,80,90,100,110}_` run dir per env):
+
+| ablation | sweep | flag |
+|---|---|---|
+| fixed MALA step size $h_t = c\,(1-\alpha_t)$ | 245 (c ≤ 2, 4 envs), 248 (c ∈ {4,8}, 6 envs) | `--mala_step_size_mode fixed_step_size --mala_step_size_beta_multiplier c` |
+| TD backup from the unguided base policy | 246 | `--td_next_action ddim` |
+| half the annealing path | 247 | `--diffusion_steps 50` |
+
+**Sweeps 245/248 are zzhong's.** They ran from a fork
+(`--mala_step_size_mode` does not exist at our HEAD) and their CSV mirrors sit
+in `/n/home11/zzhong`, which is mode 700. The offline wandb dirs under
+`/n/holylabs/kdbrantley_lab/Lab/zzhong/wandb/sweep_*` are readable, so the eval
+curve has to come out of the `run-*.wandb` datastore. Two traps, both handled in
+`make_ablation_tables.py`:
+
+- `datastore.open_for_scan` opens the file `r+b`, so it fails on a read-only
+  file; copy it to scratch first.
+- history keys containing `/` (every key we log) arrive in `nested_key`, not
+  `key`. Filtering on `item.key` silently returns zero rows.
+
+Per-slot config for those runs is in each offline run's `files/config.yaml`
+(`mala_step_size_beta_multiplier`, `env`, `seed`), and `files/wandb-summary.json`
+gives the final value of every logged metric without touching the datastore --
+enough for end-of-run tables, not for curves.

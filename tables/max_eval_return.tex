@@ -1,0 +1,17 @@
+\begin{table}[t]
+\centering
+\caption{Best evaluation return over training. For each run we take the maximum over evaluation checkpoints of its mean episode return, then report the mean over 10 seeds with a Student-t 80\% confidence interval. Per environment we bold the best mean and every mean lying inside its confidence interval.}
+\label{tab:max_eval_return}
+\begin{tabular}{lcccc}
+\toprule
+Environment & MGMD (ours) & DIPO & DPMD & SAC \\
+\midrule
+Ant-v3 & \textbf{6\,832} {\scriptsize [6\,742, 6\,921]} & 5\,677 {\scriptsize [5\,352, 6\,003]} & 5\,930 {\scriptsize [5\,550, 6\,310]} & 5\,514 {\scriptsize [5\,106, 5\,922]} \\
+HalfCheetah-v3 & \textbf{13\,176} {\scriptsize [12\,960, 13\,393]} & 10\,149 {\scriptsize [9\,747, 10\,550]} & \textbf{13\,438} {\scriptsize [13\,017, 13\,859]} & 11\,246 {\scriptsize [10\,738, 11\,755]} \\
+Hopper-v3 & 3\,531 {\scriptsize [3\,477, 3\,585]} & 3\,532 {\scriptsize [3\,492, 3\,571]} & 3\,449 {\scriptsize [3\,375, 3\,523]} & \textbf{3\,638} {\scriptsize [3\,622, 3\,655]} \\
+Humanoid-v3 & 5\,442 {\scriptsize [5\,392, 5\,491]} & 5\,279 {\scriptsize [5\,239, 5\,319]} & 5\,322 {\scriptsize [5\,261, 5\,384]} & \textbf{5\,526} {\scriptsize [5\,474, 5\,579]} \\
+Swimmer-v3 & 141 {\scriptsize [131, 151]} & 59 {\scriptsize [55, 62]} & \textbf{153} {\scriptsize [150, 155]} & 61 {\scriptsize [55, 66]} \\
+Walker2d-v3 & \textbf{4\,996} {\scriptsize [4\,837, 5\,155]} & 4\,581 {\scriptsize [4\,362, 4\,801]} & \textbf{5\,134} {\scriptsize [4\,923, 5\,344]} & 4\,854 {\scriptsize [4\,652, 5\,055]} \\
+\bottomrule
+\end{tabular}
+\end{table}

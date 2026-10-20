@@ -42,6 +42,24 @@ export CPATH="$HOME/.local/glew/glew-2.1.0/include:${CPATH:-}"
 
 - `seaborn`, `tbparse`, and `tensorboardX` for optional analysis / plotting utilities that are not needed for the packed MGMD launch path
 
+### HumanoidBench
+
+HumanoidBench is optional and is not installed by `requirements.txt`, because its
+package pins older Gymnasium and MuJoCo versions than this project. Install its
+code into the already-prepared training venv without replacing that stack:
+
+```bash
+source ~/.venvs/general/bin/activate
+pip install --no-deps "git+https://github.com/carlosferrazza/humanoid-bench.git"
+python -c "import humanoid_bench; import gymnasium as gym; gym.make('h1hand-walk-v0', render_mode=None).close()"
+```
+
+The launcher uses `~/.venvs/general` for `humanoidbench/*` by default. Point it
+at another fully provisioned venv with `HUMANOIDBENCH_VENV=/path/to/venv`.
+HumanoidBench environments are exposed as namespaced ids such as
+`humanoidbench/h1hand-walk-v0`. Use `scripts/launch.py --benchmark humanoidbench`
+to expand the current official main-task suite into the environment sweep axis.
+
 ## Sanity checks after install
 
 ```bash
@@ -90,6 +108,99 @@ Remove `--dry-run` to actually submit the SLURM jobs.
 - inject `--parallel_runs K` for each packed job
 - inline the per-slot overrides via `--hp_pack_inline '<json>'`
 - auto-pick CPUs as `min(pack_size * num_vec_envs, 24)` unless you override `--cpus`
+
+## Candidate distillation: reweighting, Boltzmann sampling, best of N
+
+`--candidate_sampler ddim_clipped --policy_parameterization eps` draws unguided proposals
+with one network forward per DDIM step. `--candidate_selection` controls improvement:
+
+| Value | Policy target and clipped-double-Q TD backup | Training rollout |
+|---|---|---|
+| `reweight` | All N actions, weighted per state by `softmax(eta * Q)` | One draw from those weights |
+| `boltzmann` | One categorical draw from the same weights | That draw |
+| `best` | The maximum-Q action; eta is unused | That action |
+
+Each method takes one policy optimizer step at `--distillation_steps 1` and
+buffer size 1; reweighting evaluates all targets in one batch. With
+`--ema_advantage_normalization`, Q in the weights is divided by the existing
+running standard deviation. Remove that flag for literal unnormalized Q.
+`Boltzmann/ess_mean` and `Boltzmann/pmax_mean` reveal whether the weights have
+collapsed onto the maximum. The original `first` and `--boltzmann_reweight`
+settings remain available.
+
+`ddim_clipped` clips the clean-action prediction to `[-1,1]` at every level
+and recomputes the implied epsilon. Its coefficient on the current noisy action
+is `sigma_prev / sigma_t <= 1`, avoiding the growing intermediate actions that
+final-only clipping cannot fix. The original `ddim` remains available.
+`--candidate_sampler ddpm` is the stochastic reference: clipped x0 at every
+level plus DDPM posterior noise, with no posterior noise on the final step.
+These choices use the configured schedule and unit Gaussian initialization;
+they isolate the reverse transition rather than bundle DPMD's other settings.
+They also support `--eval_sampler` and `--td_next_action`.
+
+Supplying NaN/Inf controls reproduces the MuJoCo exception seen in sweep 264.
+The numerical regression reproduces an overflowing unclipped DDIM chain from
+finite inputs and checks that clipped DDIM stays bounded at every level.
+The vector environment now rejects any remaining NaN/Inf actions before
+dispatch, reporting their env indices instead of passing them into MuJoCo.
+
+`--action_noise 1` adds DPMD's Gaussian noise to training actions and
+distillation/TD targets, after computing ranks/weights from clean proposals;
+`0` disables it. Targets remain unclipped after injection, as in DPMD.
+The noise controller is data independent, so its original Adam(0.007) curve is
+tabulated once: initial std 0.5, target entropy -0.9 per action dimension,
+asymptotic std about 0.0984. Its 250-update period at five env steps/update is
+1250 env steps here, independent of this run's update/data ratio.
+`Policy/action_noise_std` logs the actual std. Evaluation adds no such noise.
+
+This grid uses N=32 throughout and evaluates every arm with the same best of 32
+base DDIM proposals (`--eval_sampler ddim_clipped` avoids nested selection and
+uses the same clipped transition for evaluation).
+Compare `eval/episode_return_mean` / `eval_episode_returns.csv`; training
+returns include exploration noise.
+There are 48 runs in 12 GPU jobs: four environments × three methods, with
+noise 0/1 × two seeds vmapped within each job. Selection is a hard axis because
+the target-buffer shapes differ; noise, eta and learning rates are easy axes.
+Start with the existing eta and policy learning rate, without extra sweeps.
+
+H100 calibration with clipped DDIM (Humanoid-v3, four packed runs, 50 steps):
+reweighting and best-of-32 each completed 20,001 training steps and two
+ten-episode-per-run evaluations with finite losses/actions, taking 598 s and
+563 s respectively. This extrapolates to about 8–9 hours of training per 1M
+steps. The 22-hour request leaves headroom for logging, checkpoints, longer
+episodes and machine load; queue time is separate. These are numerical
+stability/throughput probes, not completed 1M-step learning runs.
+
+```bash
+IMD_RUN_ROOT=/n/netscratch/kdbrantley_lab/Lab/$USER/imd_clipped_$(date +%Y%m%d_%H%M%S)
+python scripts/launch.py \
+  --cmd "python scripts/train_mujoco.py \
+    --alg mgmd --num_vec_envs 1 --update_per_iteration 1 \
+    --candidate_sampler ddim_clipped --policy_parameterization eps \
+    --num_denoised_actions 32 --beta_schedule_type cosine --diffusion_steps 50 \
+    --lr_q 0.00015 --lr_policy 0.0003 --delay_policy_update 1 \
+    --ema_advantage_normalization --lr_anneal --orthogonal_init \
+    --fused_denoising --q_agg_sample mean --T 0 --eta 64 --s_hat 1 \
+    --distillation_steps 1 --total_step 1000000 \
+    --eval_every 10000 --eval_sampler ddim_clipped --eval_best_of_n_actions 32 \
+    --save_diagnostic_snapshots --diagnostic_snapshot_dir $IMD_RUN_ROOT/snapshots \
+    --diagnostic_snapshot_steps 10000 50000 100000 200000 300000 400000 500000 600000 700000 800000 825000 850000 875000 900000 925000 950000 975000 1000000" \
+  --seeds-per-config 2 \
+  --ablate buffer_size 250000 \
+  --ablate env Walker2d-v3 Humanoid-v3 Ant-v3 HalfCheetah-v3 \
+  --ablate candidate_selection reweight boltzmann best \
+  --ablate action_noise 0 1 \
+  --max-runs-per-gpu 10 --cpus 8 --time 22:00:00 --mem 64G \
+  --log-dir "$IMD_RUN_ROOT" \
+  --wandb-offline-base /n/holylabs/kdbrantley_lab/Lab/$USER/wandb \
+  --wandb-sync-interval 60
+```
+
+Add `--dry-run --no-sweep-id` to inspect the packing without submission or a
+wandb API lookup. The early diagnostic snapshots let a failed run's sampler
+be investigated from saved parameters; `--diagnostic_snapshot_steps` alone
+does not enable saving. To use stochastic DDPM, change both sampler flags to
+`ddpm`.
 
 ## Sharing across the lab (multi-user setup)
 

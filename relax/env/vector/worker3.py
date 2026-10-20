@@ -9,6 +9,7 @@ import numpy as np
 
 import setproctitle
 from relax.dmc import register_dmc_envs
+from relax.humanoidbench import register_humanoidbench_envs
 from relax.prctl import set_client_pdeathsig
 from relax.futex import futex_client_wait, futex_client_notify
 
@@ -18,6 +19,7 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"^gymnasi
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", type=str, required=True)
+    parser.add_argument("--worker-index", type=int, required=True)
     parser.add_argument("--index", type=str, required=True)
     parser.add_argument("--seed", type=str, required=True)
     parser.add_argument("--descr", type=str, required=True)
@@ -35,6 +37,7 @@ def main():
     assert len(indices) == len(seeds)
 
     register_dmc_envs(args.env)
+    register_humanoidbench_envs(args.env)
 
     envs = []
     for seed in seeds:
@@ -52,6 +55,7 @@ def main():
     reward = initialize_shm(descr["reward"], "r+")
     terminated = initialize_shm(descr["terminated"], "r+")
     truncated = initialize_shm(descr["truncated"], "r+")
+    status = initialize_shm(descr["status"], "r+")
     signal = initialize_shm(descr["signal"], "r+")
     signal_pointer = signal.ctypes.data
 
@@ -85,6 +89,9 @@ def main():
                 raise ValueError(f"Unknown command: {command}")
     except KeyboardInterrupt:
         pass
+    except BaseException:
+        status[args.worker_index] = 1
+        raise
     finally:
         futex_client_notify(signal_pointer)
 

@@ -105,6 +105,7 @@ class HParams(NamedTuple):
     # snapshots written before this field loadable.
     mala_target_acceptance_rate: jax.Array = 0.574  # MALA Robbins-Monro acceptance target
     mala_step_size_max: jax.Array = 0.5  # upper clip on the MALA step size h
+    action_noise: jax.Array = 0.0  # multiplier on DPMD's post-selection Gaussian std
 
 
 class Diffv2TrainState(NamedTuple):
@@ -137,8 +138,8 @@ class Diffv2TrainState(NamedTuple):
     # (--noise_schedule_log_snr_{max,min}), which the equal-cost update returns
     # unchanged, so the range stays fixed without being stored separately.
     log_snr_levels: Optional[jax.Array] = None
-    # [batch*K*--distillation_buffer_size, obs_dim + act_dim] ring of the tilted
-    # (next_obs | action) targets the policy is distilled onto; see
+    # Ring of (next_obs | action [| weight]) policy targets; the optional final
+    # weight column is present only with Boltzmann reweighting. See
     # relax/algorithm/distillation.py. None only for states built outside MGMD.
     distill_buffer: Optional[jax.Array] = None
     hp: HParams = HParams()
@@ -171,6 +172,10 @@ class MGMDConfig:
     # MGMD where act_dim is known.
     mala_step_size_max: Optional[float] = None
     mala_step_size_max_coef: float = 2.7
+    # "per_level": one adapted coefficient c_t per noise level (h_t = c_t (1 -
+    # alpha_t)). "shared": a single c for the whole schedule, adapted from the
+    # level-averaged acceptance rate. See --mala_step_size_mode.
+    mala_step_size_mode: str = "per_level"
     mcmc_proposal_type: str = "euler_maruyama"
     denoising_predictor: str = "DDPM_mean"
     ddpm_mean_final_steps: int = 1
@@ -202,6 +207,9 @@ class MGMDConfig:
     kl_budget: Optional[float] = None
     one_step_dist_shift_beta: bool = False
     guidance_gradient_space: str = "xt"
+    # Where the critic's TD backup takes a': the configured improvement sample/
+    # expectation, or an independent base-policy sample. See --td_next_action.
+    td_next_action: str = "tilted"
     critic_update_steps: int = 1
     policy_update_steps: int = 1
     num_denoised_actions: int = 1
@@ -239,6 +247,12 @@ class MGMDConfig:
     noise_schedule_gamma: float = 1e-6
     noise_schedule_log_snr_max: float = 15.0
     noise_schedule_log_snr_min: float = -15.0
+    candidate_sampler: str = "mala"
+    candidate_selection: str = "first"
+    boltzmann_reweight: bool = False
+    action_noise: float = 0.0
+    total_step: int = 1000000
+    env_steps_per_update: float = 1.0  # noise-schedule clock, derived from trainer UTD
 
     @classmethod
     def from_args(cls, args) -> "MGMDConfig":
@@ -274,6 +288,7 @@ class MGMDConfig:
             mala_target_acceptance_rate=args.mala_target_acceptance_rate,
             mala_step_size_max=args.mala_step_size_max,
             mala_step_size_max_coef=args.mala_step_size_max_coef,
+            mala_step_size_mode=args.mala_step_size_mode,
             mcmc_proposal_type=args.mcmc_proposal_type,
             denoising_predictor=args.denoising_predictor,
             ddpm_mean_final_steps=args.ddpm_mean_final_steps,
@@ -299,6 +314,13 @@ class MGMDConfig:
             kl_budget=args.kl_budget,
             one_step_dist_shift_beta=args.one_step_dist_shift_beta,
             guidance_gradient_space=args.guidance_gradient_space,
+            td_next_action=args.td_next_action,
+            candidate_sampler=args.candidate_sampler,
+            candidate_selection=args.candidate_selection,
+            boltzmann_reweight=args.boltzmann_reweight,
+            action_noise=args.action_noise,
+            total_step=args.total_step,
+            env_steps_per_update=args.num_vec_envs / args.update_per_iteration,
             num_denoised_actions=args.num_denoised_actions,
             batch_size=args.batch_size,
             distillation_buffer_size=args.distillation_buffer_size,

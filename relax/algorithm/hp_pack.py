@@ -47,7 +47,7 @@ ALLOWED_KEYS = {
     "reward_scale", "x0_hat_clip_radius", "mala_adapt_rate",
     "mala_target_acceptance_rate", "mala_step_size_max",
     "q_td_huber_width", "alpha", "T", "eta", "s_hat",
-    "noise_schedule_gamma", "seed",
+    "noise_schedule_gamma", "action_noise", "seed",
 }
 
 
@@ -83,6 +83,8 @@ def apply(state, hp_pack: dict, N_seeds: int, cmd_specified=None):
         arr = jnp.asarray(v, dtype=jnp.float32)
         if arr.shape != (N_seeds,):
             raise ValueError(f"--hp_pack '{k}' has shape {arr.shape}; expected ({N_seeds},)")
+        if k == "action_noise" and not bool(jnp.all(jnp.isfinite(arr) & (arr >= 0))):
+            raise ValueError("--hp_pack action_noise must contain finite nonnegative multipliers.")
         target = CLI_TO_FIELD.get(k, k)
         (top_overrides if target in _TOPLEVEL_TARGETS else hp_overrides)[target] = arr
     if not hp_overrides and not top_overrides and not cmd_pack_keys:

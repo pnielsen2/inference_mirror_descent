@@ -69,6 +69,8 @@ class ScalarPolicyNet(hk.Module):
         te = self.activation(te)
         te = hk.Linear(self.time_dim, w_init=self.w_init)(te)
         input = jnp.concatenate((obs, act, te), axis=-1)
+        if self.policy_final_layer == "eps":
+            return mlp(self.hidden_sizes, act.shape[-1], self.activation, self.output_activation, w_init=self.w_init)(input)
         if self.policy_final_layer == "default":
             return mlp(self.hidden_sizes, 1, self.activation, self.output_activation, w_init=self.w_init)(input)[..., 0]
         v = mlp(self.hidden_sizes, act.shape[-1], self.activation, self.output_activation, w_init=self.w_init)(input)
@@ -183,9 +185,10 @@ class ActorCritic:
         w_init = hk.initializers.Orthogonal() if orthogonal_init else None
         q_net = hk.without_apply_rng(hk.transform(lambda obs, act: QNet(hidden_sizes, activation, w_init=w_init)(obs, act)))
 
+        network_final_layer = "eps" if policy_parameterization == "eps" else policy_final_layer
         policy_scalar = hk.without_apply_rng(
             hk.transform(
-                lambda obs, act, t: ScalarPolicyNet(diffusion_hidden_sizes, activation, time_theta=noise_cond_theta, policy_final_layer=policy_final_layer, w_init=w_init)(
+                lambda obs, act, t: ScalarPolicyNet(diffusion_hidden_sizes, activation, time_theta=noise_cond_theta, policy_final_layer=network_final_layer, w_init=w_init)(
                     obs,
                     act,
                     t,
@@ -207,7 +210,7 @@ class ActorCritic:
                 snr_max=snr_max,
             )
 
-        def raw_scalar(params, obs, act, t):
+        def raw_output(params, obs, act, t):
             return policy_scalar.apply(params, obs, act, t)
 
         # Both callables take the whole ``level`` so the interface is uniform,
@@ -215,15 +218,21 @@ class ActorCritic:
         # two. ``level.cond`` is the network's noise conditioning.
         if policy_parameterization == "E":
             def energy_fn(params, level, obs, act):
-                return raw_scalar(params, obs, act, level.cond)
+                return raw_output(params, obs, act, level.cond)
             def eps_pred(params, level, obs, act):
-                energy_grad = jax.grad(lambda a: raw_scalar(params, obs, a, level.cond).sum())(act)
+                energy_grad = jax.grad(lambda a: raw_output(params, obs, a, level.cond).sum())(act)
                 return level.sqrt_omac[..., None] * energy_grad
-        else:  # "f"
+        elif policy_parameterization == "f":
             def energy_fn(params, level, obs, act):
-                return raw_scalar(params, obs, act, level.cond) / level.sqrt_omac
+                return raw_output(params, obs, act, level.cond) / level.sqrt_omac
             def eps_pred(params, level, obs, act):
-                return jax.grad(lambda a: raw_scalar(params, obs, a, level.cond).sum())(act)
+                return jax.grad(lambda a: raw_output(params, obs, a, level.cond).sum())(act)
+        elif policy_parameterization == "eps":
+            energy_fn = None
+            def eps_pred(params, level, obs, act):
+                return raw_output(params, obs, act, level.cond)
+        else:
+            raise ValueError(f"Unknown policy_parameterization: {policy_parameterization!r}")
 
         return ActorCritic(
             _q_net=q_net,
